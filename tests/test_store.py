@@ -1,0 +1,67 @@
+from datetime import datetime, timedelta, timezone
+
+from traider.cage import Account, Position, SessionFacts
+from traider.config import active_runs, start_experiment
+from traider.store import RunStore
+
+
+def test_orders_get_increasing_seq_and_survive_reopen(tmp_path):
+    s = RunStore(tmp_path)
+    assert s.append_order({"day": "2026-12-01", "kind": "buy", "symbol": "XLE", "client_order_id": "x/1"})["seq"] == 1
+    assert RunStore(tmp_path).append_order({"day": "2026-12-01", "kind": "reject", "symbol": "AAPL", "reason": "no_price"})["seq"] == 2
+    assert [e["kind"] for e in RunStore(tmp_path).orders("2026-12-01")] == ["buy", "reject"]
+    assert RunStore(tmp_path).find_order("x/1")["symbol"] == "XLE"
+
+def test_truncated_last_line_is_skipped(tmp_path):
+    s = RunStore(tmp_path)
+    s.append_order({"day": "2026-12-01", "kind": "buy", "symbol": "XLE"})
+    with open(tmp_path / "orders.jsonl", "a") as f:
+        f.write('{"seq": 2, "kind": "bu')
+    assert len(RunStore(tmp_path).orders()) == 1
+    assert RunStore(tmp_path).append_order({"day": "2026-12-01", "kind": "close", "symbol": "XLE"})["seq"] == 2
+    assert [e["kind"] for e in RunStore(tmp_path).orders()] == ["buy", "close"]
+
+def test_session_can_start_only_once_per_day(tmp_path):
+    s, now = RunStore(tmp_path), datetime(2026, 12, 1, 15, 0, tzinfo=timezone.utc)
+    assert s.start_session("2026-12-01", now) is True
+    assert s.start_session("2026-12-01", now) is False
+    assert s.session("2026-12-01")["status"] == "started"
+    assert s.stale_started(now + timedelta(minutes=29)) == []
+    assert s.stale_started(now + timedelta(minutes=31)) == ["2026-12-01"]
+    s.finish_session("2026-12-01", "ok", {"cost": 0.9})
+    assert (s.session("2026-12-01")["status"], s.session("2026-12-01")["cost"]) == ("ok", 0.9)
+    assert s.stale_started(now + timedelta(hours=5)) == []
+    assert [x["day"] for x in s.sessions()] == ["2026-12-01"]
+
+def test_facts_come_from_the_ledger(tmp_path):
+    s, day, panel = RunStore(tmp_path), "2026-12-01", ["AAPL", "MSFT"]
+    assert s.facts(day, panel) == SessionFacts(0, frozenset(), frozenset(), False)
+    s.append_forecasts(day, [{"symbol": "AAPL", "p": 0.6}, {"symbol": "XLE", "p": 0.55}])
+    assert s.facts(day, panel).panel_done is False
+    s.append_forecasts(day, [{"symbol": "MSFT", "p": 0.4}])
+    for kind, symbol in [("buy", "XLE"), ("reject", "AAPL"), ("close", "JPM"), ("stop_fill", "COST")]:
+        s.append_order({"day": day, "kind": kind, "symbol": symbol})
+    s.append_order({"day": "2026-11-30", "kind": "buy", "symbol": "NVDA"})
+    f = s.facts(day, panel)
+    assert (f.buys_done, f.panel_done) == (1, True)
+    assert f.closed_today == frozenset({"JPM", "COST"}) and f.forecast_symbols == frozenset({"AAPL", "XLE", "MSFT"})
+
+def test_state_and_account_roundtrip(tmp_path):
+    s = RunStore(tmp_path)
+    assert s.state()["status"] == "active" and s.account() is None
+    s.update_state(status="dead")
+    acct = Account(850.0, (Position("AAPL", 0.75, 200.1, 186.0),), 1000.0)
+    s.save_account(acct)
+    assert RunStore(tmp_path).state()["status"] == "dead" and RunStore(tmp_path).account() == acct
+
+def test_prices_roundtrip(tmp_path):
+    s = RunStore(tmp_path)
+    assert s.prices("2026-12-01") is None
+    s.save_prices("2026-12-01", {"AAPL": 190.5})
+    assert RunStore(tmp_path).prices("2026-12-01") == {"AAPL": 190.5}
+
+def test_active_runs_skips_finished_and_dead(tmp_path, example):
+    exp = start_experiment(example, tmp_path / "runs")
+    RunStore(exp / "haiku").update_state(status="dead")
+    RunStore(exp / "sonnet").update_state(status="finishing")
+    assert sorted(p.name for p in active_runs(tmp_path / "runs")) == ["opus-a", "opus-analyst", "opus-b", "sonnet"]

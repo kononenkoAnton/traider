@@ -133,5 +133,6 @@ def load_run(run_dir: Path) -> tuple[RunConfig, bool]:
 
 
 def active_runs(runs_dir: Path) -> list[Path]:
-    # ponytail: статус прогона появится в задаче 4, пока активны все каталоги с config.json
-    return sorted(p.parent for p in Path(runs_dir).glob("*/*/config.json"))
+    from traider.store import RunStore  # store импортирует cage, а cage импортирует config
+    return sorted(p.parent for p in Path(runs_dir).glob("*/*/config.json")
+                  if RunStore(p.parent).state()["status"] in ("active", "finishing"))
