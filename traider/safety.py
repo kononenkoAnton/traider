@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from traider.brokers import Broker
 from traider.cage import equity, floor, hp, is_dead
-from traider.config import RunConfig
+from traider.config import TERMINAL_STATUSES, RunConfig
 from traider.store import RunStore
 
 
@@ -32,7 +32,7 @@ class SafetyReport:
 
 
 def run_safety(cfg: RunConfig, store: RunStore, broker: Broker, day: str) -> SafetyReport:
-    if store.state()["status"] in ("dead", "finished"):
+    if store.state()["status"] in TERMINAL_STATUSES:
         return SafetyReport(0.0, 0.0, 0.0, False, (), ())
     fills = tuple(e["symbol"] for e in broker.sync(day))
     acct = broker.account()

@@ -13,7 +13,9 @@
 Каталог участника, который уже есть, не перезаписывается. `load_run` читает
 замороженный конфиг и возвращает признак, сошлась ли контрольная сумма: правка файла
 не скрывается, а помечается. Лимиты у всех участников общие (`Limits()`), TOML
-переопределяет только `max_session_usd`.
+переопределяет только `max_session_usd`. `active_runs` отдаёт планировщику каждый прогон,
+чей статус не конечный (`TERMINAL_STATUSES`), в том числе `invalid`: у него отключаются
+только сессии агента, HP и стопы работают.
 """
 import hashlib
 import json
@@ -22,6 +24,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 BROKERS = ("alpaca", "sim")
+TERMINAL_STATUSES = ("dead", "finished")   # прогон в этих статусах больше не проверяется
 RESEARCH = ("self", "analyst")
 
 
@@ -137,8 +140,8 @@ def active_runs(runs_dir: Path) -> list[Path]:
 
     def active(run: Path) -> bool:
         try:
-            return RunStore(run).state()["status"] in ("active", "finishing")
-        except (OSError, ValueError):
+            return RunStore(run).state()["status"] not in TERMINAL_STATUSES
+        except (OSError, ValueError, TypeError):
             return True  # нечитаемое состояние не прячет прогон: тик сообщит об ошибке по нему
 
     return sorted(p.parent for p in Path(runs_dir).glob("*/*/config.json") if active(p.parent))

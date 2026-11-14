@@ -41,12 +41,13 @@ def test_stop_fills_found_by_sync_are_reported(env):
     market.lows = {"AAPL": (185.0, 199.0)}
     assert run_safety(cfg, store, b, "2026-12-02").stop_fills == ("AAPL",)
 
-def test_finishing_run_is_still_checked(env):
+@pytest.mark.parametrize("status", ["finishing", "invalid"])
+def test_finishing_run_is_still_checked(env, status):
     cfg, store, market = env
     b = SimBroker(cfg, store, market)
     b.buy("2026-12-01", "AAPL", 1000.0, 1.0, "тезис", "x/1")
     market.prices["AAPL"] = 169.0
-    store.update_state(status="finishing")
+    store.update_state(status=status)
     assert run_safety(cfg, store, b, "2026-12-02").died is True
     assert store.state()["status"] == "dead"
 

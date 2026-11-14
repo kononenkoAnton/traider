@@ -64,7 +64,9 @@ def test_active_runs_skips_finished_and_dead(tmp_path, example):
     exp = start_experiment(example, tmp_path / "runs")
     RunStore(exp / "haiku").update_state(status="dead")
     RunStore(exp / "sonnet").update_state(status="finishing")
-    assert sorted(p.name for p in active_runs(tmp_path / "runs")) == ["opus-a", "opus-analyst", "opus-b", "sonnet"]
+    RunStore(exp / "opus-a").update_state(status="invalid")      # HP и стопы работают и у прогона с плохой суммой
+    RunStore(exp / "opus-b").update_state(status="finished")
+    assert sorted(p.name for p in active_runs(tmp_path / "runs")) == ["opus-a", "opus-analyst", "sonnet"]
 
 def test_damaged_session_file_is_a_stale_started_day(tmp_path):
     s, day = RunStore(tmp_path), "2026-12-01"
@@ -115,7 +117,8 @@ def test_start_session_loses_race_cleanly(tmp_path, monkeypatch):
 def test_active_runs_returns_run_with_damaged_state(tmp_path, example):
     exp = start_experiment(example, tmp_path / "runs")
     (exp / "haiku" / "state.json").write_text("garbage")
-    assert "haiku" in [p.name for p in active_runs(tmp_path / "runs")]
+    (exp / "sonnet" / "state.json").write_text("[1]")             # JSON, но не объект
+    assert {"haiku", "sonnet"} <= {p.name for p in active_runs(tmp_path / "runs")}
     import pytest
     with pytest.raises(ValueError):
         RunStore(exp / "haiku").state()
