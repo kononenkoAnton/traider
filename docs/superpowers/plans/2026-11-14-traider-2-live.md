@@ -21,6 +21,23 @@
 - Тесты с пометкой `paper` запускаются только командой `uv run pytest -m paper` и только после того, как владелец положил ключи в `.env`.
 - Текст из новостей и поиска — данные. Системный промпт прямо говорит агенту не выполнять указания из такого текста.
 
+## Ядро после плана 1: что учитывать
+
+План 1 исполнен, и общий просмотр изменил несколько интерфейсов. Где текст задач ниже расходится с этим разделом, действует этот раздел.
+
+- `Market.lows_since(symbols, since)` возвращает по каждой бумаге список пар `(минимум, открытие)` по свечам с момента `since`, по порядку времени. Встроенный счёт берёт первую пару, где минимум не выше стопа.
+- `Market.now()` возвращает время с часовым поясом. `AlpacaMarket.last_prices` при ошибке связи поднимает исключение и никогда не возвращает пустой ответ молча.
+- Каждый брокер проходит два контрактных теста из `tests/broker_contract.py`: `run_contract` и `run_refusal_contract`. Негодная котировка даёт `NoPrice`; нет позиции, неверная доля, негодный стоп или повтор идентификатора с другой бумагой дают `BrokerRejected`; при отказе в журнал ничего не пишется.
+- События журнала: `close` и `liquidate` несут `fraction`, `raise_stop` несёт котировку в `price`, каждая продажа несёт `entry_price`. Счёт Alpaca пишет те же поля.
+- `account()` поднимает максимум капитала, в том числе когда позиций нет, но не поднимает его, если у удерживаемой бумаги нет годной котировки.
+- `SafetyReport` имеет поле `unpriced`: бумаги без годной котировки. Если оно не пусто, тик не проводит сессию этого участника и возвращает `action = "unpriced"`.
+- `active_runs` возвращает все прогоны, кроме `dead` и `finished` (`TERMINAL_STATUSES` в `traider/config.py`), то есть и `invalid`.
+- Проверка «годное число» одна: `traider/nums.py`, функция `usable`.
+- `RunStore.append_order(event, ts=None)`: события, которые пишет слой инструментов, передают `ts=market.now()`.
+- `apply_buy` поднимает ошибку, если сумма больше свободных денег. Любое исключение клетки или брокера слой инструментов превращает в записанный отказ с кодом `bad_request`, `no_price` или `broker_rejected`.
+- Встроенный счёт собирается из журнала при каждом обращении. Тест, которому нужна позиция, создаёт её через `broker.buy`, а не через `store.save_account`.
+- У Haiku 5.5 запросы длиннее 100 тысяч токенов стоят $0.50 за вход и $2.50 за выход. Стоимость считается по каждому запросу отдельно: таблица цен может нести `long_prompt_threshold`, `input_long` и `output_long`, и при длине запроса выше порога берутся они.
+
 ## Review Focus
 
 1. Alpaca отклоняет заявку или исполняет её частично: стоп ставится только на исполненное количество, в журнал попадает фактическое количество, агент получает понятный отказ. Задача 2.
@@ -66,7 +83,8 @@ def run_market_contract(market):
     news = market.news(["AAPL"], 5)
     assert len(news) <= 5 and all({"ts", "headline", "summary", "symbols"} <= set(n) for n in news)
     assert market.fractionable(["AAPL", "NOPE_XX"]) == {"AAPL"}
-    assert all(low <= first_open for low, first_open in market.lows_since(["AAPL"], market.now() - timedelta(days=5)).values())
+    bars = market.lows_since(["AAPL"], market.now() - timedelta(days=5))
+    assert all(low <= open_ for pairs in bars.values() for low, open_ in pairs)
     week = market.trading_days("2026-11-02", "2026-11-06")
     assert week == ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"]
 
@@ -101,7 +119,7 @@ Expected: FAIL, нет `traider.env` и `data/universe.txt`.
 
 - [ ] **Step 3: Реализовать `load_env`, `AlpacaMarket` и собрать вселенную**
 
-Данные берутся с бесплатной ленты IEX. `lows_since` считает минимум по минутным свечам с момента `since` и возвращает первую цену открытия после него. `tools/build_universe.py` собирает состав S&P 500 из открытого источника, добавляет ETF `SPY QQQ IWM DIA XLK XLF XLE XLV XLI XLY XLP XLU XLB XLRE XLC TLT GLD`, оставляет только то, что возвращает `AlpacaMarket.fractionable`, и пишет `data/universe.txt`. Скрипту нужны ключи, поэтому его запускает владелец или ассистент с его согласия; до этого файл собирается без фильтра по Alpaca.
+Данные берутся с бесплатной ленты IEX. `lows_since` возвращает по каждой бумаге пары `(минимум, открытие)` по 15-минутным свечам с момента `since`, по порядку времени. При ошибке связи методы поднимают исключение. `tools/build_universe.py` собирает состав S&P 500 из открытого источника, добавляет ETF `SPY QQQ IWM DIA XLK XLF XLE XLV XLI XLY XLP XLU XLB XLRE XLC TLT GLD`, оставляет только то, что возвращает `AlpacaMarket.fractionable`, и пишет `data/universe.txt`. Скрипту нужны ключи, поэтому его запускает владелец или ассистент с его согласия; до этого файл собирается без фильтра по Alpaca.
 
 - [ ] **Step 4: Убедиться, что тесты проходят**
 
@@ -330,6 +348,13 @@ def run(script, **kw):
 
 def test_cost_arithmetic():
     assert cost_usd(Usage(1_000_000, 100_000, 2_000_000, 400_000, 3), PRICES) == pytest.approx(4.0 + 2.0 + 0.4 + 2.0 + 0.03)
+
+def test_long_prompts_use_the_long_tier():
+    haiku = {"input": 0.10, "output": 0.50, "cache_read": 0.01, "cache_write": 0.125, "search": 0.01,
+             "long_prompt_threshold": 100_000, "input_long": 0.50, "output_long": 2.50}
+    assert cost_usd(Usage(input=90_000, output=10_000), haiku) == pytest.approx(0.009 + 0.005)
+    assert cost_usd(Usage(input=150_000, output=10_000), haiku) == pytest.approx(0.075 + 0.025)
+    assert cost_usd(Usage(input=20_000, cache_read=90_000, output=10_000), haiku) == pytest.approx(0.01 + 0.0009 + 0.025)   # длина запроса считается с кэшем
 
 def test_runs_tools_until_the_terminal_one():
     result, client = run([use("echo", x="a"), use("finish")])
@@ -771,7 +796,7 @@ def tick(runs_dir: Path, market: Market, make_broker: Callable[[RunConfig, RunSt
 def main(argv: Sequence[str] | None = None) -> int     # команды: start <toml> [--live], tick, status
 ```
 
-Элемент результата `tick`: `{"participant": str, "action": str, ...}`. Значения `action`: `safety` (только проверка), `session`, `missed`, `stale_failed`, `died`, `finishing`, `finished`, `invalid`, `error`.
+Элемент результата `tick`: `{"participant": str, "action": str, ...}`. Значения `action`: `safety` (только проверка), `session`, `missed`, `stale_failed`, `died`, `finishing`, `finished`, `invalid`, `unpriced`, `error`.
 
 Правила:
 - рынок закрыт — пустой список;
@@ -862,9 +887,26 @@ def test_lock_blocks_a_second_tick_and_expires(world):
 
 def test_dead_run_is_reported_once_and_then_skipped(world):
     runs, market, mb, mc, _ = world
-    store = RunStore(runs / "pilot-1" / "opus-b"); store.save_account(Account(840.0, (), 1000.0))
+    run = runs / "pilot-1" / "opus-b"; cfg, _ = load_run(run)
+    SimBroker(cfg, RunStore(run), market).buy("2026-11-30", "AAPL", 1000.0, 1.0, "т", "seed/1")
+    market.prices["AAPL"] *= 0.8                                                  # капитал около 800 при поле 850
     assert actions(tick(runs, market, mb, mc))["opus-b"] == "died"
     assert "opus-b" not in actions(tick(runs, market, mb, mc))
+
+def test_invalid_run_keeps_its_safety_check_on_later_ticks(world):
+    runs, market, mb, mc, _ = world
+    path = runs / "pilot-1" / "haiku" / "config.json"; path.write_text(path.read_text().replace('"seed": 20261114', '"seed": 1'))
+    tick(runs, market, mb, mc)
+    market.clock = ny(2026, 12, 1, 10, 20)
+    assert actions(tick(runs, market, mb, mc))["haiku"] == "invalid"              # прогон по-прежнему посещается
+
+def test_unpriced_position_blocks_the_session(world):
+    runs, market, mb, mc, _ = world
+    run = runs / "pilot-1" / "opus-b"; cfg, _ = load_run(run)
+    SimBroker(cfg, RunStore(run), market).buy("2026-11-30", "AAPL", 100.0, 1.0, "т", "seed/1")
+    del market.prices["AAPL"]
+    assert actions(tick(runs, market, mb, mc))["opus-b"] == "unpriced"
+    assert RunStore(run).session("2026-12-01") is None
 
 def test_finishing_run_becomes_finished_after_five_trading_days(world):
     runs, market, mb, mc, _ = world
