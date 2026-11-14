@@ -9,7 +9,8 @@
 строки) и `ts`, строка пишется одним вызовом, сбрасывается и делает fsync. Оборванная
 сбоем последняя строка при чтении пропускается, а следующая запись начинается с новой
 строки. Остальные JSON-файлы (состояние, записи сессий, снимки цен) пишутся через
-временный файл и `os.replace`, чтобы сбой не оставил половину файла. Факты сессии для
+временный файл и `os.replace`, чтобы сбой не оставил половину файла. NaN и бесконечность не
+записываются никуда: такая запись даёт ValueError до любого изменения файла. Факты сессии для
 клетки (`SessionFacts`) считаются из журнала заявок и прогнозов, отдельно не хранятся.
 Встроенный счёт лежит в `state.json` под ключом `account`.
 """
@@ -27,9 +28,10 @@ DEFAULT_STATE = {"status": "active", "notes": "", "last_sync": None}
 
 
 def _dump_json(tmp: Path, data) -> None:
+    text = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False)   # NaN и бесконечность не пишутся
     tmp.parent.mkdir(parents=True, exist_ok=True)
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write(text)
         f.flush()
         os.fsync(f.fileno())
 
@@ -57,12 +59,13 @@ def _read_lines(path: Path) -> list[dict]:
 
 
 def _append_line(path: Path, record: dict) -> None:
+    line = json.dumps(record, ensure_ascii=False, allow_nan=False).encode() + b"\n"
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "ab+") as f:
         f.seek(0, os.SEEK_END)
         fresh = f.tell() == 0 or (f.seek(-1, os.SEEK_END), f.read(1))[1] == b"\n"
         f.seek(0, os.SEEK_END)
-        f.write((b"" if fresh else b"\n") + json.dumps(record, ensure_ascii=False).encode() + b"\n")
+        f.write((b"" if fresh else b"\n") + line)
         f.flush()
         os.fsync(f.fileno())
 
@@ -83,8 +86,12 @@ class RunStore:
         evs = _read_lines(self.dir / "orders.jsonl")
         return evs if day is None else [e for e in evs if e.get("day") == day]
 
-    def find_order(self, client_order_id: str) -> dict | None:
-        return next((e for e in self.orders() if e.get("client_order_id") == client_order_id), None)
+    def find_order(self, client_order_id: str | None) -> dict | None:
+        # повтором считается только исполненная заявка; отказ или стоп с тем же id не сделка
+        if client_order_id is None:
+            return None
+        return next((e for e in self.orders() if e.get("client_order_id") == client_order_id
+                     and e.get("kind") in ("buy", "close")), None)
 
     # сессии
     def _session_path(self, day: str) -> Path:

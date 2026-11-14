@@ -10,18 +10,26 @@
 количествам и ценам (проскальзывание заново не считается), от сохранённого счёта берётся
 только пик капитала, если он выше. Поэтому сбой между записью и сохранением ничего не
 портит, а повтор заявки с тем же `client_order_id` не торгует снова, а возвращает
-`Fill` из записанного события. Сверка считает минимумы бумаги только с момента, когда существуют позиция и её нынешний стоп. Нет цены бумаги: `NoPrice` до любой записи. Ошибки
-`ValueError` из `traider.sim` пробрасываются.
+`Fill` из записанного события; повтор id по другой бумаге даёт `BrokerRejected`. Сверка
+считает минимумы бумаги только с момента, когда существуют позиция и её нынешний стоп.
+
+Отказы до любой записи: нет годной котировки (её нет или она не конечное положительное
+число) в `buy` и `close` даёт `NoPrice`; нет позиции, доля вне (0, 1] или негодный стоп в
+`close` и `raise_stop` дают `BrokerRejected`. Ошибки `ValueError` из `traider.sim`
+пробрасываются. События продажи (`close`, `stop_fill`, `liquidate`) несут `entry_price`
+позиции, `close` и `liquidate` ещё `fraction`, `raise_stop` котировку в `price` (None, если
+годной нет). `account` поднимает пик и у пустого счёта, но не поднимает его, пока у
+какой-то удерживаемой бумаги нет годной котировки.
 """
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime
-from math import isfinite
 from typing import Protocol
 
 from traider.cage import Account, Position
 from traider.config import RunConfig
 from traider.market import Market
+from traider.nums import usable
 from traider.sim import Fill, apply_buy, apply_close, apply_stops, mark_peak
 from traider.store import RunStore
 
@@ -82,21 +90,26 @@ class SimBroker:
 
     def _price(self, symbol: str) -> float:
         price = self.market.last_prices([symbol]).get(symbol)
-        if price is None:
+        if not usable(price):   # нет котировки и негодная котировка это один случай
             raise NoPrice(symbol)
         return price
 
-    def _repeat(self, client_order_id: str) -> Fill | None:
+    def _repeat(self, client_order_id: str, symbol: str) -> Fill | None:
         e = self.store.find_order(client_order_id)
         if e is None:
             return None
+        if e["symbol"] != symbol:
+            raise BrokerRejected(f"заявка {client_order_id} уже была по {e['symbol']}, не по {symbol}")
         self.store.save_account(self._load())
         return Fill(e["symbol"], e["qty"], e["price"], e["kind"])
 
     def account(self) -> Account:
         acct = self._load()
-        held = [p.symbol for p in acct.positions]
-        marked = mark_peak(acct, self.market.last_prices(held)) if held else acct
+        prices = self.market.last_prices([p.symbol for p in acct.positions])
+        # пик поднимается только по полным котировкам (у пустого счёта по деньгам): оценка по цене входа
+        # могла бы навсегда поднять пол над позицией, которая на деле упала
+        priced = all(usable(prices.get(p.symbol)) for p in acct.positions)
+        marked = mark_peak(acct, prices) if priced else acct
         saved = self.store.account()
         if saved is None or marked.peak_equity > saved.peak_equity:
             self.store.save_account(marked)
@@ -106,7 +119,7 @@ class SimBroker:
         return self.market.last_prices(symbols)
 
     def buy(self, day, symbol, notional, stop_price, thesis, client_order_id) -> Fill:
-        if (done := self._repeat(client_order_id)) is not None:
+        if (done := self._repeat(client_order_id, symbol)) is not None:
             return done
         acct = self._load()
         new, fill = apply_buy(acct, symbol, notional, self._price(symbol), stop_price)
@@ -116,21 +129,30 @@ class SimBroker:
         return fill
 
     def close(self, day, symbol, fraction, reason, client_order_id) -> Fill:
-        if (done := self._repeat(client_order_id)) is not None:
+        if (done := self._repeat(client_order_id, symbol)) is not None:
             return done
         acct = self._load()
+        pos = next((p for p in acct.positions if p.symbol == symbol), None)
+        if pos is None:
+            raise BrokerRejected(f"нет позиции по {symbol}")
+        if not (usable(fraction) and fraction <= 1):
+            raise BrokerRejected(f"доля должна быть в (0, 1]: {fraction}")
         new, fill = apply_close(acct, symbol, fraction, self._price(symbol))
-        self._log(day, "close", symbol, fill, reason=reason, client_order_id=client_order_id)
+        self._log(day, "close", symbol, fill, reason=reason, client_order_id=client_order_id,
+                  fraction=fraction, entry_price=pos.entry_price)
         self.store.save_account(new)
         return fill
 
     def raise_stop(self, day: str, symbol: str, stop_price: float) -> None:
         acct = self._load()
         if not any(p.symbol == symbol for p in acct.positions):
-            raise KeyError(symbol)
+            raise BrokerRejected(f"нет позиции по {symbol}")
+        if not usable(stop_price):
+            raise BrokerRejected(f"стоп должен быть конечным положительным числом: {stop_price}")
+        quote = self.market.last_prices([symbol]).get(symbol)
         self.store.append_order({
             "day": day, "kind": "raise_stop", "symbol": symbol, "notional": None, "qty": None,
-            "price": None, "stop_price": stop_price, "thesis": None, "reason": None,
+            "price": quote if usable(quote) else None, "stop_price": stop_price, "thesis": None, "reason": None,
             "client_order_id": None, "broker_order_id": None}, ts=self.market.now())
         self.store.save_account(self._load())
 
@@ -157,8 +179,9 @@ class SimBroker:
                 lows.update(self.market.lows_since(syms, start))
             new, fills = apply_stops(acct, {s: v[0] for s, v in lows.items()},
                                      {s: v[1] for s, v in lows.items()})
-            stops = {p.symbol: p.stop_price for p in acct.positions}
-            events = [self._log(day, "stop_fill", f.symbol, f, stop_price=stops[f.symbol], reason="stop")
+            held = {p.symbol: p for p in acct.positions}
+            events = [self._log(day, "stop_fill", f.symbol, f, stop_price=held[f.symbol].stop_price,
+                                entry_price=held[f.symbol].entry_price, reason="stop")
                       for f in fills]
             self.store.save_account(new)
         self.store.update_state(last_sync=self.market.now().isoformat())
@@ -169,10 +192,11 @@ class SimBroker:
         for p in acct.positions:
             # нет цены или она негодная: продаём по цене входа, чтобы ликвидация не оборвалась на полпути
             price = self.market.last_prices([p.symbol]).get(p.symbol)
-            if not (isinstance(price, (int, float)) and isfinite(price) and price > 0):
+            if not usable(price):
                 price = p.entry_price
             acct, fill = apply_close(acct, p.symbol, 1.0, price, "liquidate")
-            self._log(day, "liquidate", p.symbol, fill, reason="liquidate")
+            self._log(day, "liquidate", p.symbol, fill, reason="liquidate", fraction=1.0,
+                      entry_price=p.entry_price)
             self.store.save_account(acct)
             fills.append(fill)
         return fills

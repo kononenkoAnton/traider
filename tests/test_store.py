@@ -122,3 +122,24 @@ def test_active_runs_returns_run_with_damaged_state(tmp_path, example):
     import pytest
     with pytest.raises(ValueError):
         RunStore(exp / "haiku").state()
+
+def test_non_finite_numbers_are_never_written(tmp_path):
+    import pytest
+    s = RunStore(tmp_path)
+    s.append_order({"day": "2026-12-01", "kind": "buy", "symbol": "XLE"})
+    before = (tmp_path / "orders.jsonl").read_bytes()
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            s.append_order({"day": "2026-12-01", "kind": "raise_stop", "symbol": "XLE", "stop_price": bad})
+        with pytest.raises(ValueError):
+            s.update_state(notes=bad)
+    assert (tmp_path / "orders.jsonl").read_bytes() == before
+    assert s.state()["notes"] == "" and list(tmp_path.glob("*.tmp")) == []
+
+def test_find_order_matches_only_buys_and_closes(tmp_path):
+    s = RunStore(tmp_path)
+    s.append_order({"day": "2026-12-01", "kind": "reject", "symbol": "AAPL", "client_order_id": "x/9"})
+    s.append_order({"day": "2026-12-01", "kind": "stop_fill", "symbol": "XLE", "client_order_id": None})
+    assert s.find_order("x/9") is None and s.find_order(None) is None
+    s.append_order({"day": "2026-12-01", "kind": "close", "symbol": "XLE", "client_order_id": "x/9"})
+    assert s.find_order("x/9")["kind"] == "close"

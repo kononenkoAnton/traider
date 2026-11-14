@@ -11,15 +11,15 @@
 на общее количество, стоп берётся от новой покупки. Стоп срабатывает, если минимум
 не выше стопа; без гэпа он исполняется по стопу, при гэпе вниз по цене открытия,
 то есть по `min(стоп, открытие)`. Нет данных по бумаге: стоп не трогаем. Нечисловые
-или неположительные цена, сумма и доля в `apply_buy` и `apply_close` дают ValueError;
+или неположительные цена, сумма, стоп и доля в `apply_buy` и `apply_close` дают ValueError,
+как и покупка больше свободных денег;
 в `apply_stops` такой минимум означает отсутствие данных, а такое открытие считается
 выше стопа. `mark_peak` пик капитала только поднимает.
 """
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from math import isfinite
-
 from traider.cage import Account, Position, equity
+from traider.nums import usable
 
 SLIPPAGE = 0.0005
 
@@ -30,11 +30,8 @@ class Fill:
     price: float     # цена исполнения с учётом проскальзывания
     kind: str        # "buy" | "close" | "stop_fill" | "liquidate"
 
-def _ok(x: float | None) -> bool:
-    return isinstance(x, (int, float)) and isfinite(x) and x > 0
-
 def _positive(name: str, x: float) -> float:
-    if not _ok(x):
+    if not usable(x):
         raise ValueError(f"{name} должно быть конечным положительным числом: {x}")
     return x
 
@@ -50,6 +47,9 @@ def apply_buy(acct: Account, symbol: str, notional: float, price: float,
               stop_price: float) -> tuple[Account, Fill]:
     _positive("сумма", notional)
     _positive("цена", price)
+    _positive("стоп", stop_price)
+    if notional > acct.cash + 1e-9:
+        raise ValueError(f"сумма {notional} больше свободных денег {acct.cash}")
     fill_price = price * (1 + SLIPPAGE)
     qty = notional / fill_price
     old = next((p for p in acct.positions if p.symbol == symbol), None)
@@ -67,7 +67,7 @@ def apply_close(acct: Account, symbol: str, fraction: float, price: float,
     pos = next((p for p in acct.positions if p.symbol == symbol), None)
     if pos is None:
         raise KeyError(symbol)
-    if not (_ok(fraction) and fraction <= 1):
+    if not (usable(fraction) and fraction <= 1):
         raise ValueError(f"доля должна быть в (0, 1]: {fraction}")
     _positive("цена", price)
     return _sell(acct, pos, pos.qty * fraction, price, kind)
@@ -77,10 +77,10 @@ def apply_stops(acct: Account, lows: Mapping[str, float],
     fills: list[Fill] = []
     for pos in acct.positions:
         low = lows.get(pos.symbol)
-        if not _ok(low) or low > pos.stop_price:
+        if not usable(low) or low > pos.stop_price:
             continue
         opened = opens.get(pos.symbol)
-        base = min(pos.stop_price, opened) if _ok(opened) else pos.stop_price
+        base = min(pos.stop_price, opened) if usable(opened) else pos.stop_price
         acct, fill = _sell(acct, pos, pos.qty, base, "stop_fill")
         fills.append(fill)
     return acct, fills

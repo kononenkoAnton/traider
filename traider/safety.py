@@ -11,13 +11,16 @@
 капитал и пол по счёту брокера и ценам удерживаемых бумаг, затем либо гибель, либо
 `broker.ensure_stops`. Капитал ниже пола: `broker.liquidate`, статус `dead` и день
 гибели в `died_on`. Нечисловой капитал даёт ValueError из `traider.cage`, он не
-перехватывается: молча пропущенная проверка опаснее остановки.
+перехватывается: молча пропущенная проверка опаснее остановки. Удерживаемая бумага без
+годной котировки оценивается по цене входа (гибель решается по этой оценке), а отчёт
+перечисляет такие бумаги в `unpriced`.
 """
 from dataclasses import dataclass
 
 from traider.brokers import Broker
 from traider.cage import equity, floor, hp, is_dead
 from traider.config import TERMINAL_STATUSES, RunConfig
+from traider.nums import usable
 from traider.store import RunStore
 
 
@@ -29,6 +32,7 @@ class SafetyReport:
     died: bool
     stops_placed: tuple[str, ...]
     stop_fills: tuple[str, ...]
+    unpriced: tuple[str, ...] = ()   # удерживаемые бумаги без годной котировки: капитал по ним оценён по цене входа
 
 
 def run_safety(cfg: RunConfig, store: RunStore, broker: Broker, day: str) -> SafetyReport:
@@ -37,9 +41,10 @@ def run_safety(cfg: RunConfig, store: RunStore, broker: Broker, day: str) -> Saf
     fills = tuple(e["symbol"] for e in broker.sync(day))
     acct = broker.account()
     prices = broker.prices([p.symbol for p in acct.positions])
+    unpriced = tuple(p.symbol for p in acct.positions if not usable(prices.get(p.symbol)))
     eq, fl, h = equity(acct, prices), floor(acct, cfg.limits), hp(acct, prices, cfg.limits)
     if is_dead(acct, prices, cfg.limits):
         broker.liquidate(day)
         store.update_state(status="dead", died_on=day)
-        return SafetyReport(eq, fl, h, True, (), fills)
-    return SafetyReport(eq, fl, h, False, tuple(broker.ensure_stops()), fills)
+        return SafetyReport(eq, fl, h, True, (), fills, unpriced)
+    return SafetyReport(eq, fl, h, False, tuple(broker.ensure_stops()), fills, unpriced)

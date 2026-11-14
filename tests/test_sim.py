@@ -72,3 +72,15 @@ def test_peak_only_goes_up():
     acct, _ = apply_buy(START, "AAPL", 150.0, 200.0, 186.0)
     assert mark_peak(acct, {"AAPL": 260.0}).peak_equity > 1000.0
     assert mark_peak(acct, {"AAPL": 190.0}).peak_equity == 1000.0
+
+def test_buy_with_a_bad_stop_raises():
+    for stop in (math.nan, math.inf, 0.0, -1.0, True):
+        with pytest.raises(ValueError):
+            apply_buy(START, "AAPL", 150.0, 200.0, stop)
+
+def test_buy_cannot_spend_more_than_the_cash():
+    with pytest.raises(ValueError):
+        apply_buy(START, "AAPL", 5000.0, 200.0, 186.0)
+    assert START == Account(1000.0, (), 1000.0)
+    all_in, _ = apply_buy(START, "AAPL", 1000.0, 200.0, 186.0)
+    assert all_in.cash == 0.0

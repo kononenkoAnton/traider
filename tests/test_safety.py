@@ -60,3 +60,14 @@ def test_finished_run_is_a_noop(env):
     r = run_safety(cfg, store, b, "2026-12-02")
     assert (r.died, r.equity, r.floor, r.hp, r.stops_placed, r.stop_fills) == (False, 0.0, 0.0, 0.0, (), ())
     assert len(store.orders()) == 1 and store.state()["status"] == "finished"
+
+def test_held_symbols_without_a_quote_are_reported(env):
+    cfg, store, market = env
+    b = SimBroker(cfg, store, market)
+    b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    b.buy("2026-12-01", "XLE", 100.0, 90.0, "тезис", "x/2")
+    assert run_safety(cfg, store, b, "2026-12-01").unpriced == ()
+    del market.prices["AAPL"]
+    market.prices["XLE"] = float("nan")
+    r = run_safety(cfg, store, b, "2026-12-01")
+    assert sorted(r.unpriced) == ["AAPL", "XLE"] and r.died is False
