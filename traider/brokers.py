@@ -1,0 +1,163 @@
+"""Протокол брокера и встроенный счёт `SimBroker`.
+
+:wk-id: brokers-module
+:wk-tags: accounts, broker, ledger
+:wk-categories: system-architecture
+
+Как это работает. Каждый метод, меняющий счёт, сначала пишет событие в журнал заявок,
+потом сохраняет счёт. Журнал это истина: перед каждой операцией счёт заново
+собирается проигрыванием всего журнала с начального капитала по записанным
+количествам и ценам (проскальзывание заново не считается), от сохранённого счёта берётся
+только пик капитала, если он выше. Поэтому сбой между записью и сохранением ничего не
+портит, а повтор заявки с тем же `client_order_id` не торгует снова, а возвращает
+`Fill` из записанного события. Нет цены бумаги: `NoPrice` до любой записи. Ошибки
+`ValueError` из `traider.sim` пробрасываются.
+"""
+from collections.abc import Iterable
+from dataclasses import replace
+from datetime import datetime
+from typing import Protocol
+
+from traider.cage import Account, Position
+from traider.config import RunConfig
+from traider.market import Market
+from traider.sim import Fill, apply_buy, apply_close, apply_stops, mark_peak
+from traider.store import RunStore
+
+
+class BrokerRejected(Exception): ...
+class NoPrice(Exception): ...
+
+
+class Broker(Protocol):
+    def account(self) -> Account: ...
+    def prices(self, symbols: Iterable[str]) -> dict[str, float]: ...
+    def buy(self, day: str, symbol: str, notional: float, stop_price: float, thesis: str,
+            client_order_id: str) -> Fill: ...
+    def close(self, day: str, symbol: str, fraction: float, reason: str, client_order_id: str) -> Fill: ...
+    def raise_stop(self, day: str, symbol: str, stop_price: float) -> None: ...
+    def ensure_stops(self) -> list[str]: ...
+    def sync(self, day: str) -> list[dict]: ...
+    def liquidate(self, day: str) -> list[Fill]: ...
+
+
+def _replay(events: list[dict], start: Account) -> Account:
+    cash, pos = start.cash, {p.symbol: p for p in start.positions}
+    for e in events:
+        kind, sym = e.get("kind"), e.get("symbol")
+        if kind == "buy":
+            old, qty = pos.get(sym), e["qty"]
+            total = qty if old is None else old.qty + qty
+            entry = e["price"] if old is None else (old.qty * old.entry_price + e["notional"]) / total
+            pos[sym] = Position(sym, total, entry, e["stop_price"])
+            cash -= e["notional"]
+        elif kind in ("close", "stop_fill", "liquidate") and sym in pos:
+            cash += e["qty"] * e["price"]
+            kept = pos[sym].qty - e["qty"]
+            if kept > 0:
+                pos[sym] = replace(pos[sym], qty=kept)
+            else:
+                del pos[sym]
+        elif kind == "raise_stop" and sym in pos:
+            pos[sym] = replace(pos[sym], stop_price=e["stop_price"])
+    return Account(cash, tuple(pos.values()), start.peak_equity)
+
+
+class SimBroker:
+    def __init__(self, cfg: RunConfig, store: RunStore, market: Market):
+        self.cfg, self.store, self.market = cfg, store, market
+
+    def _load(self) -> Account:
+        saved = self.store.account()
+        peak = saved.peak_equity if saved else self.cfg.start_equity
+        start = Account(self.cfg.start_equity, (), max(peak, self.cfg.start_equity))
+        return _replay(self.store.orders(), start)
+
+    def _log(self, day: str, kind: str, symbol: str, fill: Fill, **extra) -> dict:
+        return self.store.append_order({
+            "day": day, "kind": kind, "symbol": symbol, "notional": None, "qty": fill.qty,
+            "price": fill.price, "stop_price": None, "thesis": None, "reason": None,
+            "client_order_id": None, "broker_order_id": None, **extra})
+
+    def _price(self, symbol: str) -> float:
+        price = self.market.last_prices([symbol]).get(symbol)
+        if price is None:
+            raise NoPrice(symbol)
+        return price
+
+    def _repeat(self, client_order_id: str) -> Fill | None:
+        e = self.store.find_order(client_order_id)
+        if e is None:
+            return None
+        self.store.save_account(self._load())
+        return Fill(e["symbol"], e["qty"], e["price"], e["kind"])
+
+    def account(self) -> Account:
+        acct = self._load()
+        held = [p.symbol for p in acct.positions]
+        marked = mark_peak(acct, self.market.last_prices(held)) if held else acct
+        saved = self.store.account()
+        if saved is None or marked.peak_equity > saved.peak_equity:
+            self.store.save_account(marked)
+        return marked
+
+    def prices(self, symbols: Iterable[str]) -> dict[str, float]:
+        return self.market.last_prices(symbols)
+
+    def buy(self, day, symbol, notional, stop_price, thesis, client_order_id) -> Fill:
+        if (done := self._repeat(client_order_id)) is not None:
+            return done
+        acct = self._load()
+        new, fill = apply_buy(acct, symbol, notional, self._price(symbol), stop_price)
+        self._log(day, "buy", symbol, fill, notional=notional, stop_price=stop_price, thesis=thesis,
+                  client_order_id=client_order_id)
+        self.store.save_account(new)
+        return fill
+
+    def close(self, day, symbol, fraction, reason, client_order_id) -> Fill:
+        if (done := self._repeat(client_order_id)) is not None:
+            return done
+        acct = self._load()
+        new, fill = apply_close(acct, symbol, fraction, self._price(symbol))
+        self._log(day, "close", symbol, fill, reason=reason, client_order_id=client_order_id)
+        self.store.save_account(new)
+        return fill
+
+    def raise_stop(self, day: str, symbol: str, stop_price: float) -> None:
+        acct = self._load()
+        if not any(p.symbol == symbol for p in acct.positions):
+            raise KeyError(symbol)
+        self.store.append_order({
+            "day": day, "kind": "raise_stop", "symbol": symbol, "notional": None, "qty": None,
+            "price": None, "stop_price": stop_price, "thesis": None, "reason": None,
+            "client_order_id": None, "broker_order_id": None})
+        self.store.save_account(self._load())
+
+    def ensure_stops(self) -> list[str]:
+        return []   # встроенный счёт проверяет стопы сам в sync
+
+    def sync(self, day: str) -> list[dict]:
+        acct = self._load()
+        events: list[dict] = []
+        if acct.positions:
+            last = self.store.state()["last_sync"] or self.store.orders()[0]["ts"]
+            lows = self.market.lows_since([p.symbol for p in acct.positions], datetime.fromisoformat(last))
+            new, fills = apply_stops(acct, {s: v[0] for s, v in lows.items()},
+                                     {s: v[1] for s, v in lows.items()})
+            stops = {p.symbol: p.stop_price for p in acct.positions}
+            events = [self._log(day, "stop_fill", f.symbol, f, stop_price=stops[f.symbol], reason="stop")
+                      for f in fills]
+            self.store.save_account(new)
+        self.store.update_state(last_sync=self.market.now().isoformat())
+        return events
+
+    def liquidate(self, day: str) -> list[Fill]:
+        acct, fills = self._load(), []
+        for p in acct.positions:
+            # нет цены: продаём по цене входа, чтобы ликвидация не оборвалась на полпути
+            price = self.market.last_prices([p.symbol]).get(p.symbol, p.entry_price)
+            acct, fill = apply_close(acct, p.symbol, 1.0, price, "liquidate")
+            self._log(day, "liquidate", p.symbol, fill, reason="liquidate")
+            self.store.save_account(acct)
+            fills.append(fill)
+        return fills

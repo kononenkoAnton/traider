@@ -3,6 +3,10 @@ import re
 
 import pytest
 
+from tests.fakes import FakeMarket
+from traider.config import load_run, start_experiment
+from traider.store import RunStore
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PANEL = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK.B", "JPM", "V",
          "UNH", "XOM", "LLY", "AVGO", "COST", "WMT", "HD", "PG", "JNJ", "MA"]
@@ -24,6 +28,13 @@ def _make(tmp_path, edit=lambda text: text):
 @pytest.fixture
 def example(tmp_path):
     return _make(tmp_path)
+
+
+@pytest.fixture
+def env(tmp_path, example):
+    run = start_experiment(example, tmp_path / "runs") / "opus-b"
+    cfg, _ = load_run(run)
+    return cfg, RunStore(run), FakeMarket(prices={"AAPL": 200.0, "XLE": 100.0})
 
 
 @pytest.fixture
