@@ -10,7 +10,8 @@
 `benchmark`. Порядок результата: дни сессии как заданы; внутри дня бумаги панели в порядке
 панели (пропущенный прогноз становится 0.5 с `missing=True`), затем бумаги вне панели в
 порядке прогнозов. Если день и бумага повторены, остаётся последний прогноз. Прогноз, где
-`p` не конечное число из [0, 1], считается пропущенным. Пара выпадает целиком, если нет
+`p` не конечное число из [0, 1], считается пропущенным. Прогноз по самому `benchmark`
+пропускается. Пара выпадает целиком, если нет
 положительной цены закрытия бумаги или бенчмарка в один из двух дней, либо дня со сдвигом
 `horizon` нет в `trading_days`.
 
@@ -29,6 +30,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import ceil, isfinite
 
+from traider.nums import usable
+
 
 @dataclass(frozen=True)
 class Scored:
@@ -45,7 +48,7 @@ def _p_ok(p: object) -> bool:
 
 def _close(closes: Mapping[str, Mapping[str, float]], symbol: str, day: str) -> float | None:
     x = closes.get(symbol, {}).get(day)
-    return x if isinstance(x, (int, float)) and isfinite(x) and x > 0 else None
+    return x if usable(x) else None
 
 
 def score(forecasts: Sequence[dict], closes: Mapping[str, Mapping[str, float]], trading_days: Sequence[str],
@@ -65,6 +68,8 @@ def score(forecasts: Sequence[dict], closes: Mapping[str, Mapping[str, float]], 
             continue
         today = given.get(day, {})
         for sym in [*panel, *(s for s in today if s not in panel)]:
+            if sym == benchmark:   # бумага не может обогнать саму себя
+                continue
             s0, s1 = _close(closes, sym, day), _close(closes, sym, end)
             if s0 is None or s1 is None:
                 continue

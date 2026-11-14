@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from traider.cage import Account, Position, SessionFacts
 from traider.config import active_runs, start_experiment
@@ -107,7 +108,7 @@ def test_start_session_loses_race_cleanly(tmp_path, monkeypatch):
     real_link = store.os.link
     def racing_link(src, dst):
         (tmp_path / "sessions").mkdir(exist_ok=True)
-        open(dst, "w").write(json.dumps({"day": day, "status": "started", "started_at": "winner"}))
+        Path(dst).write_text(json.dumps({"day": day, "status": "started", "started_at": "winner"}))
         return real_link(src, dst)
     monkeypatch.setattr(store.os, "link", racing_link)
     assert s.start_session(day, datetime(2026, 12, 1, tzinfo=timezone.utc)) is False

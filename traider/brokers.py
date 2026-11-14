@@ -19,8 +19,10 @@
 `close` и `raise_stop` дают `BrokerRejected`. Ошибки `ValueError` из `traider.sim`
 пробрасываются. События продажи (`close`, `stop_fill`, `liquidate`) несут `entry_price`
 позиции, `close` и `liquidate` ещё `fraction`, `raise_stop` котировку в `price` (None, если
-годной нет). `account` поднимает пик и у пустого счёта, но не поднимает его, пока у
-какой-то удерживаемой бумаги нет годной котировки.
+годной нет). Ликвидация бумаги без годной котировки идёт по цене входа и пишет причину
+`no_quote_entry_price`. `account` поднимает пик и у пустого счёта, но не поднимает его, пока у
+какой-то удерживаемой бумаги нет годной котировки, и сохраняет счёт, если он отличается
+от сохранённого.
 """
 from collections.abc import Iterable
 from dataclasses import replace
@@ -111,8 +113,7 @@ class SimBroker:
         # могла бы навсегда поднять пол над позицией, которая на деле упала
         priced = all(usable(prices.get(p.symbol)) for p in acct.positions)
         marked = mark_peak(acct, prices) if priced else acct
-        saved = self.store.account()
-        if saved is None or marked.peak_equity > saved.peak_equity:
+        if marked != self.store.account():
             self.store.save_account(marked)
         return marked
 
@@ -199,10 +200,11 @@ class SimBroker:
         for p in acct.positions:
             # нет цены или она негодная: продаём по цене входа, чтобы ликвидация не оборвалась на полпути
             price = self.market.last_prices([p.symbol]).get(p.symbol)
+            reason = "liquidate" if usable(price) else "no_quote_entry_price"
             if not usable(price):
                 price = p.entry_price
             acct, fill = apply_close(acct, p.symbol, 1.0, price, "liquidate")
-            self._log(day, "liquidate", p.symbol, fill, reason="liquidate", fraction=1.0,
+            self._log(day, "liquidate", p.symbol, fill, reason=reason, fraction=1.0,
                       entry_price=p.entry_price)
             self.store.save_account(acct)
             fills.append(fill)

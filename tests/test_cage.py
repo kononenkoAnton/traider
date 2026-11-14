@@ -117,3 +117,16 @@ def test_nan_stop_on_held_position_is_bad_request():
     assert code(acct=acct) == "bad_request"
     r = check_raise_stop("AAPL", 190.0, acct, PRICES, LIM)
     assert r.code == "bad_request"
+
+
+def test_add_on_counts_the_held_value_against_the_cap():
+    acct = Account(850.0, (Position("AAPL", 0.75, 200.0, 186.0),), 1000.0)   # держим 150 при капитале 1000
+    assert code(notional=60.0, acct=acct) == "position_too_large"
+    assert code(notional=50.0, acct=acct) is None
+
+
+def test_add_on_risk_uses_the_new_stop_on_the_whole_position():
+    # прочий риск 60, AAPL 0.25 со стопом 175: старый риск 66.25 из 80; докупка 150 переносит стоп на всю позицию
+    acct = Account(450.0, (Position("XLE", 5.0, 100.0, 88.0), Position("AAPL", 0.25, 200.0, 175.0)), 1000.0)
+    assert code(notional=150.0, stop=176.0, acct=acct) == "open_risk_too_high"   # 60 + 1.0 * 24 = 84
+    assert code(notional=150.0, stop=180.0, acct=acct) is None                   # 60 + 1.0 * 20 = 80

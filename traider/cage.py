@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from math import isfinite
 
 from traider.config import Limits
+from traider.nums import usable
 
 EPS = 1e-9
 
@@ -60,14 +61,10 @@ class Reject:
     detail: str   # русская фраза с числами для агента
 
 
-def _ok(x: float) -> bool:
-    return isinstance(x, (int, float)) and isfinite(x) and x > 0
-
-
 def _price(p: Position, prices: Mapping[str, float]) -> float:
     # котировка годится только конечная и положительная, иначе оцениваем по цене входа
     q = prices.get(p.symbol)
-    return q if q is not None and _ok(q) else p.entry_price
+    return q if usable(q) else p.entry_price
 
 
 def _finite(x: float) -> float:
@@ -121,12 +118,12 @@ def check_buy(req: BuyRequest, acct: Account, prices: Mapping[str, float], facts
     sym = req.symbol
     if _account_corrupt(acct):
         return Reject("bad_request", "В данных счёта нечисловое значение, заявка не принимается.")
-    if not (_ok(req.notional) and _ok(req.stop_price)):
+    if not (usable(req.notional) and usable(req.stop_price)):
         return Reject("bad_request", "Сумма и стоп должны быть конечными положительными числами.")
     if sym not in universe:
         return Reject("not_in_universe", f"{sym} нет во вселенной, купить его нельзя.")
     price = prices.get(sym)
-    if price is None or not _ok(price):
+    if not usable(price):
         return Reject("no_price", f"Нет цены для {sym}, покупка невозможна.")
     if not facts.panel_done:
         return Reject("no_panel_forecasts", "Сначала запишите прогнозы по всей панели, потом покупайте.")
@@ -170,13 +167,13 @@ def check_raise_stop(symbol: str, new_stop: float, acct: Account, prices: Mappin
                      limits: Limits) -> Reject | None:
     if _account_corrupt(acct):
         return Reject("bad_request", "В данных счёта нечисловое значение, стоп не меняется.")
-    if not _ok(new_stop):
+    if not usable(new_stop):
         return Reject("bad_request", "Стоп должен быть конечным положительным числом.")
     held = [p for p in acct.positions if p.symbol == symbol]
     if not held:
         return Reject("no_position", f"Позиции по {symbol} нет, поднимать нечего.")
     price = prices.get(symbol)
-    if price is None or not _ok(price):
+    if not usable(price):
         return Reject("no_price", f"Нет цены для {symbol}, стоп изменить нельзя.")
     old_stop = max(p.stop_price for p in held)
     if not (new_stop > old_stop + EPS):

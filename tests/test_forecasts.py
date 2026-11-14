@@ -85,3 +85,12 @@ def test_empty_buckets_and_last_bucket_includes_one():
 def test_summary_lines():
     scored = [Scored("d", "A", 0.65, 1, False), Scored("d", "B", 0.70, 0, False), Scored("d", "C", 0.10, 0, False)]
     assert summary_text(scored).split("\n") == ["прогнозы 0–20%: сбылось 0% (n=1)", "прогнозы 60–80%: сбылось 50% (n=2)"]
+
+def test_one_block_of_all_days_gives_a_point_interval():
+    scored = [Scored(f"d{i // 4:02d}", f"S{i % 4}", 0.6, int((i * 7) % 3 == 0), False) for i in range(80)]
+    lo, hi = bootstrap_diff(scored, block=len({s.day for s in scored}))
+    assert lo == hi == brier(scored) - reference(scored)
+
+def test_forecast_for_the_benchmark_itself_is_skipped():
+    fc = [{"day": DAYS[0], "symbol": "SPY", "p": 0.9}, {"day": DAYS[0], "symbol": "AAPL", "p": 0.7}]
+    assert [s.symbol for s in score(fc, CLOSES, DAYS, [DAYS[0]], ["SPY", "AAPL"])] == ["AAPL"]

@@ -6,7 +6,8 @@
 
 Как это работает. `start_experiment` читает TOML (`tomllib`) и проверяет его целиком
 до первой записи на диск: режим live требует флага `live=True`, модель должна быть в
-таблице `[prices]`, брокер из `alpaca|sim`, источник информации из `self|analyst`.
+таблице `[prices]`, брокер из `alpaca|sim`, источник информации из `self|analyst`, все
+бумаги панели во вселенной, в `[criteria]` и в каждой таблице цен есть все ключи.
 Пути к файлам вселенной и промптов считаются от каталога самого TOML. Для каждого
 участника в `runs/<experiment>/<participant>/` пишутся `config.json` (тексты промптов
 и вселенная встроены в него) и `config.sha256` (SHA-256 байтов `config.json`).
@@ -26,6 +27,8 @@ from pathlib import Path
 BROKERS = ("alpaca", "sim")
 TERMINAL_STATUSES = ("dead", "finished")   # прогон в этих статусах больше не проверяется
 RESEARCH = ("self", "analyst")
+CRITERIA_KEYS = ("min_sessions", "max_missed_share", "min_closed_trades", "red_percentile", "green_percentile")
+PRICE_KEYS = ("input", "output", "cache_read", "cache_write", "search")
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,13 @@ def _build(toml_path: Path, live: bool) -> list[RunConfig]:
     universe = tuple((base / t["universe_file"]).read_text(encoding="utf-8").split())
     system = (base / t["system_prompt_file"]).read_text(encoding="utf-8")
     analyst_text = (base / t["analyst_prompt_file"]).read_text(encoding="utf-8")
+    if missing := [s for s in t["panel"] if s not in universe]:
+        raise ValueError(f"бумаг панели нет во вселенной: {', '.join(missing)}")
+    if missing := [k for k in CRITERIA_KEYS if k not in t["criteria"]]:
+        raise ValueError(f"в [criteria] нет ключей: {', '.join(missing)}")
+    for model, table in t["prices"].items():
+        if missing := [k for k in PRICE_KEYS if k not in table]:
+            raise ValueError(f"в ценах {model} нет ключей: {', '.join(missing)}")
     runs = []
     names = [p["name"] for p in t["participants"]]
     for name in set(names):

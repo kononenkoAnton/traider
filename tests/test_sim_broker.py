@@ -2,7 +2,7 @@ import pytest
 
 from tests.fakes import ny
 from tests.broker_contract import run_contract, run_refusal_contract
-from traider.brokers import BrokerRejected, NoPrice, SimBroker
+from traider.brokers import BrokerRejected, NoPrice, SimBroker, _replay
 from traider.cage import Account
 
 
@@ -82,8 +82,10 @@ def test_liquidate_sells_at_entry_when_there_is_no_price(env):
     del market.prices["AAPL"]
     fills = b.liquidate("2026-12-01")
     assert sorted(f.symbol for f in fills) == ["AAPL", "XLE"]
+    assert next(f for f in fills if f.symbol == "AAPL").price == pytest.approx(200.10 * 0.9995)
     assert SimBroker(cfg, store, market).account().positions == ()
     assert [e["kind"] for e in store.orders()][-2:] == ["liquidate", "liquidate"]
+    assert {e["symbol"]: e["reason"] for e in store.orders()[-2:]} == {"AAPL": "no_quote_entry_price", "XLE": "liquidate"}
 
 def test_raise_stop_on_unheld_symbol_raises(env):
     cfg, store, market = env
@@ -191,3 +193,31 @@ def test_stop_fills_at_the_open_of_the_bar_that_hit_it(env, bars, price):
     market.lows = {"AAPL": bars}
     events = b.sync("2026-12-02")
     assert [e["price"] for e in events] == ([] if price is None else [pytest.approx(price)])
+
+def test_ledger_replay_equals_the_account_after_every_step(env):
+    cfg, store, market = env
+    b = SimBroker(cfg, store, market)
+    steps = [
+        lambda: b.buy("2026-12-01", "AAPL", 100.0, 186.0, "тезис", "x/1"),
+        lambda: b.buy("2026-12-01", "XLE", 100.0, 90.0, "тезис", "x/2"),
+        lambda: (market.prices.update(AAPL=210.0), b.buy("2026-12-01", "AAPL", 80.0, 195.0, "докупка", "x/3")),
+        lambda: b.close("2026-12-01", "AAPL", 0.4, "частично", "x/4"),
+        lambda: b.raise_stop("2026-12-01", "AAPL", 200.0),
+        lambda: (market.lows.update(XLE=(89.0, 95.0)), b.sync("2026-12-02")),
+    ]
+    for step in steps:
+        step()
+        saved = store.account()                                     # посчитан функциями traider.sim
+        rebuilt = _replay(store.orders(), Account(cfg.start_equity, (), saved.peak_equity))
+        assert rebuilt == saved
+        reported = b.account()                                      # пик он может поднять, остальное то же
+        assert (reported.cash, reported.positions) == (rebuilt.cash, rebuilt.positions)
+    assert [p.symbol for p in store.account().positions] == ["AAPL"]
+
+def test_account_saves_the_rebuilt_account_when_the_saved_one_is_stale(env):
+    cfg, store, market = env
+    b = SimBroker(cfg, store, market)
+    b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    store.save_account(Account(1000.0, (), 1000.0))                 # отстал, пик тот же
+    reported = b.account()
+    assert store.account() == reported and reported.positions != ()

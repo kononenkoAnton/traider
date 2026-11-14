@@ -64,3 +64,38 @@ def test_missing_checksum_is_reported_invalid(tmp_path, example):
     (run / "config.sha256").unlink()
     cfg, valid = load_run(run)
     assert valid is False and cfg.participant == "haiku"
+
+
+def test_model_without_prices_is_rejected(tmp_path, example):
+    example.write_text(example.read_text().replace('model = "claude-sonnet-5-5"', 'model = "claude-nope"'))
+    with pytest.raises(ValueError, match="claude-nope"):
+        start_experiment(example, tmp_path / "runs")
+    assert not (tmp_path / "runs").exists()
+
+
+def test_analyst_without_analyst_model_is_rejected(tmp_path, example):
+    example.write_text(example.read_text().replace('analyst_model = "claude-haiku-5-5"\n', ''))
+    with pytest.raises(ValueError, match="opus-analyst"):
+        start_experiment(example, tmp_path / "runs")
+    assert not (tmp_path / "runs").exists()
+
+
+def test_panel_ticker_outside_the_universe_is_rejected(tmp_path, example):
+    example.write_text(example.read_text().replace('"MA"]', '"MA","ZZZZ"]'))
+    with pytest.raises(ValueError, match="ZZZZ"):
+        start_experiment(example, tmp_path / "runs")
+    assert not (tmp_path / "runs").exists()
+
+
+def test_criteria_missing_a_key_is_rejected(tmp_path, example):
+    example.write_text(example.read_text().replace("red_percentile = 25\n", ""))
+    with pytest.raises(ValueError, match="red_percentile"):
+        start_experiment(example, tmp_path / "runs")
+    assert not (tmp_path / "runs").exists()
+
+
+def test_price_table_missing_a_key_is_rejected(tmp_path, example):
+    example.write_text(example.read_text().replace("cache_write = 2.5\n", ""))
+    with pytest.raises(ValueError, match="cache_write"):
+        start_experiment(example, tmp_path / "runs")
+    assert not (tmp_path / "runs").exists()
