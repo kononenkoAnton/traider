@@ -10,12 +10,13 @@
 количествам и ценам (проскальзывание заново не считается), от сохранённого счёта берётся
 только пик капитала, если он выше. Поэтому сбой между записью и сохранением ничего не
 портит, а повтор заявки с тем же `client_order_id` не торгует снова, а возвращает
-`Fill` из записанного события. Нет цены бумаги: `NoPrice` до любой записи. Ошибки
+`Fill` из записанного события. Сверка считает минимумы бумаги только с момента, когда существуют позиция и её нынешний стоп. Нет цены бумаги: `NoPrice` до любой записи. Ошибки
 `ValueError` из `traider.sim` пробрасываются.
 """
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime
+from math import isfinite
 from typing import Protocol
 
 from traider.cage import Account, Position
@@ -77,7 +78,7 @@ class SimBroker:
         return self.store.append_order({
             "day": day, "kind": kind, "symbol": symbol, "notional": None, "qty": fill.qty,
             "price": fill.price, "stop_price": None, "thesis": None, "reason": None,
-            "client_order_id": None, "broker_order_id": None, **extra})
+            "client_order_id": None, "broker_order_id": None, **extra}, ts=self.market.now())
 
     def _price(self, symbol: str) -> float:
         price = self.market.last_prices([symbol]).get(symbol)
@@ -130,7 +131,7 @@ class SimBroker:
         self.store.append_order({
             "day": day, "kind": "raise_stop", "symbol": symbol, "notional": None, "qty": None,
             "price": None, "stop_price": stop_price, "thesis": None, "reason": None,
-            "client_order_id": None, "broker_order_id": None})
+            "client_order_id": None, "broker_order_id": None}, ts=self.market.now())
         self.store.save_account(self._load())
 
     def ensure_stops(self) -> list[str]:
@@ -140,8 +141,20 @@ class SimBroker:
         acct = self._load()
         events: list[dict] = []
         if acct.positions:
-            last = self.store.state()["last_sync"] or self.store.orders()[0]["ts"]
-            lows = self.market.lows_since([p.symbol for p in acct.positions], datetime.fromisoformat(last))
+            last = self.store.state()["last_sync"]
+            since: dict[str, datetime] = {}
+            for e in self.store.orders():   # окно бумаги: не раньше покупки и не раньше нынешнего стопа
+                if e["kind"] in ("buy", "raise_stop"):
+                    since[e["symbol"]] = datetime.fromisoformat(e["ts"])
+            groups: dict[datetime, list[str]] = {}
+            for p in acct.positions:
+                start = since[p.symbol]
+                if last:
+                    start = max(start, datetime.fromisoformat(last))
+                groups.setdefault(start, []).append(p.symbol)
+            lows: dict[str, tuple[float, float]] = {}
+            for start, syms in groups.items():
+                lows.update(self.market.lows_since(syms, start))
             new, fills = apply_stops(acct, {s: v[0] for s, v in lows.items()},
                                      {s: v[1] for s, v in lows.items()})
             stops = {p.symbol: p.stop_price for p in acct.positions}
@@ -154,8 +167,10 @@ class SimBroker:
     def liquidate(self, day: str) -> list[Fill]:
         acct, fills = self._load(), []
         for p in acct.positions:
-            # нет цены: продаём по цене входа, чтобы ликвидация не оборвалась на полпути
-            price = self.market.last_prices([p.symbol]).get(p.symbol, p.entry_price)
+            # нет цены или она негодная: продаём по цене входа, чтобы ликвидация не оборвалась на полпути
+            price = self.market.last_prices([p.symbol]).get(p.symbol)
+            if not (isinstance(price, (int, float)) and isfinite(price) and price > 0):
+                price = p.entry_price
             acct, fill = apply_close(acct, p.symbol, 1.0, price, "liquidate")
             self._log(day, "liquidate", p.symbol, fill, reason="liquidate")
             self.store.save_account(acct)

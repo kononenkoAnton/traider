@@ -1,5 +1,6 @@
 import pytest
 
+from tests.fakes import ny
 from tests.broker_contract import run_contract
 from traider.brokers import NoPrice, SimBroker
 from traider.cage import Account
@@ -84,3 +85,51 @@ def test_raise_stop_on_unheld_symbol_raises(env):
     with pytest.raises(KeyError):
         SimBroker(cfg, store, market).raise_stop("2026-12-01", "AAPL", 190.0)
     assert store.orders() == []
+
+def _at(market, *args):
+    market.clock = ny(2026, 12, 1, *args)
+
+def test_low_before_the_buy_gives_no_stop_fill(env):
+    cfg, store, market = env
+    b = SimBroker(cfg, store, market)
+    _at(market, 10); b.sync("2026-12-01")
+    _at(market, 12); b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    market.lows = {"AAPL": (185.0, 190.0, ny(2026, 12, 1, 11))}
+    _at(market, 13)
+    assert b.sync("2026-12-01") == [] and len(b.account().positions) == 1
+
+def test_low_after_the_buy_gives_a_stop_fill(env):
+    cfg, store, market = env
+    b = SimBroker(cfg, store, market)
+    _at(market, 10); b.sync("2026-12-01")
+    _at(market, 12); b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    market.lows = {"AAPL": (185.0, 190.0, ny(2026, 12, 1, 12, 30))}
+    _at(market, 13)
+    assert [e["kind"] for e in b.sync("2026-12-01")] == ["stop_fill"]
+
+def test_low_before_the_stop_was_raised_does_not_count(env):
+    cfg, store, market = env
+    b = SimBroker(cfg, store, market)
+    _at(market, 10); b.buy("2026-12-01", "AAPL", 150.0, 180.0, "тезис", "x/1")
+    _at(market, 12); b.raise_stop("2026-12-01", "AAPL", 190.0)
+    market.lows = {"AAPL": (185.0, 190.0, ny(2026, 12, 1, 11))}
+    _at(market, 13)
+    assert b.sync("2026-12-01") == []
+
+def test_old_position_is_stopped_by_a_low_after_last_sync(env):
+    cfg, store, market = env
+    b = SimBroker(cfg, store, market)
+    b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    market.clock = ny(2026, 12, 2, 10); b.sync("2026-12-02")
+    market.lows = {"AAPL": (180.0, 190.0, ny(2026, 12, 2, 11))}
+    market.clock = ny(2026, 12, 2, 12)
+    assert [e["kind"] for e in b.sync("2026-12-02")] == ["stop_fill"]
+
+def test_liquidate_treats_a_nan_quote_like_a_missing_one(env):
+    cfg, store, market = env
+    b = SimBroker(cfg, store, market)
+    b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    b.buy("2026-12-01", "XLE", 100.0, 90.0, "тезис", "x/2")
+    market.prices["AAPL"] = float("nan")
+    assert sorted(f.symbol for f in b.liquidate("2026-12-01")) == ["AAPL", "XLE"]
+    assert SimBroker(cfg, store, market).account().positions == ()

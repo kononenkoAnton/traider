@@ -72,10 +72,10 @@ class RunStore:
         self.dir = Path(run_dir)
 
     # журнал заявок
-    def append_order(self, event: dict) -> dict:
+    def append_order(self, event: dict, ts: datetime | None = None) -> dict:
         path = self.dir / "orders.jsonl"
         seq = max((e.get("seq", 0) for e in _read_lines(path)), default=0) + 1
-        rec = {"seq": seq, "ts": datetime.now(timezone.utc).isoformat(), **event}
+        rec = {"seq": seq, "ts": (ts or datetime.now(timezone.utc)).isoformat(), **event}
         _append_line(path, rec)
         return rec
 

@@ -38,7 +38,13 @@ class FakeMarket:
         return {s: self.bars[s][-days:] for s in symbols if s in self.bars}
 
     def lows_since(self, symbols, since):
-        return {s: self.lows[s] for s in symbols if s in self.lows}
+        # запись lows: (минимум, открытие) или (минимум, открытие, время); без времени считается всегда
+        out = {}
+        for s in symbols:
+            e = self.lows.get(s)
+            if e is not None and (len(e) < 3 or e[2] >= since):
+                out[s] = (e[0], e[1])
+        return out
 
     def news(self, symbols, limit):
         items = [n for n in self.news_items if symbols is None or set(n["symbols"]) & set(symbols)]
