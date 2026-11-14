@@ -76,6 +76,10 @@ def _build(toml_path: Path, live: bool) -> list[RunConfig]:
     system = (base / t["system_prompt_file"]).read_text(encoding="utf-8")
     analyst_text = (base / t["analyst_prompt_file"]).read_text(encoding="utf-8")
     runs = []
+    names = [p["name"] for p in t["participants"]]
+    for name in set(names):
+        if names.count(name) > 1:
+            raise ValueError(f"имя участника повторяется: {name}")
     for p in t["participants"]:
         research = p.get("research", "self")
         if p["model"] not in t["prices"]:
@@ -119,7 +123,9 @@ def start_experiment(toml_path: Path, runs_dir: Path, live: bool = False) -> Pat
 
 def load_run(run_dir: Path) -> tuple[RunConfig, bool]:
     raw = (Path(run_dir) / "config.json").read_bytes()
-    valid = hashlib.sha256(raw).hexdigest() == (Path(run_dir) / "config.sha256").read_text().strip()
+    sha = Path(run_dir) / "config.sha256"
+    # нет файла суммы = прогон помечен как изменённый, но конфиг читается (HP и стопы работают)
+    valid = sha.exists() and hashlib.sha256(raw).hexdigest() == sha.read_text().strip()
     d = json.loads(raw)
     d["limits"] = Limits(**d["limits"])
     d["universe"], d["panel"] = tuple(d["universe"]), tuple(d["panel"])

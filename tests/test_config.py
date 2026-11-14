@@ -50,3 +50,17 @@ def test_unknown_model_or_broker_is_rejected(tmp_path, example_bad_broker):
     with pytest.raises(ValueError):
         start_experiment(example_bad_broker, tmp_path / "runs")
     assert not (tmp_path / "runs").exists()  # ничего не создано до проверки
+
+
+def test_duplicate_participant_names_are_rejected(tmp_path, example):
+    example.write_text(example.read_text().replace('name = "opus-b"', 'name = "opus-a"'))
+    with pytest.raises(ValueError, match="opus-a"):
+        start_experiment(example, tmp_path / "runs")
+    assert not (tmp_path / "runs").exists()
+
+
+def test_missing_checksum_is_reported_invalid(tmp_path, example):
+    run = start_experiment(example, tmp_path / "runs") / "haiku"
+    (run / "config.sha256").unlink()
+    cfg, valid = load_run(run)
+    assert valid is False and cfg.participant == "haiku"
