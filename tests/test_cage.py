@@ -92,3 +92,28 @@ def test_raise_stop(symbol, new_stop, expected):
 def test_position_too_large_detail_names_the_limit():
     r = check_buy(BuyRequest("AAPL", 250.0, 186.0), EMPTY, PRICES, FACTS, UNIVERSE, LIM)
     assert "20%" in r.detail
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_bad_quote_of_other_held_symbol_values_it_at_entry(bad):
+    acct = Account(300.0, (Position("XLE", 7.0, 100.0, 90.0),), 1000.0)   # по цене входа капитал 1000
+    prices = {"AAPL": 200.0, "XLE": bad}
+    assert equity(acct, prices) == pytest.approx(equity(acct, {}))
+    assert code(notional=250.0, acct=acct, prices=prices) == "position_too_large"
+
+
+def test_nan_cash_is_bad_request_and_never_alive_or_dead():
+    acct = Account(float("nan"), (), 1000.0)
+    assert code(notional=5000.0, acct=acct) == "bad_request"
+    for fn in (hp, is_dead):
+        with pytest.raises(ValueError):
+            fn(acct, {}, LIM)
+    with pytest.raises(ValueError):
+        equity(acct, {})
+
+
+def test_nan_stop_on_held_position_is_bad_request():
+    acct = Account(900.0, (Position("AAPL", 0.5, 200.0, float("nan")),), 1000.0)
+    assert code(acct=acct) == "bad_request"
+    r = check_raise_stop("AAPL", 190.0, acct, PRICES, LIM)
+    assert r.code == "bad_request"

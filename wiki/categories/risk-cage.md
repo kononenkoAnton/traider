@@ -5,7 +5,7 @@ type: category
 tags: ['risk-cage']
 categories: ['traider']
 created: 2026-11-14T15:43:20+00:00
-modified: 2026-11-14T15:51:19+00:00
+modified: 2026-11-14T15:53:39+00:00
 ---
 
 # Клетка риска

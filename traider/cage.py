@@ -60,12 +60,31 @@ class Reject:
     detail: str   # русская фраза с числами для агента
 
 
+def _ok(x: float) -> bool:
+    return isinstance(x, (int, float)) and isfinite(x) and x > 0
+
+
 def _price(p: Position, prices: Mapping[str, float]) -> float:
-    return prices.get(p.symbol, p.entry_price)
+    # котировка годится только конечная и положительная, иначе оцениваем по цене входа
+    q = prices.get(p.symbol)
+    return q if q is not None and _ok(q) else p.entry_price
+
+
+def _finite(x: float) -> float:
+    if not isfinite(x):
+        raise ValueError(f"нечисловое значение в счёте: {x}")
+    return x
+
+
+def _account_corrupt(acct: Account) -> bool:
+    nums = [acct.cash, acct.peak_equity]
+    for p in acct.positions:
+        nums += [p.qty, p.entry_price, p.stop_price]
+    return not all(isinstance(x, (int, float)) and isfinite(x) for x in nums)
 
 
 def equity(acct: Account, prices: Mapping[str, float]) -> float:
-    return acct.cash + sum(p.qty * _price(p, prices) for p in acct.positions)
+    return _finite(acct.cash + sum(p.qty * _price(p, prices) for p in acct.positions))
 
 
 def floor(acct: Account, limits: Limits) -> float:
@@ -73,7 +92,7 @@ def floor(acct: Account, limits: Limits) -> float:
 
 
 def hp(acct: Account, prices: Mapping[str, float], limits: Limits) -> float:
-    return equity(acct, prices) - floor(acct, limits)
+    return _finite(equity(acct, prices) - floor(acct, limits))
 
 
 def is_dead(acct: Account, prices: Mapping[str, float], limits: Limits) -> bool:
@@ -88,10 +107,6 @@ def open_risk(acct: Account, prices: Mapping[str, float]) -> float:
     return sum(_risk(p, _price(p, prices)) for p in acct.positions)
 
 
-def _ok(x: float) -> bool:
-    return isinstance(x, (int, float)) and isfinite(x) and x > 0
-
-
 def _stop_range(price: float, stop: float, limits: Limits) -> Reject | None:
     lo, hi = price * (1 - limits.stop_max), price * (1 - limits.stop_min)
     if lo - EPS <= stop <= hi + EPS:
@@ -104,6 +119,8 @@ def _stop_range(price: float, stop: float, limits: Limits) -> Reject | None:
 def check_buy(req: BuyRequest, acct: Account, prices: Mapping[str, float], facts: SessionFacts,
               universe: frozenset[str], limits: Limits) -> Reject | None:
     sym = req.symbol
+    if _account_corrupt(acct):
+        return Reject("bad_request", "В данных счёта нечисловое значение, заявка не принимается.")
     if not (_ok(req.notional) and _ok(req.stop_price)):
         return Reject("bad_request", "Сумма и стоп должны быть конечными положительными числами.")
     if sym not in universe:
@@ -115,34 +132,34 @@ def check_buy(req: BuyRequest, acct: Account, prices: Mapping[str, float], facts
         return Reject("no_panel_forecasts", "Сначала запишите прогнозы по всей панели, потом покупайте.")
     if sym not in facts.forecast_symbols:
         return Reject("no_symbol_forecast", f"Сначала запишите прогноз по {sym}, потом покупайте.")
-    if facts.buys_done >= limits.max_buys_per_session:
+    if not (facts.buys_done < limits.max_buys_per_session):
         return Reject("too_many_buys", f"Лимит покупок за сессию исчерпан: {limits.max_buys_per_session}.")
     if sym in facts.closed_today:
         return Reject("rebuy_same_day", f"{sym} сегодня уже закрыт, повторно купить его сегодня нельзя.")
-    if req.notional < limits.min_order_usd - EPS:
+    if not (req.notional >= limits.min_order_usd - EPS):
         return Reject("order_too_small",
                       f"Заявка ${req.notional:.2f} меньше минимума ${limits.min_order_usd:.2f}.")
     if bad := _stop_range(price, req.stop_price, limits):
         return bad
     held = [p for p in acct.positions if p.symbol == sym]
     old_stop = max((p.stop_price for p in held), default=None)
-    if old_stop is not None and req.stop_price < old_stop - EPS:
+    if old_stop is not None and not (req.stop_price >= old_stop - EPS):
         return Reject("stop_below_existing",
                       f"Стоп {req.stop_price:.2f} ниже действующего {old_stop:.2f} по {sym}: стоп можно только поднимать.")
     eq = equity(acct, prices)
     old_qty = sum(p.qty for p in held)
     new_value = old_qty * price + req.notional
     cap = limits.max_position_share * eq
-    if new_value > cap + EPS:
+    if not (new_value <= cap + EPS):
         return Reject("position_too_large",
                       f"Позиция по {sym} после покупки ${new_value:.2f} превысит "
                       f"{limits.max_position_share:.0%} капитала (${cap:.2f}).")
-    if req.notional > acct.cash + EPS:
+    if not (req.notional <= acct.cash + EPS):
         return Reject("not_enough_cash", f"Заявка ${req.notional:.2f} больше свободных денег ${acct.cash:.2f}.")
     other = sum(_risk(p, _price(p, prices)) for p in acct.positions if p.symbol != sym)
     new_risk = other + (old_qty + req.notional / price) * (price - req.stop_price)
     max_risk = limits.max_open_risk_share * eq
-    if new_risk > max_risk + EPS:
+    if not (new_risk <= max_risk + EPS):
         return Reject("open_risk_too_high",
                       f"Суммарный риск после покупки ${new_risk:.2f} превысит "
                       f"{limits.max_open_risk_share:.0%} капитала (${max_risk:.2f}).")
@@ -151,6 +168,8 @@ def check_buy(req: BuyRequest, acct: Account, prices: Mapping[str, float], facts
 
 def check_raise_stop(symbol: str, new_stop: float, acct: Account, prices: Mapping[str, float],
                      limits: Limits) -> Reject | None:
+    if _account_corrupt(acct):
+        return Reject("bad_request", "В данных счёта нечисловое значение, стоп не меняется.")
     if not _ok(new_stop):
         return Reject("bad_request", "Стоп должен быть конечным положительным числом.")
     held = [p for p in acct.positions if p.symbol == symbol]
@@ -160,6 +179,6 @@ def check_raise_stop(symbol: str, new_stop: float, acct: Account, prices: Mappin
     if price is None or not _ok(price):
         return Reject("no_price", f"Нет цены для {symbol}, стоп изменить нельзя.")
     old_stop = max(p.stop_price for p in held)
-    if new_stop <= old_stop + EPS:
+    if not (new_stop > old_stop + EPS):
         return Reject("stop_not_higher", f"Новый стоп {new_stop:.2f} не выше действующего {old_stop:.2f}.")
     return _stop_range(price, new_stop, limits)
