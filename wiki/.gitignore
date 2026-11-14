@@ -1,0 +1,7 @@
+# WikiKnowledge: локальный кэш индекса
+.index/
+
+# WikiKnowledge: настройки этой машины (пути, учётные данные)
+.settings/
+
+.DS_Store
