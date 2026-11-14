@@ -87,12 +87,8 @@ class RunStore:
 
     def start_session(self, day: str, now: datetime) -> bool:
         path = self._session_path(day)
-        try:  # эксклюзивное создание: второй старт за день получает False
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+        if path.exists():  # тики идут под замком, проверки и os.replace достаточно
             return False
-        os.close(fd)
         _write_json(path, {"day": day, "status": "started", "started_at": now.isoformat()})
         return True
 
@@ -101,10 +97,12 @@ class RunStore:
         _write_json(self._session_path(day), rec)
 
     def session(self, day: str) -> dict | None:
+        path = self._session_path(day)
         try:
-            return _read_json(self._session_path(day))
-        except json.JSONDecodeError:
-            return None  # файл создан, но запись не успела (сбой между open и записью)
+            return _read_json(path)
+        except json.JSONDecodeError:  # повреждённый файл считается зависшим стартом
+            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            return {"day": day, "status": "started", "started_at": mtime.isoformat()}
 
     def sessions(self) -> list[dict]:
         return [s for p in sorted((self.dir / "sessions").glob("*.json")) if (s := self.session(p.stem))]

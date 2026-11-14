@@ -65,3 +65,27 @@ def test_active_runs_skips_finished_and_dead(tmp_path, example):
     RunStore(exp / "haiku").update_state(status="dead")
     RunStore(exp / "sonnet").update_state(status="finishing")
     assert sorted(p.name for p in active_runs(tmp_path / "runs")) == ["opus-a", "opus-analyst", "opus-b", "sonnet"]
+
+def test_damaged_session_file_is_a_stale_started_day(tmp_path):
+    s, day = RunStore(tmp_path), "2026-12-01"
+    path = tmp_path / "sessions" / f"{day}.json"
+    path.parent.mkdir()
+    path.write_text("")
+    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    assert s.session(day)["status"] == "started"
+    assert s.start_session(day, mtime) is False
+    assert s.stale_started(mtime + timedelta(minutes=29)) == []
+    assert s.stale_started(mtime + timedelta(minutes=31)) == [day]
+    s.finish_session(day, "failed", {})
+    assert s.session(day)["status"] == "failed" and s.stale_started(mtime + timedelta(hours=5)) == []
+
+def test_start_session_leaves_no_empty_target(tmp_path, monkeypatch):
+    import traider.store as store
+    def boom(*a, **k):
+        raise OSError("crash")
+    monkeypatch.setattr(store.os, "replace", boom)
+    try:
+        RunStore(tmp_path).start_session("2026-12-01", datetime(2026, 12, 1, tzinfo=timezone.utc))
+    except OSError:
+        pass
+    assert not (tmp_path / "sessions" / "2026-12-01.json").exists()
