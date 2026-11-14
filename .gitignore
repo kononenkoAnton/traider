@@ -2,3 +2,8 @@
 .env.*
 !.env.example
 .superpowers/
+runs/
+logs/
+.venv/
+__pycache__/
+.pytest_cache/

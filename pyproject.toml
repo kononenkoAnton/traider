@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "traider"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["anthropic", "alpaca-py"]
+
+[dependency-groups]
+dev = ["pytest", "python-frontmatter"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["traider"]
+
+[tool.pytest.ini_options]
+markers = ["paper: нужен paper-счёт Alpaca"]
+addopts = "-m 'not paper'"
