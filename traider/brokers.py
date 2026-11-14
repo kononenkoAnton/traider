@@ -11,7 +11,8 @@
 только пик капитала, если он выше. Поэтому сбой между записью и сохранением ничего не
 портит, а повтор заявки с тем же `client_order_id` не торгует снова, а возвращает
 `Fill` из записанного события; повтор id по другой бумаге даёт `BrokerRejected`. Сверка
-считает минимумы бумаги только с момента, когда существуют позиция и её нынешний стоп.
+считает свечи бумаги только с момента, когда существуют позиция и её нынешний стоп, и
+берёт первую свечу, чей минимум задел стоп: исполнение по `min(стоп, открытие этой свечи)`.
 
 Отказы до любой записи: нет годной котировки (её нет или она не конечное положительное
 число) в `buy` и `close` даёт `NoPrice`; нет позиции, доля вне (0, 1] или негодный стоп в
@@ -174,11 +175,17 @@ class SimBroker:
                 if last:
                     start = max(start, datetime.fromisoformat(last))
                 groups.setdefault(start, []).append(p.symbol)
-            lows: dict[str, tuple[float, float]] = {}
+            bars: dict[str, list[tuple[float, float]]] = {}
             for start, syms in groups.items():
-                lows.update(self.market.lows_since(syms, start))
-            new, fills = apply_stops(acct, {s: v[0] for s, v in lows.items()},
-                                     {s: v[1] for s, v in lows.items()})
+                bars.update(self.market.lows_since(syms, start))
+            hit: dict[str, tuple[float, float]] = {}   # первая свеча, задевшая стоп: её открытие ловит гэп
+            for p in acct.positions:
+                first = next(((lo, op) for lo, op in bars.get(p.symbol, ())
+                              if usable(lo) and lo <= p.stop_price), None)
+                if first is not None:
+                    hit[p.symbol] = first
+            new, fills = apply_stops(acct, {s: v[0] for s, v in hit.items()},
+                                     {s: v[1] for s, v in hit.items()})
             held = {p.symbol: p for p in acct.positions}
             events = [self._log(day, "stop_fill", f.symbol, f, stop_price=held[f.symbol].stop_price,
                                 entry_price=held[f.symbol].entry_price, reason="stop")

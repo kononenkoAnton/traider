@@ -178,3 +178,16 @@ def test_ledger_events_carry_what_a_replay_needs(env):
     assert ev["close:AAPL"]["fraction"] == 0.5 and ev["liquidate:AAPL"]["fraction"] == 1.0
     assert ev["close:AAPL"]["entry_price"] == ev["liquidate:AAPL"]["entry_price"] == pytest.approx(200.10)
     assert ev["stop_fill:XLE"]["entry_price"] == pytest.approx(100.05)
+
+@pytest.mark.parametrize("bars, price", [
+    ([(190.0, 191.0), (168.0, 170.0)], 170.0 * 0.9995),   # гэп ночью: исполнение по открытию той свечи
+    ([(185.0, 199.0)], 186.0 * 0.9995),                   # без гэпа: по стопу
+    ([(190.0, 191.0), (187.0, 188.0)], None),             # стоп не задет
+])
+def test_stop_fills_at_the_open_of_the_bar_that_hit_it(env, bars, price):
+    cfg, store, market = env
+    b = SimBroker(cfg, store, market)
+    b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    market.lows = {"AAPL": bars}
+    events = b.sync("2026-12-02")
+    assert [e["price"] for e in events] == ([] if price is None else [pytest.approx(price)])
