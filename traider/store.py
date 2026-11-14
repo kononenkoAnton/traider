@@ -15,6 +15,7 @@
 """
 import json
 import os
+import uuid
 from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -25,13 +26,17 @@ from traider.cage import Account, Position, SessionFacts
 DEFAULT_STATE = {"status": "active", "notes": "", "last_sync": None}
 
 
-def _write_json(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+def _dump_json(tmp: Path, data) -> None:
+    tmp.parent.mkdir(parents=True, exist_ok=True)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.flush()
         os.fsync(f.fileno())
+
+
+def _write_json(path: Path, data) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    _dump_json(tmp, data)
     os.replace(tmp, path)
 
 
@@ -43,7 +48,7 @@ def _read_lines(path: Path) -> list[dict]:
     if not path.exists():
         return []
     out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8").split("\n"):  # не splitlines: он режет по U+2028/U+0085
         try:
             out.append(json.loads(line))
         except json.JSONDecodeError:
@@ -87,10 +92,15 @@ class RunStore:
 
     def start_session(self, day: str, now: datetime) -> bool:
         path = self._session_path(day)
-        if path.exists():  # тики идут под замком, проверки и os.replace достаточно
+        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        _dump_json(tmp, {"day": day, "status": "started", "started_at": now.isoformat()})
+        try:  # link не перезаписывает: из двух конкурентных стартов выигрывает один
+            os.link(tmp, path)
+            return True
+        except FileExistsError:
             return False
-        _write_json(path, {"day": day, "status": "started", "started_at": now.isoformat()})
-        return True
+        finally:
+            os.unlink(tmp)
 
     def finish_session(self, day: str, status: str, record: dict) -> None:
         rec = {**(self.session(day) or {"day": day}), **record, "status": status}

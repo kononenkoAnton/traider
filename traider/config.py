@@ -134,5 +134,11 @@ def load_run(run_dir: Path) -> tuple[RunConfig, bool]:
 
 def active_runs(runs_dir: Path) -> list[Path]:
     from traider.store import RunStore  # store импортирует cage, а cage импортирует config
-    return sorted(p.parent for p in Path(runs_dir).glob("*/*/config.json")
-                  if RunStore(p.parent).state()["status"] in ("active", "finishing"))
+
+    def active(run: Path) -> bool:
+        try:
+            return RunStore(run).state()["status"] in ("active", "finishing")
+        except (OSError, ValueError):
+            return True  # нечитаемое состояние не прячет прогон: тик сообщит об ошибке по нему
+
+    return sorted(p.parent for p in Path(runs_dir).glob("*/*/config.json") if active(p.parent))

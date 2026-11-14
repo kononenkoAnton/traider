@@ -83,9 +83,39 @@ def test_start_session_leaves_no_empty_target(tmp_path, monkeypatch):
     import traider.store as store
     def boom(*a, **k):
         raise OSError("crash")
-    monkeypatch.setattr(store.os, "replace", boom)
+    monkeypatch.setattr(store.os, "link", boom)
     try:
         RunStore(tmp_path).start_session("2026-12-01", datetime(2026, 12, 1, tzinfo=timezone.utc))
     except OSError:
         pass
-    assert not (tmp_path / "sessions" / "2026-12-01.json").exists()
+    assert list((tmp_path / "sessions").iterdir()) == []
+
+def test_unicode_line_separators_do_not_split_records(tmp_path):
+    s, day = RunStore(tmp_path), "2026-12-01"
+    s.append_order({"day": day, "kind": "buy", "symbol": "XLE", "thesis": "a b c\u0085d"})
+    s.append_forecasts(day, [{"symbol": "a b", "p": 0.5}])
+    s2 = RunStore(tmp_path)
+    assert s2.orders()[0]["thesis"] == "a b c\u0085d"
+    assert s2.forecasts()[0]["symbol"] == "a b"
+    assert s2.append_order({"day": day, "kind": "close", "symbol": "XLE"})["seq"] == 2
+
+def test_start_session_loses_race_cleanly(tmp_path, monkeypatch):
+    import json, traider.store as store
+    s, day = RunStore(tmp_path), "2026-12-01"
+    real_link = store.os.link
+    def racing_link(src, dst):
+        (tmp_path / "sessions").mkdir(exist_ok=True)
+        open(dst, "w").write(json.dumps({"day": day, "status": "started", "started_at": "winner"}))
+        return real_link(src, dst)
+    monkeypatch.setattr(store.os, "link", racing_link)
+    assert s.start_session(day, datetime(2026, 12, 1, tzinfo=timezone.utc)) is False
+    assert s.session(day)["started_at"] == "winner"
+    assert [p.name for p in (tmp_path / "sessions").iterdir()] == [f"{day}.json"]
+
+def test_active_runs_returns_run_with_damaged_state(tmp_path, example):
+    exp = start_experiment(example, tmp_path / "runs")
+    (exp / "haiku" / "state.json").write_text("garbage")
+    assert "haiku" in [p.name for p in active_runs(tmp_path / "runs")]
+    import pytest
+    with pytest.raises(ValueError):
+        RunStore(exp / "haiku").state()
