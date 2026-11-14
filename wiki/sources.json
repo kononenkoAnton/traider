@@ -1,0 +1,35 @@
+{
+  "sources": {
+    "traider-code": {
+      "type": "source-code",
+      "default_path": "../",
+      "knowledge_bases": {
+        "default": "traider"
+      },
+      "respect_gitignore": true,
+      "languages": {
+        "python": {
+          "include": [
+            "traider/**/*.py"
+          ]
+        }
+      }
+    },
+    "traider-docs": {
+      "type": "markdown-files",
+      "description": "Design spec and plans",
+      "default_path": "../docs",
+      "knowledge_bases": {
+        "default": "traider"
+      },
+      "respect_gitignore": true,
+      "include": [
+        "./**/*.md"
+      ],
+      "exclude": [],
+      "tags": [
+        "docs"
+      ]
+    }
+  }
+}
