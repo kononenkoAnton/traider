@@ -5,7 +5,7 @@ type: category
 tags: ['architecture']
 categories: ['traider']
 created: 2026-11-14T15:43:20+00:00
-modified: 2026-11-14T15:58:57+00:00
+modified: 2026-11-14T16:01:02+00:00
 ---
 
 # Архитектура системы
