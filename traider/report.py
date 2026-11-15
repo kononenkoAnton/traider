@@ -23,12 +23,16 @@
 пока разница близнецов по модулю меньше 1e-9 (шум float) или у одного из них нет покупок. Место среди ботов: None, пока нет
 покупок. Капитал счёта, HP и доля HP берутся из `ticks.jsonl`: последний тик дня с числом, иначе None.
 Прогнозы: `brier`, `reference`, `ci` по панели, `brier_picks` по прогнозам купленных в тот же день бумаг;
-нет созревших, значит None. Закрытая сделка это каждое событие продажи (`agent`, `stop`, `liquidation`);
+нет созревших, значит None. `brier_series` по дням отчёта: те же Брайер и эталон по созревшим прогнозам
+панели, данным до дня включительно (последняя точка равна сводке); вне дней участника и без таких прогнозов None.
+`money`: месяц последнего дня сессии, траты всех участников в нём и за прогон, прогноз на месяц (средний расход
+дня сессии на число торговых дней месяца по `trading_days`). Закрытая сделка это каждое событие продажи (`agent`, `stop`, `liquidation`);
 без годных входа или выхода у неё `pnl` None. Диалог сессии в отчёте есть только у 10 последних дней
 сессий эксперимента, каждая строка режется до 2000 знаков с пометкой. Порядок правил `verdict`: гибель или
 нарушение целостности, нехватка данных (в том числе нет места или интервала), красный, зелёный, жёлтый;
 пороги только из `cfg.criteria`. Всё детерминировано, кроме `meta.generated_at` (`market.now()`).
 """
+import calendar
 import inspect
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
@@ -186,6 +190,32 @@ def _curves(p: dict, bars: Mapping, closes: Mapping, tdays: Sequence[str]) -> No
     p["reference"] = forecasts.reference(panel) if panel else None
     p["ci"] = list(forecasts.bootstrap_diff(panel, seed=cfg.seed)) if panel else None
     p["brier_picks"] = forecasts.brier(picks) if picks else None
+    p["panel_scored"] = panel
+
+
+def _brier_series(p: dict, days: Sequence[str]) -> list:
+    """По точке на день отчёта: Брайер и эталон по созревшим прогнозам панели, данным до этого дня включительно;
+    вне дней участника и пока таких прогнозов нет, None."""
+    mine, out = set(p["days"]), []
+    for d in days:
+        items = [s for s in p["panel_scored"] if s.day <= d]
+        out.append({"brier": forecasts.brier(items), "reference": forecasts.reference(items), "n": len(items)}
+                   if d in mine and items else None)
+    return out
+
+
+def _money(ps: list[dict], market: Market) -> dict:
+    """Расход всех участников: месяц последнего дня сессии, траты в нём, за прогон и прогноз на месяц."""
+    costs = [(r["day"], c) for p in ps for r in p["records"] for c in [_session_cost(r)] if c is not None]
+    run = float(sum(c for _, c in costs))
+    sdays = sorted({r["day"] for p in ps for r in p["records"]})
+    if not sdays:
+        return {"month": None, "month_spend_usd": None, "run_spend_usd": run, "month_forecast_usd": None}
+    month = sdays[-1][:7]
+    y, mo = int(month[:4]), int(month[5:])
+    tdays = market.trading_days(f"{month}-01", f"{month}-{calendar.monthrange(y, mo)[1]:02d}")
+    return {"month": month, "month_spend_usd": float(sum(c for d, c in costs if d.startswith(month))),
+            "run_spend_usd": run, "month_forecast_usd": run / len(sdays) * len(tdays)}
 
 
 def _summary(p: dict) -> dict:
@@ -280,8 +310,8 @@ def _incidents(ps: list[dict], checked: dict[str, list[str]], with_broker: set[s
                                                           "title": title, "text": "", "n": 0})
                 x["n"] += 1
                 x["text"] = t.get("error") or ", ".join(t.get("unpriced") or []) or x["text"]
-        out += [{**{k: v for k, v in x.items() if k != "n"}, "text": f"{x['text'] or title}; тиков: {x['n']}"}
-                for x in seen.values() for title in [x["title"]]]
+        out += [{**{k: v for k, v in x.items() if k != "n"}, "text": f"{x['text'] + '; ' if x['text'] else ''}тиков: {x['n']}"}
+                for x in seen.values()]
         if pid in with_broker:
             bad = checked[pid]
             out.append({"kind": "critical" if bad else "good", "day": None, "participant": pid,
@@ -400,6 +430,8 @@ def build_report(exp_dir: Path, market: Market, broker_order_ids: Mapping[str, I
                if first and _has_benchmark(closes) else None,
         "spy_same_exposure": {p["id"]: p["same"] for p in ps},
         "band": {p["id"]: p["band"] for p in ps},
+        "brier_series": {p["id"]: _brier_series(p, days) for p in ps},
+        "money": _money(ps, market),
         "summary": summary, "costs": costs, "tokens": tokens, "sessions": sessions,
         "positions": {s: positions[s] for s in sorted(positions)}, "cash": cash, "trades": trades,
         "calibration": {p["id"]: forecasts.calibration(p["scored"]) for p in ps},

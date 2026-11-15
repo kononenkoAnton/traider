@@ -327,3 +327,44 @@ def test_beyond_noise_float_noise_twins_and_exactly_twice():
     assert c["ladder"]["beyond_noise"] is None and c["analyst"]["beyond_noise"] is None
     c = run(1.0, 0.0, 2.5, 2.5)                                # шум 1 п.п., разброс и разница ровно 2 п.п.
     assert c["ladder"]["beyond_noise"] is False and c["analyst"]["beyond_noise"] is False
+
+
+def test_brier_series_is_cumulative_and_ends_at_the_summary(moving):
+    exp, market = moving
+    r = build_report(exp, market)
+    assert r["days"] == ["2026-12-01", "2026-12-02", "2026-12-03", "2026-12-04"]
+    for pid, series in r["brier_series"].items():
+        assert len(series) == len(r["days"])
+        # точка дня: прогнозы панели, данные до этого дня включительно и уже созревшие; 01.12 и 02.12 созрели
+        assert [x and x["n"] for x in series] == [20, 40, 40, 40]
+        last = [x for x in series if x][-1]
+        assert last["brier"] == pytest.approx(r["summary"][pid]["brier"])
+        assert last["reference"] == pytest.approx(r["summary"][pid]["reference"])
+
+
+def test_brier_series_is_empty_before_any_forecast_matures(played):
+    exp, market = played
+    r = build_report(exp, market)                       # прогнозы 01–03.12 при отчёте 03.12: ни один не созрел
+    assert all(x is None for s in r["brier_series"].values() for x in s)
+    assert all(r["summary"][p]["brier"] is None for p in r["brier_series"])
+
+
+def test_money_block_from_session_costs_and_the_month_calendar(moving):
+    exp, market = moving
+    m = build_report(exp, market)["money"]
+    per_day = 0.0008 + 0.016 + 0.032 + 0.032 + 0.0328   # haiku, sonnet, opus-a, opus-b, opus-analyst за сессию
+    assert m["month"] == "2026-12"
+    assert m["month_spend_usd"] == pytest.approx(4 * per_day) and m["run_spend_usd"] == pytest.approx(4 * per_day)
+    assert m["month_forecast_usd"] == pytest.approx(per_day * 23)   # будни декабря 2026: 4 + 5 + 5 + 5 + 4
+
+
+def test_money_block_of_a_run_that_has_not_started(tmp_path, example):
+    exp = start_experiment(example, tmp_path / "runs")
+    m = build_report(exp, FakeMarket.with_history(list(load_run(exp / "haiku")[0].universe), days=70))["money"]
+    assert m == {"month": None, "month_spend_usd": None, "run_spend_usd": 0.0, "month_forecast_usd": None}
+
+
+def test_death_incident_does_not_repeat_its_title(played_with_death):
+    exp, market = played_with_death
+    died = [i for i in build_report(exp, market)["incidents"] if i["title"].startswith("гибель")]
+    assert died and all(i["title"] not in i["text"] for i in died)

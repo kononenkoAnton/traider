@@ -5,7 +5,7 @@ type: category
 tags: ['traider', 'overview']
 categories: []
 created: 2026-11-14T14:58:35+00:00
-modified: 2026-11-15T23:45:00+00:00
+modified: 2026-11-16T00:10:00+00:00
 ---
 
 # Traider: обзор проекта
