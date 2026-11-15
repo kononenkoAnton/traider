@@ -99,3 +99,17 @@ def test_price_table_missing_a_key_is_rejected(tmp_path, example):
     with pytest.raises(ValueError, match="cache_write"):
         start_experiment(example, tmp_path / "runs")
     assert not (tmp_path / "runs").exists()
+
+
+def test_analyst_prices_are_frozen_for_the_analyst_participant_only(tmp_path, example):
+    exp = start_experiment(example, tmp_path / "runs")
+    analyst, _ = load_run(exp / "opus-analyst")
+    assert analyst.analyst_token_prices["input"] == 0.10 and analyst.analyst_token_prices["search"] == 0.01
+    assert load_run(exp / "opus-a")[0].analyst_token_prices is None
+
+
+def test_an_analyst_model_without_prices_is_rejected_before_any_write(tmp_path, example):
+    example.write_text(example.read_text().replace('analyst_model = "claude-haiku-5-5"', 'analyst_model = "claude-nope"'))
+    with pytest.raises(ValueError, match="аналитик"):
+        start_experiment(example, tmp_path / "runs")
+    assert not (tmp_path / "runs").exists()

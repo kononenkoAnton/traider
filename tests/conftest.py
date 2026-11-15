@@ -48,6 +48,23 @@ def senv(tmp_path, example):
     return cfg, store, market, SimBroker(cfg, store, market)
 
 
+def _analyst_world(tmp_path, example):
+    run = start_experiment(example, tmp_path / "runs") / "opus-analyst"
+    cfg, _ = load_run(run)
+    return cfg, RunStore(run), FakeMarket.with_history(list(cfg.universe), days=70)
+
+@pytest.fixture
+def env_analyst(tmp_path, example):
+    """Конфиг opus-analyst и рынок."""
+    cfg, _, market = _analyst_world(tmp_path, example)
+    return cfg, market
+
+@pytest.fixture
+def env_analyst_session(tmp_path, example):
+    """Мир сессии для opus-analyst: конфиг, хранилище, рынок, SimBroker."""
+    cfg, store, market = _analyst_world(tmp_path, example)
+    return cfg, store, market, SimBroker(cfg, store, market)
+
 @pytest.fixture
 def example_live(tmp_path):
     return _make(tmp_path, lambda t: t.replace('mode = "paper"', 'mode = "live"'))

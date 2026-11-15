@@ -21,13 +21,17 @@
 число записей сессий в хранилище, эта включительно, любого статуса; на номере
 `cfg.sessions_target` и выше статус прогона становится `finishing` с `finish_day`, потом
 вызывается `broker.liquidate`. `buys`, `sells`, `rejects` считаются по событиям дня `buy`,
-`close`, `reject`. Текст ошибки самого цикла тоже идёт в `errors`. Параметр `analyst` пока не
-используется. Запись сессии пишется последней и без перехвата: если не удалось записать её саму,
+`close`, `reject`. Текст ошибки самого цикла тоже идёт в `errors`. Параметр `analyst` (объект на одну
+сессию, модуль analyst): его сводка, запрошенная внутри защищённой части (сбой даёт заглушку и запись
+в `errors`), идёт в контекст, `analyst.research` попадает в `SessionContext`, основной агент не получает
+поиск (`max_searches=0`), а в запись пишется `analyst` (`cost`, `searches`, `briefing`, `usage`, `model`).
+Стоимость аналитика входит в `cost` сессии при любом исходе. Запись сессии пишется последней и без перехвата: если не удалось записать её саму,
 тик увидит зависшую `started`.
 """
 from dataclasses import asdict
 
 from traider import forecasts
+from traider.analyst import BRIEFING_FAILED
 from traider.brain import Usage, run_agent
 from traider.brokers import Broker
 from traider.cage import equity, floor, hp
@@ -105,9 +109,16 @@ def build_context(cfg: RunConfig, store: RunStore, broker: Broker, market: Marke
 def run_session(cfg: RunConfig, store: RunStore, broker: Broker, market: Market, client, day: str,
                 analyst=None) -> dict:
     errors: list[str] = []
-    ctx = SessionContext(cfg, store, broker, market, day)
+    ctx = SessionContext(cfg, store, broker, market, day, research=analyst.research if analyst else None)
+    briefing = None
     try:
-        user = build_context(cfg, store, broker, market, day)
+        if analyst:
+            try:
+                briefing = analyst.briefing(day)
+            except Exception as e:
+                errors.append(f"аналитик: {type(e).__name__}: {e}")
+                briefing = BRIEFING_FAILED
+        user = build_context(cfg, store, broker, market, day, briefing)
     except Exception as e:
         errors.append(f"контекст: {type(e).__name__}: {e}")
         rec = {"stop": "error", "turns": 0, "cost": 0.0, "usage": asdict(Usage()), "model_used": cfg.model,
@@ -115,7 +126,7 @@ def run_session(cfg: RunConfig, store: RunStore, broker: Broker, market: Market,
     else:
         res = run_agent(client, model=cfg.model, system=cfg.system_prompt, user=user, tools=build_tools(ctx),
                         prices=cfg.token_prices, max_turns=cfg.limits.max_turns, max_usd=cfg.limits.max_session_usd,
-                        max_searches=cfg.limits.max_searches)
+                        max_searches=0 if analyst else cfg.limits.max_searches)
         if res.error:
             errors.append(f"цикл: {res.error}")
         rec = {"stop": res.stop, "turns": res.turns, "cost": res.cost, "usage": asdict(res.usage),
@@ -131,8 +142,12 @@ def run_session(cfg: RunConfig, store: RunStore, broker: Broker, market: Market,
             broker.liquidate(day)
         except Exception as e:
             errors.append(f"ликвидация: {type(e).__name__}: {e}")
+    if analyst:
+        rec["cost"] += analyst.cost
     kinds = [e["kind"] for e in store.orders(day)]
     rec |= {"finished_at": market.now().isoformat(), "buys": kinds.count("buy"), "sells": kinds.count("close"),
-            "rejects": kinds.count("reject"), "journal": ctx.journal, "analyst": None, "errors": errors}
+            "rejects": kinds.count("reject"), "journal": ctx.journal, "errors": errors,
+            "analyst": analyst and {"cost": analyst.cost, "searches": analyst.searches, "briefing": briefing,
+                                    "usage": asdict(analyst.usage), "model": cfg.analyst_model}}
     store.finish_session(day, STATUS[rec["stop"]], rec)
     return store.session(day)

@@ -13,7 +13,8 @@
 и вселенная встроены в него) и `config.sha256` (SHA-256 байтов `config.json`).
 Каталог участника, который уже есть, не перезаписывается. `load_run` читает
 замороженный конфиг и возвращает признак, сошлась ли контрольная сумма: правка файла
-не скрывается, а помечается. Лимиты у всех участников общие (`Limits()`), TOML
+не скрывается, а помечается. У участника с аналитиком в конфиг замораживается и таблица цен модели аналитика
+(`analyst_token_prices`), у остальных там None. Лимиты у всех участников общие (`Limits()`), TOML
 переопределяет только `max_session_usd`. `active_runs` отдаёт планировщику каждый прогон,
 чей статус не конечный (`TERMINAL_STATUSES`), в том числе `invalid`: у него отключаются
 только сессии агента, HP и стопы работают.
@@ -69,6 +70,7 @@ class RunConfig:
     analyst_prompt: str | None
     analyst_max_searches: int
     analyst_max_usd: float
+    analyst_token_prices: dict | None
 
 
 def _build(toml_path: Path, live: bool) -> list[RunConfig]:
@@ -115,6 +117,7 @@ def _build(toml_path: Path, live: bool) -> list[RunConfig]:
             analyst_prompt=analyst_text if analyst else None,
             analyst_max_searches=p.get("analyst_max_searches", 0) if analyst else 0,
             analyst_max_usd=p.get("analyst_max_usd", 0.0) if analyst else 0.0,
+            analyst_token_prices=t["prices"][p["analyst_model"]] if analyst else None,
         ))
     return runs
 
