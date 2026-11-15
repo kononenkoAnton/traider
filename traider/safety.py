@@ -12,8 +12,9 @@
 `broker.ensure_stops`. Капитал ниже пола: `broker.liquidate`, статус `dead` и день
 гибели в `died_on`. Нечисловой капитал даёт ValueError из `traider.cage`, он не
 перехватывается: молча пропущенная проверка опаснее остановки. Удерживаемая бумага без
-годной котировки оценивается по цене входа (гибель решается по этой оценке), а отчёт
-перечисляет такие бумаги в `unpriced`.
+годной котировки оценивается по цене входа, отчёт перечисляет такие бумаги в `unpriced`. Пока
+`unpriced` не пуст, гибель в этом тике не решается и ликвидации нет, стопы проверяются как обычно:
+ложная гибель необратима, а запоздалая исправится на следующем тике с котировками.
 """
 from dataclasses import dataclass
 
@@ -32,7 +33,7 @@ class SafetyReport:
     died: bool
     stops_placed: tuple[str, ...]
     stop_fills: tuple[str, ...]
-    unpriced: tuple[str, ...] = ()   # удерживаемые бумаги без годной котировки: капитал по ним оценён по цене входа
+    unpriced: tuple[str, ...] = ()   # бумаги без годной котировки: оценены по цене входа, гибель не решалась
 
 
 def run_safety(cfg: RunConfig, store: RunStore, broker: Broker, day: str) -> SafetyReport:
@@ -43,7 +44,7 @@ def run_safety(cfg: RunConfig, store: RunStore, broker: Broker, day: str) -> Saf
     prices = broker.prices([p.symbol for p in acct.positions])
     unpriced = tuple(p.symbol for p in acct.positions if not usable(prices.get(p.symbol)))
     eq, fl, h = equity(acct, prices), floor(acct, cfg.limits), hp(acct, prices, cfg.limits)
-    if is_dead(acct, prices, cfg.limits):
+    if not unpriced and is_dead(acct, prices, cfg.limits):
         broker.liquidate(day)
         store.update_state(status="dead", died_on=day)
         return SafetyReport(eq, fl, h, True, (), fills, unpriced)

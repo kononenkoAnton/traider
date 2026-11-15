@@ -221,3 +221,15 @@ def test_account_saves_the_rebuilt_account_when_the_saved_one_is_stale(env):
     store.save_account(Account(1000.0, (), 1000.0))                 # отстал, пик тот же
     reported = b.account()
     assert store.account() == reported and reported.positions != ()
+
+
+# --- финальная волна, I2 ---
+
+def test_low_in_the_minute_of_the_last_sync_still_fills_the_stop(env):
+    cfg, store, market = env
+    b = SimBroker(cfg, store, market)
+    _at(market, 10); b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    market.clock = ny(2026, 12, 1, 10, 15).replace(second=30); assert b.sync("2026-12-01") == []
+    market.lows = {"AAPL": (185.0, 189.0, ny(2026, 12, 1, 10, 15))}   # свеча 10:15 началась до сверки в 10:15:30
+    market.clock = ny(2026, 12, 1, 10, 30).replace(second=30)
+    assert [e["kind"] for e in b.sync("2026-12-01")] == ["stop_fill"]

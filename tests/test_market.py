@@ -94,3 +94,17 @@ def test_load_env_accepts_export_and_quotes(tmp_path):
         "export A=1\nB=\"two words\"\nC='x=y'\nexport D = \"q\" \nE=\"unterminated\nF=a\"b\nG=\"\"\n")
     assert load_env(tmp_path / ".env") == {
         "A": "1", "B": "two words", "C": "x=y", "D": "q", "E": "\"unterminated", "F": "a\"b", "G": ""}
+
+
+# --- финальная волна, I2: стопы видят каждую минуту ---
+
+def test_floor_minute_drops_seconds_and_keeps_the_zone():
+    from traider.market import floor_minute
+    t = ny(2026, 12, 1, 10, 15).replace(second=42, microsecond=7)
+    assert floor_minute(t) == ny(2026, 12, 1, 10, 15) and floor_minute(t).tzinfo == t.tzinfo
+    assert floor_minute(ny(2026, 12, 1, 10, 15)) == ny(2026, 12, 1, 10, 15)
+
+def test_fake_lows_include_the_minute_that_holds_since_and_not_the_one_before():
+    m = FakeMarket(lows={"AAPL": [(1.0, 2.0, ny(2026, 12, 1, 10, 14)), (3.0, 4.0, ny(2026, 12, 1, 10, 15))]})
+    since = ny(2026, 12, 1, 10, 15).replace(second=30)
+    assert m.lows_since(["AAPL"], since) == {"AAPL": [(3.0, 4.0)]}

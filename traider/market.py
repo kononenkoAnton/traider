@@ -7,8 +7,10 @@
 Как это работает. `Market` это только контракт, реализации живут отдельно (настоящий
 источник котировок и поддельный рынок в тестах). Время `now` с поясом America/New_York.
 Бумаги без цены в ответ `last_prices` не попадают. `lows_since` отдаёт для каждой бумаги
-список пар (минимум, открытие), по одной на каждую свечу с указанного момента, в порядке
-времени; бумага без свечей в ответ не попадает. По ним стопы считаются задним числом:
+список пар (минимум, открытие), по одной на каждую минутную свечу с указанного момента, в порядке
+времени; бумага без свечей в ответ не попадает. Свеча помечена временем своего начала, поэтому
+`since` округляется вниз до минуты (`floor_minute`): минута, в которой лежит `since`, входит целиком,
+предыдущая нет. По ним стопы считаются задним числом:
 исполнение идёт по открытию той свечи, что первой задела стоп, поэтому гэп через ночь
 исполняется по открытию, а не по стопу. `Bar` это дневная свеча.
 
@@ -58,12 +60,18 @@ class Market(Protocol):
     def trading_days(self, start: str, end: str) -> list[str]: ...
     def daily_bars(self, symbols: Iterable[str], days: int) -> dict[str, list[Bar]]: ...
     def lows_since(self, symbols: Iterable[str], since: datetime) -> dict[str, list[tuple[float, float]]]: ...
+    # ^ минутные свечи с начала минуты, в которой лежит since (floor_minute), минута since входит целиком
     def news(self, symbols: Sequence[str] | None, limit: int) -> list[dict]: ...
     def fractionable(self, symbols: Iterable[str]) -> set[str]: ...
 
 
 def ny_day(ts: datetime) -> str:
     return ts.astimezone(NY).date().isoformat()
+
+
+def floor_minute(ts: datetime) -> datetime:
+    """Начало минуты, в которой лежит `ts`: с него начинается свеча, содержащая `ts`."""
+    return ts.replace(second=0, microsecond=0)
 
 
 def bar_from_sdk(b) -> Bar:
@@ -128,8 +136,8 @@ class AlpacaMarket:
         symbols = list(symbols)
         if not symbols:
             return {}
-        req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=TimeFrame(15, TimeFrameUnit.Minute),
-                               start=since, feed=DataFeed.IEX)
+        req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=TimeFrame(1, TimeFrameUnit.Minute),
+                               start=floor_minute(since), feed=DataFeed.IEX)
         cal = self._trading.get_calendar(GetCalendarRequest(start=since.astimezone(NY).date(), end=self.now().date()))
         sessions = [(c.open.replace(tzinfo=NY), c.close.replace(tzinfo=NY)) for c in cal]  # время календаря наивное, нью-йоркское
         out = {s: low_open_pairs(regular_session_bars(bars, sessions))

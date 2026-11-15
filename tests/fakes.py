@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from traider.brokers import BrokerRejected
-from traider.market import Bar, completed_days
+from traider.market import Bar, completed_days, floor_minute
 
 NY = ZoneInfo("America/New_York")
 
@@ -65,12 +65,13 @@ class FakeMarket:
 
     def lows_since(self, symbols, since):
         # запись lows: одна свеча или список свечей по времени; свеча это (минимум, открытие)
-        # или (минимум, открытие, время), без времени она считается всегда
-        out = {}
+        # или (минимум, открытие, время начала), без времени она считается всегда; как у AlpacaMarket,
+        # свеча той минуты, в которой лежит since, входит
+        out, start = {}, floor_minute(since)
         for s in symbols:
             e = self.lows.get(s)
             bars = [(b[0], b[1]) for b in (e if isinstance(e, list) else [e] if e else [])
-                    if len(b) < 3 or b[2] >= since]
+                    if len(b) < 3 or b[2] >= start]
             if bars:
                 out[s] = bars
         return out
