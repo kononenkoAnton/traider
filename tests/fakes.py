@@ -102,6 +102,11 @@ class FakeAlpacaApi:
         self.fail_next_stop = False
         self.fail_stop_for = None
         self.reject_sales_of: set[str] = set()
+        self.fail_replace = False
+        self.fill_stop_on_cancel: set[str] = set()   # стоп этой бумаги исполняется в тот момент, когда его отменяют
+        self.lookup_dies_with_network = False        # после потерянной связи поиск по client_order_id тоже падает
+        self._lookup_down = False
+        self.replaced = 0
         self.submitted = 0
 
     # --- ручки теста ---
@@ -153,6 +158,7 @@ class FakeAlpacaApi:
         mode, fraction = self.next_order_mode, self.next_fill_fraction
         self.next_order_mode, self.next_fill_fraction = None, 1.0
         if mode == "network_down":
+            self._lookup_down = self.lookup_dies_with_network
             raise ConnectionError("нет связи")
         if mode == "error":
             raise BrokerRejected("отклонено брокером")
@@ -185,15 +191,32 @@ class FakeAlpacaApi:
     def submit_market_sell(self, symbol, qty, client_order_id):
         return self._market(symbol, "sell", qty, None, client_order_id)
 
-    def submit_stop_sell(self, symbol, qty, stop_price):
+    def _check_stop(self, stop_price, cid):
+        if abs(round(stop_price, 2 if stop_price >= 1 else 4) - stop_price) > 1e-9:
+            raise BrokerRejected("sub-penny")
+        if any(o["client_order_id"] == cid for o in self.orders.values()):
+            raise BrokerRejected("client_order_id must be unique")
+
+    def submit_stop_sell(self, symbol, qty, stop_price, client_order_id):
         if self.fail_next_stop or self.fail_stop_for == symbol:
             self.fail_next_stop = False
             raise BrokerRejected("стоп отклонён")
         if qty > self._available(symbol) + 1e-9:
             raise BrokerRejected("недостаточно акций под стоп")
-        if abs(round(stop_price, 2 if stop_price >= 1 else 4) - stop_price) > 1e-9:
-            raise BrokerRejected("sub-penny")
-        return self._new(symbol, "sell", "stop", qty, f"stop-{self.submitted + 1}", stop_price=stop_price)["id"]
+        self._check_stop(stop_price, client_order_id)
+        return self._new(symbol, "sell", "stop", qty, client_order_id, stop_price=stop_price)["id"]
+
+    def replace_stop(self, order_id, stop_price, client_order_id):
+        """Как у Alpaca: старая заявка заменена, появляется новая (другой id) на то же количество."""
+        o = self.orders[order_id]
+        if self.fail_replace:
+            raise BrokerRejected("замена отклонена")
+        if o["type"] != "stop" or o["status"] not in self.OPEN:
+            raise BrokerRejected("заменить нельзя")
+        self._check_stop(stop_price, client_order_id)
+        o["status"] = "canceled"
+        self.replaced += 1
+        return self._new(o["symbol"], "sell", "stop", o["qty"], client_order_id, stop_price=stop_price)["id"]
 
     def order(self, order_id):
         o = self.orders[order_id]
@@ -201,6 +224,8 @@ class FakeAlpacaApi:
                                       "qty", "client_order_id", "stop_price", "filled_at")}
 
     def order_by_client_id(self, client_order_id):
+        if self._lookup_down:
+            raise ConnectionError("нет связи")
         o = next((o for o in self.orders.values() if o["client_order_id"] == client_order_id), None)
         return None if o is None else self.order(o["id"])
 
@@ -210,6 +235,9 @@ class FakeAlpacaApi:
 
     def cancel(self, order_id):
         o = self.orders[order_id]
+        if o["status"] in self.OPEN and o["type"] == "stop" and o["symbol"] in self.fill_stop_on_cancel:
+            self.fill_stop_on_cancel.discard(o["symbol"])
+            self._fill(o, o["qty"], o["stop_price"])      # стоп успел сработать раньше, чем дошла отмена
         if o["status"] not in self.OPEN:
             raise BrokerRejected("заявку уже нельзя отменить")
         o["status"] = "canceled"

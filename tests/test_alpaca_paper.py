@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from traider.alpaca import AlpacaBroker, make_alpaca_api
@@ -20,18 +22,19 @@ def test_fractional_buy_stop_and_same_day_close_on_paper(tmp_path, example):
     api = make_alpaca_api(cfg, env)
     store = RunStore(run)
     b = AlpacaBroker(cfg, store, market, api)
+    run_id = int(time.time())                                        # ids не повторяются между запусками на одном счёте
     quote = b.prices(["SPY"])["SPY"]
     stop = round(quote * 0.9, 2)
     try:
-        fill = b.buy("2026-12-01", "SPY", 20.0, stop, "тест paper", "paper/buy-1")
+        fill = b.buy("2026-12-01", "SPY", 20.0, stop, "тест paper", f"paper-{run_id}/buy-1")
         assert fill.qty > 0
         order = api.open_stop_orders()["SPY"]                         # дробный DAY-стоп принят
         assert order["qty"] == pytest.approx(fill.qty) and order["stop_price"] == stop
         assert b.ensure_stops() == []
-        half = b.close("2026-12-01", "SPY", 0.5, "тест paper", "paper/close-1")   # закрытие в день покупки
+        half = b.close("2026-12-01", "SPY", 0.5, "тест paper", f"paper-{run_id}/close-1")   # закрытие в день покупки
         assert half.qty == pytest.approx(fill.qty / 2, rel=1e-3)
         assert api.open_stop_orders()["SPY"]["qty"] == pytest.approx(fill.qty - half.qty, rel=1e-3)
-        b.close("2026-12-01", "SPY", 1.0, "тест paper", "paper/close-2")
+        b.close("2026-12-01", "SPY", 1.0, "тест paper", f"paper-{run_id}/close-2")
         assert api.open_stop_orders() == {}
         assert [e["kind"] for e in store.orders()] == ["buy", "close", "close"]
         assert all(e["broker_order_id"] for e in store.orders())
