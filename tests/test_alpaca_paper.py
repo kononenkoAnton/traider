@@ -1,6 +1,6 @@
 import pytest
 
-from traider.brokers import AlpacaBroker, make_alpaca_api
+from traider.alpaca import AlpacaBroker, make_alpaca_api
 from traider.config import load_run, start_experiment
 from traider.env import load_env
 from traider.market import AlpacaMarket

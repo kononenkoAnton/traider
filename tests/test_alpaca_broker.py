@@ -2,7 +2,8 @@ import pytest
 
 from tests.broker_contract import run_contract, run_refusal_contract
 from tests.fakes import FakeAlpacaApi, FakeMarket
-from traider.brokers import AlpacaBroker, BrokerRejected, NoPrice, make_alpaca_api
+from traider.alpaca import AlpacaBroker, make_alpaca_api
+from traider.brokers import BrokerRejected, NoPrice
 from traider.config import load_run, start_experiment
 from traider.store import RunStore
 
@@ -88,7 +89,7 @@ def test_close_cancels_the_stop_and_restores_it_for_the_rest(env):
 def test_paper_is_the_default(example, tmp_path, monkeypatch):
     cfg, _ = load_run(start_experiment(example, tmp_path / "runs") / "opus-a")
     seen = {}
-    monkeypatch.setattr("traider.brokers.AlpacaSdkApi", lambda key, secret, paper: seen.update(paper=paper))
+    monkeypatch.setattr("traider.alpaca.AlpacaSdkApi", lambda key, secret, paper: seen.update(paper=paper))
     make_alpaca_api(cfg, {"ALPACA_API_KEY": "k", "ALPACA_SECRET_KEY": "s"})
     assert seen == {"paper": True}
 
@@ -102,7 +103,7 @@ def test_live_mode_needs_its_own_keys(example_live, tmp_path):
 def test_live_mode_uses_live_keys_and_not_paper(example_live, tmp_path, monkeypatch):
     cfg, _ = load_run(start_experiment(example_live, tmp_path / "runs", live=True) / "opus-a")
     seen = {}
-    monkeypatch.setattr("traider.brokers.AlpacaSdkApi", lambda key, secret, paper: seen.update(k=key, s=secret, p=paper))
+    monkeypatch.setattr("traider.alpaca.AlpacaSdkApi", lambda key, secret, paper: seen.update(k=key, s=secret, p=paper))
     make_alpaca_api(cfg, {"ALPACA_LIVE_API_KEY": "lk", "ALPACA_LIVE_SECRET_KEY": "ls"})
     assert seen == {"k": "lk", "s": "ls", "p": False}
 
