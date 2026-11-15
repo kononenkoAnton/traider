@@ -7,7 +7,8 @@
 Как это работает. `start_experiment` читает TOML (`tomllib`) и проверяет его целиком
 до первой записи на диск: режим live требует флага `live=True`, модель должна быть в
 таблице `[prices]`, брокер из `alpaca|sim`, источник информации из `self|analyst`, все
-бумаги панели во вселенной, в `[criteria]` и в каждой таблице цен есть все ключи.
+бумаги панели во вселенной, в `[criteria]` и в каждой таблице цен есть все ключи; длинные ставки (`long_prompt_threshold` и четыре `*_long`) заданы
+либо все, либо ни одной.
 Пути к файлам вселенной и промптов считаются от каталога самого TOML. Для каждого
 участника в `runs/<experiment>/<participant>/` пишутся `config.json` (тексты промптов
 и вселенная встроены в него) и `config.sha256` (SHA-256 байтов `config.json`).
@@ -30,6 +31,7 @@ TERMINAL_STATUSES = ("dead", "finished")   # прогон в этих стату
 RESEARCH = ("self", "analyst")
 CRITERIA_KEYS = ("min_sessions", "max_missed_share", "min_closed_trades", "red_percentile", "green_percentile")
 PRICE_KEYS = ("input", "output", "cache_read", "cache_write", "search")
+LONG_PRICE_KEYS = ("long_prompt_threshold", "input_long", "output_long", "cache_read_long", "cache_write_long")
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,9 @@ def _build(toml_path: Path, live: bool) -> list[RunConfig]:
     for model, table in t["prices"].items():
         if missing := [k for k in PRICE_KEYS if k not in table]:
             raise ValueError(f"в ценах {model} нет ключей: {', '.join(missing)}")
+        if (have := [k for k in LONG_PRICE_KEYS if k in table]) and len(have) < len(LONG_PRICE_KEYS):
+            raise ValueError(f"в ценах {model} длинные ставки заданы не целиком, нет: "
+                             f"{', '.join(k for k in LONG_PRICE_KEYS if k not in table)}")
     runs = []
     names = [p["name"] for p in t["participants"]]
     for name in set(names):

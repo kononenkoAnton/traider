@@ -37,7 +37,7 @@ def test_an_answer_is_capped_at_400_words_and_keeps_its_paragraphs(env_analyst):
 
 def test_research_shares_the_daily_budget(env_analyst):
     cfg, market = env_analyst
-    pricey = use("submit", text="ответ", usage=dict(input_tokens=4_000_000))            # $0.40 по ценам Haiku
+    pricey = use("submit", text="ответ", usage=dict(input_tokens=4_000_000))            # $2.00 по длинным ставкам Haiku (запрос длиннее 100 тысяч токенов), потолок $0.30
     client = FakeAnthropic([pricey])
     a = Analyst(client, cfg, market)
     assert a.research("вопрос") == "ответ"

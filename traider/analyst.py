@@ -17,7 +17,6 @@
 заглушка. Методы не поднимают исключений. Без остатка бюджета вопрос не уходит в сеть.
 """
 import re
-from dataclasses import asdict
 
 from traider.brain import Tool, Usage, run_agent
 from traider.config import RunConfig

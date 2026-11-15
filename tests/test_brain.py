@@ -25,10 +25,19 @@ def test_cost_arithmetic():
 
 def test_long_prompts_use_the_long_tier():
     haiku = {"input": 0.10, "output": 0.50, "cache_read": 0.01, "cache_write": 0.125, "search": 0.01,
-             "long_prompt_threshold": 100_000, "input_long": 0.50, "output_long": 2.50}
-    assert cost_usd(Usage(input=90_000, output=10_000), haiku) == pytest.approx(0.009 + 0.005)
-    assert cost_usd(Usage(input=150_000, output=10_000), haiku) == pytest.approx(0.075 + 0.025)
-    assert cost_usd(Usage(input=20_000, cache_read=90_000, output=10_000), haiku) == pytest.approx(0.01 + 0.0009 + 0.025)   # длина запроса считается с кэшем
+             "long_prompt_threshold": 100_000, "input_long": 0.50, "output_long": 2.50,
+             "cache_read_long": 0.05, "cache_write_long": 0.625}
+    # 150 000 токенов запроса: вход 50 000, чтение кэша 80 000, запись кэша 20 000; выход 10 000; все по длинным ставкам
+    assert cost_usd(Usage(50_000, 10_000, 80_000, 20_000), haiku) == pytest.approx(0.025 + 0.004 + 0.0125 + 0.025)
+    assert cost_usd(Usage(50_000, 10_000, 80_000, 20_000), haiku) == pytest.approx(0.0665)
+    # ровно 100 000 токенов запроса: порог строгий, базовые ставки
+    assert cost_usd(Usage(20_000, 10_000, 60_000, 20_000), haiku) == pytest.approx(0.002 + 0.0006 + 0.0025 + 0.005)
+    assert cost_usd(Usage(20_000, 10_000, 60_000, 20_000), haiku) == pytest.approx(0.0101)
+
+
+def test_a_table_without_long_keys_prices_any_length_at_base_rates():
+    base = {"input": 0.10, "output": 0.50, "cache_read": 0.01, "cache_write": 0.125, "search": 0.01}
+    assert cost_usd(Usage(500_000, 100_000, 400_000, 100_000), base) == pytest.approx(0.05 + 0.05 + 0.004 + 0.0125)
 
 
 def test_runs_tools_until_the_terminal_one():
@@ -160,11 +169,6 @@ def test_unsupported_schema_type_is_an_error_result():
     weird = Tool("echo", "", {"type": "object", "properties": {"x": {"type": "weird"}}}, lambda a: "ok")
     result, client = run([use("echo", x="a"), use("finish")], tools=[weird, DONE])
     assert result.stop == "finished" and client.requests[1]["messages"][-1]["content"][0]["is_error"] is True
-
-
-def test_missing_long_rates_fall_back_to_base_rates():
-    prices = {**PRICES, "long_prompt_threshold": 100}
-    assert cost_usd(Usage(input=1_000_000, output=1_000_000), prices) == pytest.approx(24.0)
 
 
 def test_failure_after_the_request_keeps_what_was_gathered():

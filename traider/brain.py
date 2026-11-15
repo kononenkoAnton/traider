@@ -60,13 +60,14 @@ class AgentResult:
 
 
 def cost_usd(usage: Usage, prices: Mapping[str, float]) -> float:
-    """Цена ОДНОГО запроса; длинный запрос (вход + кэш выше порога) идёт по длинным ставкам."""
+    """Цена ОДНОГО запроса. Если в таблице есть `long_prompt_threshold` и запрос (вход + чтение кэша +
+    запись кэша) строго длиннее порога, все четыре вида токенов считаются по длинным ставкам
+    (`input_long`, `output_long`, `cache_read_long`, `cache_write_long`; конфиг проверяет, что они все есть)."""
     prompt = usage.input + usage.cache_read + usage.cache_write
-    long = "long_prompt_threshold" in prices and prompt > prices["long_prompt_threshold"]
-    rate_in = prices.get("input_long", prices["input"]) if long else prices["input"]    # нет длинной ставки: базовая
-    rate_out = prices.get("output_long", prices["output"]) if long else prices["output"]
-    return (usage.input * rate_in + usage.output * rate_out + usage.cache_read * prices["cache_read"]
-            + usage.cache_write * prices["cache_write"]) / 1e6 + usage.searches * prices["search"]
+    sfx = "_long" if "long_prompt_threshold" in prices and prompt > prices["long_prompt_threshold"] else ""
+    return (usage.input * prices["input" + sfx] + usage.output * prices["output" + sfx]
+            + usage.cache_read * prices["cache_read" + sfx] + usage.cache_write * prices["cache_write" + sfx]
+            ) / 1e6 + usage.searches * prices["search"]
 
 
 _TYPES = {"string": str, "object": dict, "array": list, "boolean": bool, "null": type(None)}

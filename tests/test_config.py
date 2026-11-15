@@ -113,3 +113,22 @@ def test_an_analyst_model_without_prices_is_rejected_before_any_write(tmp_path, 
     with pytest.raises(ValueError, match="аналитик"):
         start_experiment(example, tmp_path / "runs")
     assert not (tmp_path / "runs").exists()
+
+
+def test_partial_long_rates_are_rejected_before_any_write(tmp_path, example):
+    text = example.read_text()
+    cut = "cache_read_long = 0.05\ncache_write_long = 0.625\n"
+    assert cut in text
+    example.write_text(text.replace(cut, "").replace("output_long = 2.50\n", ""))  # остались порог и input_long
+    with pytest.raises(ValueError, match="длинные ставки"):
+        start_experiment(example, tmp_path / "runs")
+    assert not (tmp_path / "runs").exists()
+
+
+def test_haiku_long_rates_are_frozen_for_the_participant_and_the_analyst(tmp_path, example):
+    exp = start_experiment(example, tmp_path / "runs")
+    want = {"long_prompt_threshold": 100000, "input_long": 0.50, "output_long": 2.50,
+            "cache_read_long": 0.05, "cache_write_long": 0.625}
+    for table in (load_run(exp / "haiku")[0].token_prices, load_run(exp / "opus-analyst")[0].analyst_token_prices):
+        assert {k: table[k] for k in want} == want
+    assert "input_long" not in load_run(exp / "opus-a")[0].token_prices
