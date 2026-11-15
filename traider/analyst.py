@@ -11,7 +11,9 @@
 ценами `cfg.analyst_token_prices`. Инструменты: `get_news` (тот же, что у основного агента),
 серверный поиск и завершающий `submit(text)`. Бюджет `cfg.analyst_max_usd` и лимит поисков
 `cfg.analyst_max_searches` общие на сводку и все вопросы: каждому вызову передаётся остаток, потому
-что каждый вызов для API отдельный ход. Расход копится в `usage`, `cost`, `searches`.
+что каждый вызов для API отдельный ход. Срок каждого вызова `CALL_SECONDS` (600 с). Расход копится в
+`usage`, `cost`, `searches`, а `calls` хранит по записи на вызов: `kind` (`briefing` или `research`),
+`question` (текст задачи), `stop`, `cost`, `transcript`.
 Текст берётся из `submit`, даже если ответ с ним упёрся в потолок: цикл тогда не выполнил
 инструмент, но текст оплачен. Иначе берётся последнее текстовое сообщение при `end_turn`, иначе
 заглушка. Методы не поднимают исключений. Без остатка бюджета вопрос не уходит в сеть.
@@ -27,6 +29,7 @@ BRIEFING_WORDS = 1200
 ANSWER_WORDS = 400
 BRIEFING_FAILED = "Сводка аналитика недоступна."
 ANSWER_FAILED = "Аналитик недоступен."
+CALL_SECONDS = 600   # срок одного вызова аналитика
 BUDGET_SPENT = "Бюджет аналитика на сегодня исчерпан."
 
 
@@ -52,17 +55,20 @@ class Analyst:
     def __init__(self, client, cfg: RunConfig, market: Market):
         self.client, self.cfg = client, cfg
         self.usage, self.cost, self.searches = Usage(), 0.0, 0
+        self.calls: list[dict] = []   # по записи на вызов: kind, question, stop, cost, transcript
         self.tools = [news_tool(market), Tool(
             "submit", "Сдать готовый текст и закончить задачу.",
             {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"],
              "additionalProperties": False}, lambda a: "Принято.", terminal=True)]
 
-    def _ask(self, user: str, words: int) -> str | None:
+    def _ask(self, kind: str, user: str, words: int) -> str | None:
         cfg = self.cfg
         res = run_agent(self.client, model=cfg.analyst_model, system=cfg.analyst_prompt, user=user,
                         tools=self.tools, prices=cfg.analyst_token_prices, max_turns=cfg.limits.max_turns,
                         max_usd=cfg.analyst_max_usd - self.cost,
-                        max_searches=max(cfg.analyst_max_searches - self.searches, 0))
+                        max_searches=max(cfg.analyst_max_searches - self.searches, 0), max_seconds=CALL_SECONDS)
+        self.calls.append({"kind": kind, "question": user, "stop": res.stop, "cost": res.cost,
+                           "transcript": res.transcript})
         self.cost += res.cost
         self.searches += res.usage.searches
         self.usage = Usage(*(a + b for a, b in zip(vars(self.usage).values(), vars(res.usage).values())))
@@ -73,7 +79,7 @@ class Analyst:
         user = (f"Сегодня {day}. Собери сводку для торговой сессии. Вселенная бумаг: "
                 f"{', '.join(self.cfg.universe)}.")
         try:
-            return (self._ask(user, BRIEFING_WORDS) if self.cost < self.cfg.analyst_max_usd else None) \
+            return (self._ask("briefing", user, BRIEFING_WORDS) if self.cost < self.cfg.analyst_max_usd else None) \
                 or BRIEFING_FAILED
         except Exception:
             return BRIEFING_FAILED
@@ -82,6 +88,6 @@ class Analyst:
         if self.cost >= self.cfg.analyst_max_usd:
             return BUDGET_SPENT
         try:
-            return self._ask(question, ANSWER_WORDS) or ANSWER_FAILED
+            return self._ask("research", question, ANSWER_WORDS) or ANSWER_FAILED
         except Exception:
             return ANSWER_FAILED

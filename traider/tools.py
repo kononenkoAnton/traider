@@ -8,9 +8,10 @@
 вызываются `broker.buy`, `broker.close` и `broker.raise_stop`, и `buy` с `raise_stop` до
 брокера проходят `check_buy` и `check_raise_stop` (тест сканирует пакет). Порядок в `buy`:
 статус прогона `active`, клетка со счётом и ценами брокера и фактами сессии из журнала, потом
-брокер. Любой отказ клетки или исключение клетки и брокера (ValueError, NoPrice,
+брокер. Пока рынок закрыт (`market.is_open()` ложно), `buy`, `close_position` и `raise_stop` отказывают
+первым делом с кодом `market_closed`. Стоп в `buy` и `raise_stop` округляется до центов до клетки. Любой отказ клетки или исключение клетки и брокера (ValueError, NoPrice,
 BrokerRejected) пишется в журнал событием `reject` с кодом в `reason` (код клетки,
-`no_price`, `broker_rejected`, `bad_request`, `run_not_active`) и возвращается агенту
+`no_price`, `broker_rejected`, `bad_request`, `run_not_active`, `market_closed`) и возвращается агенту
 текстом на «Отказ». Негодное число из заявки пишется как None. Закрытие и подъём стопа
 несуществующей позиции дают «Ошибка» без записи. Идентификатор заявки новый на каждую
 попытку: `эксперимент/участник/день/n`, n на единицу больше числа событий buy, close и
@@ -18,7 +19,9 @@ reject (покупки и закрытия) за день. Ответы это �
 начинается с «Куплено», «Закрыто», «Стоп поднят», отказ с «Отказ», неверный вход с «Ошибка».
 Прогнозы проверяются целиком до записи. Заметки режутся до 2000 знаков, журнал сессии до
 300 слов; `finish_session` завершающий. `research` есть только при `ctx.research`, тогда нет
-`get_news`. Текст новостей передаётся как есть: это данные. `news_tool` общий для основного
+`get_news`. Текст новостей передаётся как есть: это данные. Дневные свечи (`scan_universe`, `get_bars`)
+заканчиваются последним завершённым днём, его называет заголовок `scan_universe`; `get_bars` добавляет по
+каждой бумаге строку с текущей ценой из `market.last_prices` или пометку, что сегодня сделок не было. `news_tool` общий для основного
 агента и аналитика.
 """
 from collections.abc import Callable
@@ -52,6 +55,11 @@ class SessionContext:
 def _num(x) -> float | None:
     """Число для журнала: негодное (не число, NaN, бесконечность) пишется как None."""
     return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) and isfinite(x) else None
+
+
+def _cents(x):
+    """Стоп до центов раньше клетки: клетка проверяет ту цену, что уйдёт брокеру. Негодное число как есть."""
+    return round(x, 2) if usable(x) else x
 
 
 def _obj(props: dict, required: list[str]) -> dict:
@@ -139,7 +147,9 @@ def build_tools(ctx: SessionContext) -> list[Tool]:
         bars = market.daily_bars(cfg.universe, 61)
         rows = [(s, _metrics(bars[s])) for s in cfg.universe if bars.get(s)]
         rows.sort(key=lambda r: (r[1][key] is None, -(r[1][key] or 0) if desc else (r[1][key] or 0)))
-        lines = [f"Вселенная по {key}, {'по убыванию' if desc else 'по возрастанию'}, первые {top}:"]
+        upto = max((bars[s][-1].day for s, _ in rows), default="н/д")
+        lines = [f"Вселенная по {key}, {'по убыванию' if desc else 'по возрастанию'}, первые {top}. "
+                 f"Дневные свечи по последний завершённый день {upto} включительно, сегодняшней цены здесь нет:"]
         for s, m in rows[:top]:
             lines.append(f"{s} ret_1d {_pct(m['ret_1d'])} ret_5d {_pct(m['ret_5d'])} ret_20d {_pct(m['ret_20d'])} "
                          f"ret_60d {_pct(m['ret_60d'])} vol_20d {_pct(m['volatility_20d'])} "
@@ -149,14 +159,18 @@ def build_tools(ctx: SessionContext) -> list[Tool]:
     def get_bars(a: dict) -> str:
         days = a.get("days", 20)
         data = market.daily_bars(a["symbols"], days)
+        now = market.last_prices(a["symbols"])
         lines = []
         for s in a["symbols"]:
             bars = data.get(s)
             if not bars:
                 lines.append(f"{s}: нет данных")
-                continue
-            lines.append(f"{s} (день: открытие, максимум, минимум, закрытие, объём)")
-            lines += [f"{b.day}: {b.open:.2f} {b.high:.2f} {b.low:.2f} {b.close:.2f} {b.volume:.0f}" for b in bars]
+            else:
+                lines.append(f"{s} (день: открытие, максимум, минимум, закрытие, объём)")
+                lines += [f"{b.day}: {b.open:.2f} {b.high:.2f} {b.low:.2f} {b.close:.2f} {b.volume:.0f}" for b in bars]
+            price = now.get(s)
+            lines.append(f"{s} сейчас: {price:.2f} (последняя сделка сегодня)" if usable(price)
+                         else f"{s} сейчас: сегодня сделок ещё не было, текущей цены нет")
         return "\n".join(lines)
 
     # --- решения ---
@@ -177,11 +191,18 @@ def build_tools(ctx: SessionContext) -> list[Tool]:
         tail = f" Не хватает по панели: {', '.join(missing)}." if missing else " Панель закрыта."
         return f"Записано прогнозов: {len(clean)}.{tail}"
 
+    def closed(action: str, sym, **ref) -> str | None:
+        if market.is_open():
+            return None
+        return reject(action, sym, "market_closed", "рынок закрыт, заявки не принимаются.", **ref)
+
     def buy(a: dict) -> str:
-        sym, notional, stop, thesis = a["symbol"], a["notional"], a["stop_price"], a["thesis"]
+        sym, notional, stop, thesis = a["symbol"], a["notional"], _cents(a["stop_price"]), a["thesis"]
         ref = dict(notional=notional, stop=stop, thesis=thesis)
         cid = None
         try:
+            if no := closed("buy", sym, **ref):
+                return no
             if store.state()["status"] != "active":
                 return reject("buy", sym, "run_not_active", "прогон не активен, покупки закрыты.", **ref)
             acct = broker.account()
@@ -202,6 +223,8 @@ def build_tools(ctx: SessionContext) -> list[Tool]:
 
     def close_position(a: dict) -> str:
         sym, fraction = a["symbol"], a["fraction"]
+        if no := closed("close", sym):
+            return no
         if held(sym) is None:
             return f"Ошибка: позиции по {sym} нет."
         if not (usable(fraction) and fraction <= 1):
@@ -218,9 +241,11 @@ def build_tools(ctx: SessionContext) -> list[Tool]:
         return f"Закрыто {fill.symbol}: {fill.qty:.4f} шт по {fill.price:.2f}."
 
     def raise_stop(a: dict) -> str:
-        sym, stop = a["symbol"], a["stop_price"]
+        sym, stop = a["symbol"], _cents(a["stop_price"])
         ref = dict(stop=stop)
         try:
+            if no := closed("raise_stop", sym, **ref):
+                return no
             acct = broker.account()
             if not any(p.symbol == sym for p in acct.positions):
                 return f"Ошибка: позиции по {sym} нет."
@@ -254,10 +279,12 @@ def build_tools(ctx: SessionContext) -> list[Tool]:
              _obj({}, []), get_account),
         Tool("scan_universe",
              "Сводка по всей вселенной: доходность за 1, 5, 20 и 60 дней, волатильность 20 дней, отношение "
-             "объёма к среднему. Одна строка на тикер, тикер первым.",
+             "объёма к среднему. Одна строка на тикер, тикер первым. Дневные свечи заканчиваются последним "
+             "завершённым днём (он в заголовке): пока рынок открыт, сегодняшнего дня в них нет.",
              _obj({"sort_by": {"type": "string", "enum": list(SORT_KEYS)}, "descending": {"type": "boolean"},
                    "top": {"type": "integer", "minimum": 1, "maximum": 50}}, []), scan_universe),
-        Tool("get_bars", "Дневные свечи по тикерам (не больше 10 тикеров, не больше 120 дней).",
+        Tool("get_bars", "Дневные свечи по тикерам (не больше 10 тикеров, не больше 120 дней). Свечи заканчиваются "
+             "последним завершённым днём; текущая цена (последняя сделка сегодня) идёт отдельной строкой.",
              _obj({"symbols": _SYMBOLS, "days": {"type": "integer", "minimum": 1, "maximum": 120}}, ["symbols"]),
              get_bars),
     ]

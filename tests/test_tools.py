@@ -341,3 +341,51 @@ def test_reject_events_carry_the_market_clock(ctx):
     ctx.market.clock = ny(2031, 3, 4, 11, 22)
     call(ctx, "buy", symbol="AAPL", notional=50.0, stop_price=1.0, thesis="т")
     assert last(ctx)["kind"] == "reject" and last(ctx)["ts"] == ctx.market.now().isoformat()
+
+
+# --- финальная волна, I4: агент видит сегодняшние цены ---
+
+def test_get_bars_shows_the_current_price_or_says_there_is_none(ctx):
+    ctx.market.prices["AAPL"] = 201.37
+    del ctx.market.prices["MSFT"]
+    out = call(ctx, "get_bars", symbols=["AAPL", "MSFT"], days=3)
+    assert "AAPL сейчас: 201.37" in out and "MSFT сейчас: сегодня сделок ещё не было" in out
+    assert "2026-12-01:" not in out and "2026-11-30:" in out              # свечи по вчерашний день
+
+def test_scan_header_names_the_last_completed_day(ctx):
+    assert "2026-11-30 включительно" in call(ctx, "scan_universe").splitlines()[0]
+
+
+# --- финальная волна, M14: при закрытом рынке заявок нет ---
+
+@pytest.mark.parametrize("name, args", [
+    ("buy", dict(symbol="AAPL", notional=150.0, stop_price=180.0, thesis="т")),
+    ("close_position", dict(symbol="AAPL", fraction=1.0, reason="р")),
+    ("raise_stop", dict(symbol="AAPL", stop_price=190.0)),
+])
+def test_orders_are_refused_while_the_market_is_closed(ctx, name, args):
+    panel(ctx)
+    assert buy(ctx).startswith("Куплено")
+    before = ctx.broker.account()
+    ctx.market.open = False
+    out = call(ctx, name, **args)
+    assert out.startswith("Отказ (market_closed)")
+    assert (last(ctx)["kind"], last(ctx)["reason"]) == ("reject", "market_closed")
+    assert ctx.broker.account() == before
+
+
+# --- финальная волна, L102: клетка видит стоп, округлённый до центов ---
+
+def test_stop_is_rounded_to_cents_before_the_cage(ctx):
+    panel(ctx); ctx.market.prices.update(AAPL=100.0, MSFT=100.01)
+    # цена 100: нижняя граница 85.00; 84.996 без округления вне диапазона, округлённая 85.00 в нём
+    out = call(ctx, "buy", symbol="AAPL", notional=50.0, stop_price=84.996, thesis="т")
+    assert out.startswith("Куплено AAPL") and out.endswith("стоп 85.00.")
+    assert last(ctx)["stop_price"] == 85.0
+    # цена 100.01: верхняя граница 97.0097; 97.0096 без округления в диапазоне, округлённая 97.01 вне его
+    assert call(ctx, "buy", symbol="MSFT", notional=50.0, stop_price=97.0096, thesis="т").startswith(
+        "Отказ (stop_out_of_range)")
+    assert last(ctx)["stop_price"] == 97.01
+    # подъём при цене 100: верхняя граница 97.00; 97.004 проходит как 97.00
+    assert call(ctx, "raise_stop", symbol="AAPL", stop_price=97.004) == "Стоп поднят: AAPL теперь 97.00."
+    assert ctx.broker.account().positions[0].stop_price == 97.0

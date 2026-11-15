@@ -167,3 +167,33 @@ def test_the_last_session_sets_finishing_even_when_liquidation_raises(senv):
                       FakeAnthropic([use("finish_session", journal="конец")]), "2026-12-01")
     assert rec["status"] == "ok" and any("нет связи" in e for e in rec["errors"])
     assert store.state()["status"] == "finishing" and store.state()["finish_day"] == "2026-12-01"
+
+
+# --- финальная волна ---
+
+def test_record_carries_fallback_used_and_snapshot_symbols(senv):                 # I6.1, I6.5
+    cfg, store, market, broker = senv
+    market.prices.update(AAPL=math.nan)
+    store.start_session("2026-12-01", NOW)
+    step = use("finish_session", journal="к"); step["model"] = "claude-opus-5"   # ответила модель подмены
+    rec = run_session(cfg, store, broker, market, FakeAnthropic([step]), "2026-12-01")
+    assert rec["fallback_used"] is True and rec["snapshot_symbols"] == len(cfg.universe) - 1
+    store.start_session("2026-12-02", NOW)
+    plain = run_session(cfg, store, broker, market, FakeAnthropic([use("finish_session", journal="к")]), "2026-12-02")
+    assert plain["fallback_used"] is False
+
+def test_session_past_its_time_limit_is_a_cap(senv):                             # M13
+    cfg, store, market, broker = senv
+    assert cfg.limits.max_session_seconds == 1200
+    quick = dataclasses.replace(cfg, limits=dataclasses.replace(cfg.limits, max_session_seconds=0))
+    store.start_session("2026-12-01", NOW)
+    client = FakeAnthropic([use("finish_session", journal="к")])
+    rec = run_session(quick, store, broker, market, client, "2026-12-01")
+    assert (rec["status"], rec["stop"], client.requests) == ("cap", "deadline", [])
+
+def test_context_with_an_analyst_promises_no_searches(senv):                      # M17
+    cfg, store, market, broker = senv
+    own = build_context(cfg, store, broker, market, "2026-12-01")
+    helped = build_context(cfg, store, broker, market, "2026-12-01", briefing="СВОДКА")
+    assert "8 поисков" in own and "аналитика" not in own.split("## Позиции")[0]
+    assert "поисков" not in helped.split("## Позиции")[0] and "research" in helped

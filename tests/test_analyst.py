@@ -102,7 +102,7 @@ def test_session_with_an_analyst(env_analyst_session):
     assert rec["analyst"]["briefing"] == "СВОДКА" and rec["cost"] > rec["analyst"]["cost"] > 0
     assert "СВОДКА" in main.requests[0]["messages"][0]["content"]
     assert not any(t.get("name") in ("web_search", "get_news") for t in main.requests[0]["tools"])
-    assert set(rec["analyst"]) == {"cost", "searches", "briefing", "usage", "model"}
+    assert set(rec["analyst"]) == {"cost", "searches", "briefing", "usage", "model", "calls"}
     assert rec["analyst"]["model"] == "claude-haiku-5-5" and rec["analyst"]["usage"]["input"] == 1000
     assert "ОТВЕТ" in str(main.requests[1]["messages"][-1]["content"])
 
@@ -131,3 +131,21 @@ def test_a_broken_briefing_leaves_a_stub_in_the_context(env_analyst_session):
                       analyst=Broken(FakeAnthropic([]), cfg, market))
     assert "Сводка аналитика недоступна." in main.requests[0]["messages"][0]["content"]
     assert rec["status"] == "ok" and any("сломался" in e for e in rec["errors"])
+
+
+# --- финальная волна ---
+
+def test_each_analyst_call_is_recorded_and_has_its_time_limit(env_analyst_session, monkeypatch):   # I6.4, M13
+    from traider import analyst as analyst_module
+    cfg, store, market, broker = env_analyst_session
+    seen = []
+    real = analyst_module.run_agent
+    monkeypatch.setattr(analyst_module, "run_agent", lambda *a, **kw: seen.append(kw["max_seconds"]) or real(*a, **kw))
+    store.start_session("2026-12-01", NOW)
+    main = FakeAnthropic([use("research", question="что с LLY?"), use("finish_session", journal="ок")])
+    helper = FakeAnthropic([use("submit", text="СВОДКА", usage=PAID), use("submit", text="ОТВЕТ", usage=PAID)])
+    rec = run_session(cfg, store, broker, market, main, "2026-12-01", analyst=Analyst(helper, cfg, market))
+    calls = rec["analyst"]["calls"]
+    assert [c["kind"] for c in calls] == ["briefing", "research"] and calls[1]["question"] == "что с LLY?"
+    assert all(c["stop"] == "finished" and c["cost"] > 0 and c["transcript"][0]["role"] == "user" for c in calls)
+    assert sum(c["cost"] for c in calls) == rec["analyst"]["cost"] and seen == [600, 600]

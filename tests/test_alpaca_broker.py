@@ -699,3 +699,24 @@ def test_unknown_whether_the_order_reached_the_broker_keeps_the_desired_stop(env
     with pytest.raises(ConnectionError):
         b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
     assert store.state()["stops"] == {"AAPL": 186.0}
+
+
+# --- финальная волна, M9: сбой чтения счёта после сделки не отменяет сделку ---
+
+def test_failed_account_read_after_the_fill_still_answers_bought(env):
+    from traider.tools import SessionContext, build_tools
+    cfg, store, market, api = env
+    b = broker(env)
+    real = api.submit_market_buy
+    def submit(*a):
+        oid = real(*a)
+        def down():
+            raise ConnectionError("нет связи")
+        api.cash_and_positions = down                                # после исполнения счёт не читается
+        return oid
+    api.submit_market_buy = submit
+    tools = {t.name: t for t in build_tools(SessionContext(cfg, store, b, market, "2026-12-01"))}
+    tools["record_forecasts"].fn({"forecasts": [{"symbol": s, "p": 0.5} for s in cfg.panel]})
+    out = tools["buy"].fn({"symbol": "AAPL", "notional": 150.0, "stop_price": 186.0, "thesis": "т"})
+    assert out.startswith("Куплено AAPL")
+    assert [e["kind"] for e in store.orders()] == ["buy"] and store.orders()[0]["stop_placed"] is False

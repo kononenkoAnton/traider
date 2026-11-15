@@ -5,19 +5,27 @@
 :wk-categories: system-architecture
 
 Как это работает. `run_agent` вручную ведёт разговор через Messages API (стриминг, итоговое
-сообщение, адаптивное мышление, effort в `output_config`, кэш на уровне запроса). После каждого
+сообщение, адаптивное мышление с кратким изложением (`display: "summarized"`: по умолчанию у этих моделей
+текст мышления пуст; на оплату это не влияет), effort в `output_config`, кэш на уровне запроса). После каждого
 ответа считается стоимость: при `cost >= max_usd` цикл обрывается до выполнения инструментов этого
-ответа. Ходов не больше `max_turns`. Вход инструмента проверяется по его JSON-схеме до вызова.
+ответа. Ходов не больше `max_turns`. Перед каждым запросом сверяется срок: если с начала прошло
+`max_seconds` по `clock` (по умолчанию `time.monotonic`), цикл останавливается с `stop="deadline"`. Вход инструмента проверяется по его JSON-схеме до вызова.
 Цикл ничего не решает о торговле и никогда не поднимает исключений: сбой клиента это `stop="error"`.
+После каждого хода с вызовами инструментов (кроме завершающего) к тексту последнего `tool_result` добавляется
+строка состояния: ход из `max_turns`, доллары из `max_usd` и, если поиск включён, поиски из `max_searches`.
+Отдельным блоком её не шлют: сообщение должно состоять только из `tool_result`.
 
 Поиск. Лимит поисков держит API: `max_uses` считает поиски за ход, а ход продолжается, пока
 последнее сообщение запроса состоит только из блоков `tool_result` (или после `pause_turn`).
 Цикл после первого сообщения шлёт только такие сообщения, поэтому вся сессия это один ход, и
-`max_uses = max_searches` ограничивает сессию. Поиск вызывается напрямую
-(`allowed_callers: ["direct"]`), динамическая фильтрация выключена намеренно: поиски из
+`max_uses = max_searches` ограничивает сессию. Поиск вызывается напрямую: у версии с динамической
+фильтрацией (`web_search_20260209`) это задаёт `allowed_callers: ["direct"]`, у базовой `web_search_20250305`
+вызов прямой и так, поле не шлётся. Динамическая фильтрация выключена намеренно: поиски из
 выполнения кода между запросами не суммируются, а так все модели ищут одинаково. Определение
-инструмента одно на всю сессию, кэш промпта им не сбрасывается.
+инструмента одно на всю сессию, кэш промпта им не сбрасывается. В записи сессии (`transcript`) у блоков
+результатов поиска и цитат нет `encrypted_content` и `encrypted_index`; модели они возвращаются как получены.
 """
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from math import isfinite
@@ -49,7 +57,7 @@ class Usage:
 
 @dataclass
 class AgentResult:
-    stop: str             # "finished" | "end_turn" | "max_turns" | "budget" | "refusal" | "error"
+    stop: str             # "finished" | "end_turn" | "max_turns" | "budget" | "deadline" | "refusal" | "error"
     turns: int
     usage: Usage
     cost: float
@@ -140,8 +148,18 @@ def _clean(x):
     return str(x)
 
 
+ENCRYPTED = frozenset({"encrypted_content", "encrypted_index"})   # непрозрачные данные поиска: в запись не идут
+
+
+def _strip(x):
+    if isinstance(x, dict):
+        return {k: _strip(v) for k, v in x.items() if k not in ENCRYPTED}
+    return [_strip(v) for v in x] if isinstance(x, list) else x
+
+
 def _plain(block) -> dict:
-    return _clean(block if isinstance(block, dict) else block.model_dump(mode="json"))
+    """Копия блока для записи сессии: без зашифрованных полей поиска. В API уходит сам блок, как получен."""
+    return _strip(_clean(block if isinstance(block, dict) else block.model_dump(mode="json")))
 
 
 def _run_tool(tools: Mapping[str, Tool], name: str, args) -> tuple[str, bool]:
@@ -176,33 +194,47 @@ def _usage_of(entry, searches: int = 0) -> Usage:
                  _g(entry, "cache_creation_input_tokens"), searches)
 
 
+def _status(res: AgentResult, max_turns: int, max_usd: float, max_searches: int) -> str:
+    searches = f", поисков {res.usage.searches} из {max_searches}" if max_searches > 0 else ""
+    return f"[Состояние: ход {res.turns} из {max_turns}, потрачено ${res.cost:.2f} из ${max_usd:.2f}{searches}.]"
+
+
 def run_agent(client, *, model: str, system: str, user: str, tools: Sequence[Tool], prices: Mapping[str, float],
-              max_turns: int, max_usd: float, max_searches: int, effort: str = "high") -> AgentResult:
+              max_turns: int, max_usd: float, max_searches: int, effort: str = "high",
+              max_seconds: float = float("inf"), clock: Callable[[], float] = time.monotonic) -> AgentResult:
     """Никогда не поднимает исключений: любой сбой это stop="error" с накопленными ходами, расходом и записью."""
     res = AgentResult("error", 0, Usage(), 0.0, model, [{"role": "user", "content": user}])
     try:
-        _loop(client, res, model, system, user, tools, prices, max_turns, max_usd, max_searches, effort)
+        deadline = clock() + max_seconds
+        _loop(client, res, model, system, user, tools, prices, max_turns, max_usd, max_searches, effort,
+              lambda: clock() >= deadline)
     except Exception as e:
         res.stop, res.error = "error", f"{type(e).__name__}: {e}"
     return res
 
 
-def _loop(client, res, model, system, user, tools, prices, max_turns, max_usd, max_searches, effort) -> None:
+def _loop(client, res, model, system, user, tools, prices, max_turns, max_usd, max_searches, effort, late) -> None:
     by_name = {t.name: t for t in tools}
     api_tools = [{"name": t.name, "description": t.description, "input_schema": t.input_schema,
                   "eager_input_streaming": True} for t in tools]
     if max_searches > 0:
-        api_tools.append({"type": SEARCH_TYPES.get(model, "web_search_20250305"), "name": "web_search",
-                          "max_uses": max_searches, "allowed_callers": ["direct"]})
+        kind = SEARCH_TYPES.get(model, "web_search_20250305")
+        search = {"type": kind, "name": "web_search", "max_uses": max_searches}
+        if kind != "web_search_20250305":   # у базовой версии вызов и так прямой, у новой по умолчанию нет
+            search["allowed_callers"] = ["direct"]
+        api_tools.append(search)
     extra = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"} if model in FALLBACK_MODELS else {}
     messages: list[dict] = [{"role": "user", "content": user}]
     res.stop = "max_turns"
     while res.turns < max_turns:
+        if late():   # срок сессии проверяется перед каждым запросом; начатый запрос не обрывается
+            res.stop = "deadline"
+            return
         res.turns += 1
         try:
             with client.beta.messages.stream(
                 model=model, max_tokens=MAX_TOKENS, system=system, tools=api_tools, messages=list(messages),
-                thinking={"type": "adaptive"}, output_config={"effort": effort},
+                thinking={"type": "adaptive", "display": "summarized"}, output_config={"effort": effort},
                 cache_control={"type": "ephemeral"}, **extra,
             ) as stream:
                 response = stream.get_final_message()
@@ -253,6 +285,8 @@ def _loop(client, res, model, system, user, tools, prices, max_turns, max_usd, m
                 finished = not failed and by_name[b.name].terminal
             results.append({"type": "tool_result", "tool_use_id": b.id, "content": out,
                             **({"is_error": True} if failed else {})})
+        if not finished:   # строка состояния в тексте последнего результата, отдельным блоком она начала бы новый ход
+            results[-1]["content"] += "\n\n" + _status(res, max_turns, max_usd, max_searches)
         # только tool_result: любой другой блок здесь начал бы новый ход и обнулил счёт поисков API
         messages.append({"role": "user", "content": results})
         res.transcript.append({"role": "user", "content": _clean(results)})

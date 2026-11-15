@@ -97,7 +97,7 @@ def test_web_search_is_offered_only_when_allowed():
 def test_request_shape_and_fallback_per_model():
     _, opus = run([use("finish")])
     r = opus.requests[0]
-    assert r["thinking"] == {"type": "adaptive"} and r["output_config"] == {"effort": "high"}
+    assert r["thinking"] == {"type": "adaptive", "display": "summarized"} and r["output_config"] == {"effort": "high"}
     assert r["cache_control"] == {"type": "ephemeral"} and r["fallbacks"] == "default"
     assert not {"temperature", "top_p", "top_k", "tool_choice"} & set(r)
     _, haiku = run([use("finish")], model="claude-haiku-5-5")
@@ -241,3 +241,58 @@ def test_every_follow_up_message_holds_only_tool_results():
 def test_no_search_tool_in_any_request_when_searches_are_off():
     _, client = run([use("echo", x="a"), use("finish")], max_searches=0)
     assert len(client.requests) == 2 and not any(_search_tools(r) for r in client.requests)
+
+
+# --- финальная волна, I5: агент видит расход своих потолков ---
+def test_status_line_after_each_tool_turn_shows_turns_dollars_and_searches():
+    u = dict(input_tokens=100_000, web_search_requests=1)                   # $0.40 и поиск за $0.01 в каждом ответе
+    result, client = run([use("echo", x="a", usage=u), use("echo", x="b", usage=u), use("finish")])
+    second = client.requests[2]["messages"][-1]["content"]
+    assert all(b["type"] == "tool_result" for b in second)
+    assert second[-1]["content"].endswith("[Состояние: ход 2 из 40, потрачено $0.82 из $2.00, поисков 2 из 8.]")
+    assert second[-1]["content"].startswith("ok b")
+    assert "Состояние" in client.requests[1]["messages"][-1]["content"][-1]["content"]
+
+def test_status_line_goes_into_the_last_result_and_has_no_searches_when_they_are_off():
+    _, client = run([use(("echo", dict(x="a")), ("echo", dict(x="b"))), use("finish")], max_searches=0)
+    first, last = client.requests[1]["messages"][-1]["content"]
+    assert first["content"] == "ok a" and last["content"] == "ok b\n\n[Состояние: ход 1 из 40, потрачено $0.00 из $2.00.]"
+
+
+# --- финальная волна, I6.6: зашифрованные поля поиска не попадают в запись ---
+def test_transcript_drops_encrypted_search_fields_but_the_api_gets_them_back():
+    from tests.fakes import Block
+    found = Block(type="web_search_tool_result", tool_use_id="s1",
+                  content=[{"type": "web_search_result", "url": "u", "title": "t", "encrypted_content": "BLOB"}])
+    cited = Block(type="text", text="факт", citations=[{"type": "web_search_result_location", "url": "u",
+                                                         "cited_text": "c", "encrypted_index": "IDX"}])
+    step = use("echo", x="a"); step["content"] = [found, cited, *step["content"]]
+    result, client = run([step, use("finish")])
+    stored = json.dumps(result.transcript, ensure_ascii=False)
+    assert "BLOB" not in stored and "IDX" not in stored and '"url": "u"' in stored and "факт" in stored
+    echoed = client.requests[1]["messages"][1]["content"]
+    assert echoed[0] is found and echoed[0].content[0]["encrypted_content"] == "BLOB"
+    assert echoed[1].citations[0]["encrypted_index"] == "IDX"
+
+
+# --- финальная волна, M13: срок сессии ---
+def test_deadline_is_checked_before_each_request_with_an_injected_clock():
+    now = [0.0]
+    def slow(a):
+        now[0] += 700.0; return "ok"                                    # инструмент «работает» 700 секунд
+    tool = Tool("echo", "", ECHO.input_schema, slow)
+    result, client = run([use("echo", x="a"), use("echo", x="b"), use("finish")], tools=[tool, DONE],
+                         max_seconds=1200, clock=lambda: now[0])
+    assert (result.stop, result.turns, len(client.requests)) == ("deadline", 2, 2)
+
+def test_no_deadline_by_default():
+    assert run([use("echo", x="a"), use("finish")], clock=lambda: 1e12)[0].stop == "finished"
+
+
+# --- финальная волна, M21: allowed_callers только у новой версии поиска ---
+def test_allowed_callers_only_with_the_search_version_that_needs_it():
+    _, opus = run([use("finish")])
+    _, haiku = run([use("finish")], model="claude-haiku-5-5")
+    (new,), (basic,) = _search_tools(opus.requests[0]), _search_tools(haiku.requests[0])
+    assert new["type"] == "web_search_20260209" and new["allowed_callers"] == ["direct"]
+    assert basic["type"] == "web_search_20250305" and "allowed_callers" not in basic and basic["max_uses"] == 8

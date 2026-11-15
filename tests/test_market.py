@@ -108,3 +108,18 @@ def test_fake_lows_include_the_minute_that_holds_since_and_not_the_one_before():
     m = FakeMarket(lows={"AAPL": [(1.0, 2.0, ny(2026, 12, 1, 10, 14)), (3.0, 4.0, ny(2026, 12, 1, 10, 15))]})
     since = ny(2026, 12, 1, 10, 15).replace(second=30)
     assert m.lows_since(["AAPL"], since) == {"AAPL": [(3.0, 4.0)]}
+
+def test_alpaca_market_asks_for_split_adjusted_days_and_one_minute_lows():   # M16, I2
+    from types import SimpleNamespace as NS
+    from alpaca.data.enums import Adjustment
+    from traider.market import AlpacaMarket
+    seen = []
+    m = object.__new__(AlpacaMarket)
+    m._data = NS(get_stock_bars=lambda req: seen.append(req) or NS(data={}))
+    m._trading = NS(get_clock=lambda: NS(is_open=True), get_calendar=lambda req: [])
+    m.daily_bars(["AAPL"], 5)
+    m.lows_since(["AAPL"], ny(2026, 12, 1, 10, 15).replace(second=30))
+    days, lows = seen
+    assert days.adjustment == Adjustment.SPLIT
+    assert lows.timeframe.amount == 1 and lows.timeframe.unit.value == "Min"
+    assert lows.start == datetime(2026, 12, 1, 15, 15)                     # SDK хранит начало в UTC без пояса

@@ -451,8 +451,7 @@ class AlpacaBroker:
         self._log(day, "buy", symbol, o["filled_qty"], o["filled_avg_price"], notional=o["filled_qty"] * o["filled_avg_price"],
                   stop_price=stop, thesis=thesis, client_order_id=client_order_id, broker_order_id=oid,
                   stop_placed=placed)
-        self.account()
-        return Fill(symbol, o["filled_qty"], o["filled_avg_price"], "buy")
+        return Fill(symbol, o["filled_qty"], o["filled_avg_price"], "buy")   # счёт после сделки не читаем: его сбой не отменит сделку
 
     def close(self, day, symbol, fraction, reason, client_order_id) -> Fill:
         if (done := self._repeat(client_order_id, symbol)) is not None:
@@ -484,7 +483,6 @@ class AlpacaBroker:
         placed = self._restore_quietly(symbol)
         fill = self._record_sale(day, "close", symbol, o, entry, done_fraction, reason=reason,
                                  client_order_id=client_order_id, stop_placed=placed)
-        self.account()
         return fill
 
     def raise_stop(self, day: str, symbol: str, stop_price: float) -> None:

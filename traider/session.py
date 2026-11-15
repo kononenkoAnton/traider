@@ -14,7 +14,7 @@
 
 `run_session` вызывается, когда тик уже создал запись `started`. Системный промпт берётся из
 замороженного конфига (`cfg.system_prompt`), лимиты из `cfg.limits`. Исход цикла задаёт статус:
-`finished`/`end_turn` это `ok`, `max_turns`/`budget` это `cap`, `refusal`/`error` это `failed`.
+`finished`/`end_turn` это `ok`, `max_turns`/`budget`/`deadline` (срок `cfg.limits.max_session_seconds`) это `cap`, `refusal`/`error` это `failed`.
 Функция не поднимает исключений из шагов вокруг цикла: сбой сборки контекста даёт `failed` со
 `stop="error"` без вызова модели, сбой снимка цен или ликвидации пишется в поле `errors` записи.
 После цикла при любом исходе сохраняется снимок годных цен всей вселенной. Номер сессии это
@@ -24,7 +24,9 @@
 `close`, `reject`. Текст ошибки самого цикла тоже идёт в `errors`. Параметр `analyst` (объект на одну
 сессию, модуль analyst): его сводка, запрошенная внутри защищённой части (сбой даёт заглушку и запись
 в `errors`), идёт в контекст, `analyst.research` попадает в `SessionContext`, основной агент не получает
-поиск (`max_searches=0`), а в запись пишется `analyst` (`cost`, `searches`, `briefing`, `usage`, `model`).
+поиск (`max_searches=0`, и контекст не обещает ему поисков: информация идёт через аналитика и `research`), а в
+запись пишется `analyst` (`cost`, `searches`, `briefing`, `usage`, `model`, `calls` по вызовам аналитика).
+Запись несёт ещё `fallback_used` (была ли подмена модели) и `snapshot_symbols` (сколько цен в снимке, 0 при сбое).
 Стоимость аналитика входит в `cost` сессии при любом исходе. Запись сессии пишется последней и без перехвата: если не удалось записать её саму,
 тик увидит зависшую `started`.
 """
@@ -41,8 +43,8 @@ from traider.nums import usable
 from traider.store import RunStore
 from traider.tools import SessionContext, build_tools
 
-STATUS = {"finished": "ok", "end_turn": "ok", "max_turns": "cap", "budget": "cap", "refusal": "failed",
-          "error": "failed"}
+STATUS = {"finished": "ok", "end_turn": "ok", "max_turns": "cap", "budget": "cap", "deadline": "cap",
+          "refusal": "failed", "error": "failed"}
 JOURNAL_ENTRIES = 10
 CLOSED_TRADES = 20
 CALIBRATION_DAYS = 90
@@ -75,7 +77,9 @@ def build_context(cfg: RunConfig, store: RunStore, broker: Broker, market: Marke
            f"Капитал: ${equity(acct, prices):.2f}. Деньги: ${acct.cash:.2f}.",
            f"HP: ${hp(acct, prices, lim):.2f} (пол капитала ${floor(acct, lim):.2f}, пик ${acct.peak_equity:.2f}).",
            f"Покупок осталось в этой сессии: {buys_left}. Потолки сессии: {lim.max_turns} ходов, "
-           f"{lim.max_searches} поисков, ${lim.max_session_usd:.2f}.", "",
+           + ("поиска в сети у вас нет: информация приходит через аналитика (сводка ниже и инструмент research), "
+              if briefing else f"{lim.max_searches} поисков, ")
+           + f"${lim.max_session_usd:.2f}.", "",
            "## Позиции"]
     for p in acct.positions:
         price = prices.get(p.symbol)
@@ -122,18 +126,22 @@ def run_session(cfg: RunConfig, store: RunStore, broker: Broker, market: Market,
     except Exception as e:
         errors.append(f"контекст: {type(e).__name__}: {e}")
         rec = {"stop": "error", "turns": 0, "cost": 0.0, "usage": asdict(Usage()), "model_used": cfg.model,
-               "transcript": []}
+               "fallback_used": False, "transcript": []}
     else:
         res = run_agent(client, model=cfg.model, system=cfg.system_prompt, user=user, tools=build_tools(ctx),
                         prices=cfg.token_prices, max_turns=cfg.limits.max_turns, max_usd=cfg.limits.max_session_usd,
-                        max_searches=0 if analyst else cfg.limits.max_searches)
+                        max_searches=0 if analyst else cfg.limits.max_searches,
+                        max_seconds=cfg.limits.max_session_seconds)
         if res.error:
             errors.append(f"цикл: {res.error}")
         rec = {"stop": res.stop, "turns": res.turns, "cost": res.cost, "usage": asdict(res.usage),
-               "model_used": res.model_used, "transcript": res.transcript}
+               "model_used": res.model_used, "fallback_used": res.fallback_used, "transcript": res.transcript}
+    rec["snapshot_symbols"] = 0
     try:
         quotes = market.last_prices(cfg.universe)
-        store.save_prices(day, {s: float(p) for s, p in quotes.items() if usable(p)})
+        snapshot = {s: float(p) for s, p in quotes.items() if usable(p)}
+        store.save_prices(day, snapshot)
+        rec["snapshot_symbols"] = len(snapshot)
     except Exception as e:
         errors.append(f"снимок цен: {type(e).__name__}: {e}")
     if len(store.sessions()) >= cfg.sessions_target:
@@ -148,6 +156,7 @@ def run_session(cfg: RunConfig, store: RunStore, broker: Broker, market: Market,
     rec |= {"finished_at": market.now().isoformat(), "buys": kinds.count("buy"), "sells": kinds.count("close"),
             "rejects": kinds.count("reject"), "journal": ctx.journal, "errors": errors,
             "analyst": analyst and {"cost": analyst.cost, "searches": analyst.searches, "briefing": briefing,
-                                    "usage": asdict(analyst.usage), "model": cfg.analyst_model}}
+                                    "usage": asdict(analyst.usage), "model": cfg.analyst_model,
+                                    "calls": analyst.calls}}
     store.finish_session(day, STATUS[rec["stop"]], rec)
     return store.session(day)

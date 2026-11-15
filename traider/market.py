@@ -19,7 +19,8 @@
 поднимает исключение, пустой ответ никогда не прячет сбой. Цены и свечи отдаются обычными
 `float`. Цена годна, только если сделка была сегодня по Нью-Йорку, иначе бумага без цены.
 Свечи для стопов берутся только из обычной сессии по календарю Alpaca (с учётом коротких
-дней), дневные свечи только завершённые: пока рынок открыт, сегодняшняя отбрасывается.
+дней), дневные свечи только завершённые: пока рынок открыт, сегодняшняя отбрасывается. Дневные свечи
+скорректированы на сплиты (`adjustment=Adjustment.SPLIT`), минутные для стопов нет.
 Преобразования без сети (свеча SDK в `Bar`, пары (минимум, открытие), день по
 Нью-Йорку) вынесены в чистые функции. Бесплатный счёт не видит свежих данных SIP, потому IEX.
 """
@@ -29,7 +30,7 @@ from datetime import date, datetime, timedelta
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical.news import NewsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import NewsRequest, StockBarsRequest, StockLatestTradeRequest
@@ -127,7 +128,8 @@ class AlpacaMarket:
         if not symbols:
             return {}
         req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=TimeFrame(1, TimeFrameUnit.Day),
-                               start=self.now() - timedelta(days=days * 2 + 10), feed=DataFeed.IEX)
+                               start=self.now() - timedelta(days=days * 2 + 10), feed=DataFeed.IEX,
+                               adjustment=Adjustment.SPLIT)
         today, market_open = ny_day(self.now()), self.is_open()
         return {s: completed_days([bar_from_sdk(b) for b in bars], today, market_open)[-days:]
                 for s, bars in self._data.get_stock_bars(req).data.items()}

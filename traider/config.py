@@ -50,6 +50,7 @@ class Limits:
     max_turns: int = 40
     max_searches: int = 8
     max_session_usd: float = 2.0
+    max_session_seconds: int = 1200
 
 
 @dataclass(frozen=True)
