@@ -144,6 +144,18 @@ def test_lock_is_removed_even_when_the_tick_crashes(world):
         tick(runs, market, boom, mc)
     assert not (runs / ".tick.lock").exists()
 
+def test_tick_log_write_failure_of_any_kind_does_not_stop_the_tick(world, monkeypatch):
+    runs, market, mb, mc, _ = world
+    real, first = RunStore.append_tick, []
+    def broken(self, rec):
+        first.append(self.dir) if not first else None
+        if self.dir == first[0]: raise TypeError("не сериализуется")
+        return real(self, rec)
+    monkeypatch.setattr(RunStore, "append_tick", broken)
+    got = tick(runs, market, mb, mc)
+    assert len(got) == 5 and [r["action"] for r in got].count("session") == 5
+    assert not (runs / ".tick.lock").exists()
+
 def test_finishing_run_with_a_position_is_liquidated_and_priced(world):
     runs, market, mb, mc, _ = world
     run = runs / "pilot-1" / "haiku"; cfg, _ = load_run(run); store = RunStore(run)

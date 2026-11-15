@@ -352,6 +352,13 @@ def test_get_bars_shows_the_current_price_or_says_there_is_none(ctx):
     assert "AAPL сейчас: 201.37" in out and "MSFT сейчас: сегодня сделок ещё не было" in out
     assert "2026-12-01:" not in out and "2026-11-30:" in out              # свечи по вчерашний день
 
+def test_get_bars_still_returns_bars_when_current_prices_fail(ctx, monkeypatch):
+    def boom(symbols): raise RuntimeError("сеть")
+    monkeypatch.setattr(ctx.market, "last_prices", boom)
+    out = call(ctx, "get_bars", symbols=["AAPL", "MSFT"], days=3)
+    assert "2026-11-30:" in out
+    assert "AAPL сейчас: текущая цена недоступна" in out and "MSFT сейчас: текущая цена недоступна" in out
+
 def test_scan_header_names_the_last_completed_day(ctx):
     assert "2026-11-30 включительно" in call(ctx, "scan_universe").splitlines()[0]
 

@@ -21,7 +21,7 @@ reject (покупки и закрытия) за день. Ответы это �
 300 слов; `finish_session` завершающий. `research` есть только при `ctx.research`, тогда нет
 `get_news`. Текст новостей передаётся как есть: это данные. Дневные свечи (`scan_universe`, `get_bars`)
 заканчиваются последним завершённым днём, его называет заголовок `scan_universe`; `get_bars` добавляет по
-каждой бумаге строку с текущей ценой из `market.last_prices` или пометку, что сегодня сделок не было. `news_tool` общий для основного
+каждой бумаге строку с текущей ценой из `market.last_prices` или пометку, что сегодня сделок не было; если запрос цен упал, свечи всё равно отдаются, а цена помечается недоступной. `news_tool` общий для основного
 агента и аналитика.
 """
 from collections.abc import Callable
@@ -159,7 +159,10 @@ def build_tools(ctx: SessionContext) -> list[Tool]:
     def get_bars(a: dict) -> str:
         days = a.get("days", 20)
         data = market.daily_bars(a["symbols"], days)
-        now = market.last_prices(a["symbols"])
+        try:
+            now = market.last_prices(a["symbols"])
+        except Exception:
+            now = None   # свечи важнее текущей цены: отдаём их и помечаем цену недоступной
         lines = []
         for s in a["symbols"]:
             bars = data.get(s)
@@ -168,8 +171,9 @@ def build_tools(ctx: SessionContext) -> list[Tool]:
             else:
                 lines.append(f"{s} (день: открытие, максимум, минимум, закрытие, объём)")
                 lines += [f"{b.day}: {b.open:.2f} {b.high:.2f} {b.low:.2f} {b.close:.2f} {b.volume:.0f}" for b in bars]
-            price = now.get(s)
-            lines.append(f"{s} сейчас: {price:.2f} (последняя сделка сегодня)" if usable(price)
+            price = None if now is None else now.get(s)
+            lines.append(f"{s} сейчас: текущая цена недоступна" if now is None
+                         else f"{s} сейчас: {price:.2f} (последняя сделка сегодня)" if usable(price)
                          else f"{s} сейчас: сегодня сделок ещё не было, текущей цены нет")
         return "\n".join(lines)
 

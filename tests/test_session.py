@@ -17,6 +17,11 @@ def test_system_prompt_states_the_rules():
     assert "умр" not in text.lower() and "die" not in text.lower()
 
 
+def test_system_prompt_says_the_analyst_participant_has_no_search():
+    text = pathlib.Path("traider/prompts/system.md").read_text()
+    assert "8 поисков в сети (у участника, работающего через аналитика, своего поиска в сети нет)" in text
+
+
 def test_context_carries_state_memory_and_obligations(senv):
     cfg, store, market, broker = senv
     store.update_state(notes="не гнаться за новостями")

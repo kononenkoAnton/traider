@@ -29,8 +29,7 @@
 Любое исключение по одному прогону даёт `error` с текстом и не мешает остальным. Каждый элемент
 результата несёт `experiment`, `participant`, `action`, `ts` (время рынка) и, если проверка HP прошла,
 `equity`, `floor`, `hp`, `stops_placed`, `stop_fills`, `unpriced`; тот же набор (с `day`, `error`, а у сессии
-`status` и `cost`) пишется строкой в `ticks.jsonl` прогона через `RunStore.append_tick`, для ошибок тоже, если
-каталог прогона пишется. Клиенты
+`status` и `cost`) пишется строкой в `ticks.jsonl` прогона через `RunStore.append_tick`, для ошибок тоже. Сбой записи этой строки (любое исключение) тик не останавливает и результата не меняет. Клиенты
 создаются до записи `started`, чтобы сбой создания не оставил зависшую запись; когда
 сессии нет, `make_client` не вызывается.
 """
@@ -192,7 +191,10 @@ def tick(runs_dir: Path, market: Market, make_broker: Callable[[RunConfig, RunSt
             except Exception as e:
                 r = {"participant": run.name, "action": "error", "error": f"{type(e).__name__}: {e}"}
             out.append({"experiment": run.parent.name, **r, "ts": market.now().isoformat()})
-            _log_tick(run, out[-1])
+            try:
+                _log_tick(run, out[-1])
+            except Exception:
+                pass   # строка лога не должна остановить тик ни для этого прогона, ни для остальных
         return out
     finally:
         if _owned(lock, token):
@@ -208,10 +210,7 @@ def _log_tick(run: Path, r: dict) -> None:
            **{k: r.get(k) for k in TICK_FIELDS}}
     if r["action"] == "session":
         rec |= {"status": r["status"], "cost": r["cost"]}
-    try:
-        RunStore(run).append_tick(rec)
-    except OSError:
-        pass   # каталог прогона не пишется: результат тика всё равно вернётся и напечатается
+    RunStore(run).append_tick(rec)
 
 
 def _shared_alpaca(runs_dir: Path) -> dict[Path, str]:
