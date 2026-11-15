@@ -355,13 +355,79 @@ def test_money_block_from_session_costs_and_the_month_calendar(moving):
     per_day = 0.0008 + 0.016 + 0.032 + 0.032 + 0.0328   # haiku, sonnet, opus-a, opus-b, opus-analyst за сессию
     assert m["month"] == "2026-12"
     assert m["month_spend_usd"] == pytest.approx(4 * per_day) and m["run_spend_usd"] == pytest.approx(4 * per_day)
-    assert m["month_forecast_usd"] == pytest.approx(per_day * 23)   # будни декабря 2026: 4 + 5 + 5 + 5 + 4
+    # будни декабря 2026: 23, после 04.12 осталось 19; до цели 10 сессий осталось 6: ждём 6 дней сессий
+    assert m["month_forecast_usd"] == pytest.approx(4 * per_day + per_day * 6)
+    assert m["sessions_without_cost"] == 0 and m["month_sessions_without_cost"] == 0
 
 
 def test_money_block_of_a_run_that_has_not_started(tmp_path, example):
     exp = start_experiment(example, tmp_path / "runs")
     m = build_report(exp, FakeMarket.with_history(list(load_run(exp / "haiku")[0].universe), days=70))["money"]
-    assert m == {"month": None, "month_spend_usd": None, "run_spend_usd": 0.0, "month_forecast_usd": None}
+    assert m == {"month": None, "month_spend_usd": None, "run_spend_usd": 0.0, "month_forecast_usd": None,
+                 "sessions_without_cost": 0, "month_sessions_without_cost": 0}
+
+
+def _money_of(*runs, target=40, done=None):
+    """Блок денег по записям сессий: run это список (день, статус, стоимость или None)."""
+    from traider.report import _money
+    ps = [{"records": [{"day": d, "status": st, **({"cost": c} if c is not None else {})} for d, st, c in run]}
+          for run in runs]
+    done = done if done is not None else max(len(r) for r in runs)
+    return _money(ps, FakeMarket.with_history([], days=1), target, done)
+
+
+def test_money_forecast_of_a_run_started_at_the_end_of_the_month():
+    m = _money_of([("2026-12-30", "ok", 1.0)])
+    # потрачено $1; после 30.12 в декабре один торговый день (31.12), до цели 39 сессий: 1 + 1 × 1 = 2
+    assert m["month_spend_usd"] == 1.0 and m["month_forecast_usd"] == pytest.approx(2.0)
+
+
+def test_money_forecast_in_the_middle_of_a_month():
+    m = _money_of([("2026-12-01", "ok", 1.0), ("2026-12-02", "ok", 2.0), ("2026-12-03", "ok", 3.0), ("2026-12-04", "ok", 2.0)])
+    # потрачено 8 за 4 дня, в среднем 2; будней после 04.12 в декабре 23 - 4 = 19, до цели 36: 8 + 2 × 19 = 46
+    assert m["month_spend_usd"] == 8.0 and m["month_forecast_usd"] == pytest.approx(46.0)
+
+
+def test_money_forecast_of_a_run_that_reached_its_target():
+    m = _money_of([("2026-12-01", "ok", 1.0), ("2026-12-02", "ok", 2.0), ("2026-12-03", "ok", 3.0), ("2026-12-04", "ok", 2.0)],
+                  target=4)
+    assert m["month_forecast_usd"] == pytest.approx(m["month_spend_usd"]) == pytest.approx(8.0)
+
+
+def test_money_mean_and_counts_skip_unrecorded_costs_but_not_missed_days():
+    a = [("2026-12-01", "ok", 1.0), ("2026-12-02", "failed", None), ("2026-12-03", "missed", None)]
+    b = [("2026-12-01", "failed", None), ("2026-12-02", "started", None), ("2026-12-03", "ok", 2.0)]
+    m = _money_of(a, b)
+    # записано: 01.12 $1 и 03.12 $0 + $2; 02.12 без единой стоимости в среднее не идёт: (1 + 2) / 2 = 1.5
+    # без стоимости три сессии (b 01.12, a 02.12, b 02.12), пропуск a 03.12 стоит 0 и записан
+    # будней после 03.12: 20, до цели 37: 3 + 1.5 × 20 = 33
+    assert m["month_spend_usd"] == 3.0 and m["sessions_without_cost"] == 3 and m["month_sessions_without_cost"] == 3
+    assert m["month_forecast_usd"] == pytest.approx(33.0)
+
+
+def test_money_of_a_month_where_no_session_cost_is_recorded():
+    m = _money_of([("2026-11-30", "failed", None), ("2026-12-01", "failed", None), ("2026-12-02", "failed", None)])
+    assert m["month"] == "2026-12" and m["month_spend_usd"] is None and m["month_forecast_usd"] is None
+    assert m["sessions_without_cost"] == 3 and m["month_sessions_without_cost"] == 2 and m["run_spend_usd"] == 0.0
+
+
+def test_missed_days_do_not_count_as_sessions_without_cost():
+    m = _money_of([("2026-12-01", "missed", None), ("2026-12-02", "ok", 1.0)])
+    assert m["sessions_without_cost"] == 0 and m["month_sessions_without_cost"] == 0 and m["month_spend_usd"] == 1.0
+
+
+def test_participants_carry_their_first_day_and_offset(moving):
+    exp, market = moving
+    (exp / "haiku" / "sessions" / "2026-12-01.json").unlink()             # haiku начинает со второго дня
+    ps = {p["id"]: p for p in build_report(exp, market)["participants"]}
+    assert (ps["haiku"]["first_day"], ps["haiku"]["day_offset"]) == ("2026-12-02", 1)
+    assert all((p["first_day"], p["day_offset"]) == ("2026-12-01", 0) for pid, p in ps.items() if pid != "haiku")
+
+
+def test_participants_of_a_run_that_has_not_started_have_no_first_day(tmp_path, example):
+    fresh = start_experiment(example, tmp_path / "fresh")
+    r = build_report(fresh, FakeMarket.with_history(list(load_run(fresh / "haiku")[0].universe), days=70))
+    assert all(p["first_day"] is None and p["day_offset"] is None for p in r["participants"])
 
 
 def test_death_incident_does_not_repeat_its_title(played_with_death):

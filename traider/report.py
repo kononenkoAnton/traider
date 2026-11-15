@@ -25,8 +25,10 @@
 Прогнозы: `brier`, `reference`, `ci` по панели, `brier_picks` по прогнозам купленных в тот же день бумаг;
 нет созревших, значит None. `brier_series` по дням отчёта: те же Брайер и эталон по созревшим прогнозам
 панели, данным до дня включительно (последняя точка равна сводке); вне дней участника и без таких прогнозов None.
-`money`: месяц последнего дня сессии, траты всех участников в нём и за прогон, прогноз на месяц (средний расход
-дня сессии на число торговых дней месяца по `trading_days`). Закрытая сделка это каждое событие продажи (`agent`, `stop`, `liquidation`);
+`money`: месяц последнего дня сессии, записанные траты всех участников в нём (None, если в месяце ни одной записанной
+стоимости) и за прогон, число сессий без записанной стоимости, прогноз на месяц (траты месяца плюс средний расход дня
+сессии на оставшиеся торговые дни месяца, не больше сессий до цели). У участника `first_day` и `day_offset`: его
+первый день сессии и номер этого дня в `days`, без сессий None. Закрытая сделка это каждое событие продажи (`agent`, `stop`, `liquidation`);
 без годных входа или выхода у неё `pnl` None. Диалог сессии в отчёте есть только у 10 последних дней
 сессий эксперимента, каждая строка режется до 2000 знаков с пометкой. Порядок правил `verdict`: гибель или
 нарушение целостности, нехватка данных (в том числе нет места или интервала), красный, зелёный, жёлтый;
@@ -204,18 +206,32 @@ def _brier_series(p: dict, days: Sequence[str]) -> list:
     return out
 
 
-def _money(ps: list[dict], market: Market) -> dict:
-    """Расход всех участников: месяц последнего дня сессии, траты в нём, за прогон и прогноз на месяц."""
-    costs = [(r["day"], c) for p in ps for r in p["records"] for c in [_session_cost(r)] if c is not None]
-    run = float(sum(c for _, c in costs))
-    sdays = sorted({r["day"] for p in ps for r in p["records"]})
+def _money(ps: list[dict], market: Market, target: int | None, done: int) -> dict:
+    """Расход всех участников: месяц последнего дня сессии, записанные траты в нём и за прогон, сессии без записанной
+    стоимости (пропуск стоит 0 и записан) и прогноз на месяц: траты месяца плюс средний расход дня сессии (по дням,
+    где записана хоть одна стоимость) на дни сессий, которые ещё ждут в этом месяце (торговые дни после последнего
+    дня сессии, но не больше сессий до цели)."""
+    recs = [(r["day"], _session_cost(r)) for p in ps for r in p["records"]]
+    spent = [(d, c) for d, c in recs if c is not None]
+    sdays = sorted({d for d, _ in recs})
+    out = {"month": None, "month_spend_usd": None, "run_spend_usd": float(sum(c for _, c in spent)),
+           "month_forecast_usd": None, "sessions_without_cost": sum(c is None for _, c in recs), "month_sessions_without_cost": 0}
     if not sdays:
-        return {"month": None, "month_spend_usd": None, "run_spend_usd": run, "month_forecast_usd": None}
-    month = sdays[-1][:7]
-    y, mo = int(month[:4]), int(month[5:])
-    tdays = market.trading_days(f"{month}-01", f"{month}-{calendar.monthrange(y, mo)[1]:02d}")
-    return {"month": month, "month_spend_usd": float(sum(c for d, c in costs if d.startswith(month))),
-            "run_spend_usd": run, "month_forecast_usd": run / len(sdays) * len(tdays)}
+        return out
+    month = out["month"] = sdays[-1][:7]
+    in_month = [c for d, c in recs if d.startswith(month)]
+    out["month_sessions_without_cost"] = sum(c is None for c in in_month)
+    if any(c is not None for c in in_month):
+        out["month_spend_usd"] = float(sum(c for c in in_month if c is not None))
+    by_day: dict[str, float] = {}
+    for d, c in spent:
+        by_day[d] = by_day.get(d, 0.0) + c
+    if by_day:
+        y, mo = int(month[:4]), int(month[5:])
+        after = [d for d in market.trading_days(f"{month}-01", f"{month}-{calendar.monthrange(y, mo)[1]:02d}") if d > sdays[-1]]
+        left = len(after) if target is None else min(len(after), max(0, target - done))
+        out["month_forecast_usd"] = (out["month_spend_usd"] or 0.0) + sum(by_day.values()) / len(by_day) * left
+    return out
 
 
 def _summary(p: dict) -> dict:
@@ -422,8 +438,9 @@ def build_report(exp_dir: Path, market: Market, broker_order_ids: Mapping[str, I
                  "sessions_done": max((p["done"] for p in ps), default=0), "credits_month_usd": CREDITS_MONTH_USD},
         "days": days,
         "participants": [{"id": p["id"], "model": p["cfg"].model, "research": p["cfg"].research,
-                          "broker": p["cfg"].broker, "status": p["state"]["status"], "verdict": verdicts[p["id"]]}
-                         for p in ps],
+                          "broker": p["cfg"].broker, "status": p["state"]["status"], "verdict": verdicts[p["id"]],
+                          "first_day": first_day, "day_offset": days.index(first_day) if first_day in days else None}
+                         for p in ps for first_day in [min((r["day"] for r in p["records"]), default=None)]],
         "equity": {p["id"]: p["equity"] for p in ps},
         "account_equity": {p["id"]: p["account_equity"] for p in ps},
         "spy": [first.start_equity, *replay.spy_buy_hold(bars, days, first.start_equity)]
@@ -431,7 +448,7 @@ def build_report(exp_dir: Path, market: Market, broker_order_ids: Mapping[str, I
         "spy_same_exposure": {p["id"]: p["same"] for p in ps},
         "band": {p["id"]: p["band"] for p in ps},
         "brier_series": {p["id"]: _brier_series(p, days) for p in ps},
-        "money": _money(ps, market),
+        "money": _money(ps, market, first and first.sessions_target, max((p["done"] for p in ps), default=0)),
         "summary": summary, "costs": costs, "tokens": tokens, "sessions": sessions,
         "positions": {s: positions[s] for s in sorted(positions)}, "cash": cash, "trades": trades,
         "calibration": {p["id"]: forecasts.calibration(p["scored"]) for p in ps},

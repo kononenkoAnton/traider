@@ -655,13 +655,17 @@
  },
  "money": {
   "month": "2026-12",
-  "month_forecast_usd": 2.6128,
+  "month_forecast_usd": 1.1360000000000001,
+  "month_sessions_without_cost": 0,
   "month_spend_usd": 0.4544,
-  "run_spend_usd": 0.4544
+  "run_spend_usd": 0.4544,
+  "sessions_without_cost": 0
  },
  "participants": [
   {
    "broker": "sim",
+   "day_offset": 0,
+   "first_day": "2026-12-01",
    "id": "haiku",
    "model": "claude-haiku-5-5",
    "research": "self",
@@ -670,6 +674,8 @@
   },
   {
    "broker": "sim",
+   "day_offset": 0,
+   "first_day": "2026-12-01",
    "id": "sonnet",
    "model": "claude-sonnet-5-5",
    "research": "self",
@@ -678,6 +684,8 @@
   },
   {
    "broker": "alpaca",
+   "day_offset": 0,
+   "first_day": "2026-12-01",
    "id": "opus-a",
    "model": "claude-opus-5-5",
    "research": "self",
@@ -686,6 +694,8 @@
   },
   {
    "broker": "sim",
+   "day_offset": 0,
+   "first_day": "2026-12-01",
    "id": "opus-b",
    "model": "claude-opus-5-5",
    "research": "self",
@@ -694,6 +704,8 @@
   },
   {
    "broker": "sim",
+   "day_offset": 0,
+   "first_day": "2026-12-01",
    "id": "opus-analyst",
    "model": "claude-opus-5-5",
    "research": "analyst",
