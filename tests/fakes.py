@@ -214,9 +214,11 @@ class FakeAlpacaApi:
             raise BrokerRejected("заявку уже нельзя отменить")
         o["status"] = "canceled"
 
-    def filled_stop_sells_since(self, since):
+    def filled_orders_since(self, since):
+        # исполненные заявки любого вида, и отменённые с частичным исполнением; висящие ещё идут, их не трогаем
         return [self.order(o["id"]) for o in self.orders.values()
-                if o["type"] == "stop" and o["status"] == "filled" and (since is None or o["filled_at"] >= since)]
+                if o["filled_qty"] > 0 and o["status"] in ("filled", "canceled")
+                and (since is None or o["filled_at"] >= since)]
 
     def order_ids_since(self, since):
         return [o["id"] for o in self.orders.values() if since is None or o["submitted_at"] >= since]

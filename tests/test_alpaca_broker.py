@@ -369,3 +369,177 @@ def test_crash_after_sale_before_ledger_event_then_repeat(env):
     assert last["kind"] == "close" and last["entry_price"] == pytest.approx(200.0)
     assert api.open_stop_orders() == {} and "AAPL" not in store.state()["stops"]
     assert api.submitted == 3
+
+
+# --- намерение раньше действия ---
+
+def test_desired_stop_is_on_record_before_the_order_is_sent(env):
+    b = broker(env); api, store = env[3], env[1]
+    seen = {}
+    real = api.submit_market_buy
+
+    def spy(*a):
+        seen["stops"] = store.state()["stops"]
+        return real(*a)
+
+    api.submit_market_buy = spy
+    b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    assert seen["stops"] == {"AAPL": 186.0}
+
+
+def test_process_dies_after_the_fill_and_the_tick_places_the_stop(env):
+    b = broker(env); api, store = env[3], env[1]
+
+    def die(oid):
+        raise KeyboardInterrupt
+
+    b._finish = die                                                  # умер после исполнения, buy больше не зовут
+    with pytest.raises(KeyboardInterrupt):
+        b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    assert store.state()["stops"] == {"AAPL": 186.0} and api.open_stop_orders() == {}
+    assert broker(env).ensure_stops() == ["AAPL"]
+    assert api.open_stop_orders()["AAPL"]["stop_price"] == 186.0
+
+
+def test_failed_buy_keeps_the_stop_of_an_existing_position(env):
+    b = broker(env); api, store = env[3], env[1]
+    b.buy("2026-12-01", "AAPL", 100.0, 186.0, "тезис", "x/1")
+    api.next_order_mode = "reject"
+    with pytest.raises(BrokerRejected):
+        b.buy("2026-12-01", "AAPL", 100.0, 190.0, "тезис", "x/2")
+    assert store.state()["stops"] == {"AAPL": 186.0}
+
+
+# --- позиция без желаемого стопа ---
+
+def test_ensure_stops_gives_an_unknown_position_a_default_stop(env):
+    b = broker(env); api, store = env[3], env[1]
+    api.positions["XLE"] = [2.0, 90.0]                               # куплено руками
+    assert b.ensure_stops() == ["XLE"]
+    want = round(90.0 * (1 - env[0].limits.stop_max), 2)
+    assert store.state()["stops"] == {"XLE": want} and api.open_stop_orders()["XLE"]["stop_price"] == want
+    (e,) = store.orders()
+    assert (e["kind"], e["reason"], e["stop_price"], e["symbol"]) == ("raise_stop", "default_stop", want, "XLE")
+    assert b.ensure_stops() == [] and len(store.orders()) == 1       # второй раз ничего не пишет
+
+
+def test_default_stop_above_the_quote_means_the_position_is_sold(env):
+    b = broker(env); api, store = env[3], env[1]
+    api.positions["XLE"] = [2.0, 120.0]                              # котировка 100 ниже 120 * 0.85 = 102
+    assert b.ensure_stops() == [] and api.positions == {}
+    assert [e["reason"] for e in store.orders()] == ["default_stop", "gap_below_stop"]
+
+
+# --- гэп через стоп ---
+
+def test_quote_at_or_below_the_stop_sells_at_market_instead_of_placing_a_stop(env):
+    b = broker(env); api, store, market = env[3], env[1], env[2]
+    b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    api.expire_day_orders()
+    market.prices["AAPL"] = 180.0
+    assert b.ensure_stops() == []
+    assert api.positions == {} and api.open_stop_orders() == {} and "AAPL" not in store.state()["stops"]
+    fills = [e for e in store.orders() if e["kind"] == "stop_fill"]
+    assert len(fills) == 1
+    e = fills[0]
+    assert (e["reason"], e["price"], e["stop_price"], e["symbol"]) == ("gap_below_stop", 180.0, 186.0, "AAPL")
+    assert e["qty"] == pytest.approx(0.75) and e["entry_price"] == pytest.approx(200.0) and e["broker_order_id"]
+    assert b.ensure_stops() == [] and len(store.orders()) == 2
+
+
+def test_live_stop_is_left_alone_even_if_the_quote_is_below_it(env):
+    b = broker(env); api, market = env[3], env[2]
+    b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    market.prices["AAPL"] = 180.0                                    # стоп у брокера стоит и сработает сам
+    assert b.ensure_stops() == [] and "AAPL" in api.positions and "AAPL" in api.open_stop_orders()
+
+
+def test_refused_stop_with_the_quote_above_it_raises_with_the_brokers_message(env):
+    b = broker(env); api = env[3]
+    b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    api.expire_day_orders()
+    api.fail_stop_for = "AAPL"
+    with pytest.raises(BrokerRejected, match="стоп отклонён"):
+        b.ensure_stops()
+    assert "AAPL" in api.positions
+
+
+def test_without_a_quote_the_stop_is_placed_as_before(env):
+    b = broker(env); api, market = env[3], env[2]
+    b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    api.expire_day_orders()
+    del market.prices["AAPL"]
+    assert b.ensure_stops() == ["AAPL"] and "AAPL" in api.positions
+
+
+# --- сверка с брокером ---
+
+def test_sync_recovers_a_liquidation_whose_event_was_never_written(env):
+    b = broker(env); api, store = env[3], env[1]
+    fill = b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    api.cancel(api.open_stop_orders()["AAPL"]["id"])
+    api.submit_market_sell("AAPL", fill.qty, "liquidate/2026-12-01/AAPL")   # продажа ушла, события нет
+    (e,) = b.sync("2026-12-01")
+    assert (e["kind"], e["recovered"], e["symbol"]) == ("liquidate", True, "AAPL")
+    assert e["qty"] == pytest.approx(fill.qty) and e["entry_price"] == pytest.approx(200.0) and e["broker_order_id"]
+    assert b.sync("2026-12-01") == [] and [x["kind"] for x in store.orders()] == ["buy", "liquidate"]
+    assert "AAPL" not in store.state()["stops"]
+
+
+def test_sync_recovers_a_plain_sale_as_close_and_a_gap_sale_as_stop_fill(env):
+    b = broker(env); api, store = env[3], env[1]
+    b.buy("2026-12-01", "AAPL", 100.0, 186.0, "тезис", "x/1")
+    b.buy("2026-12-01", "XLE", 100.0, 90.0, "тезис", "x/2")
+    for o in list(api.open_stop_orders().values()):
+        api.cancel(o["id"])
+    api.submit_market_sell("AAPL", 0.5, "x/3")
+    api.submit_market_sell("XLE", 1.0, "gap/2026-12-01/XLE")
+    events = {e["symbol"]: e for e in b.sync("2026-12-01")}
+    assert (events["AAPL"]["kind"], events["AAPL"]["recovered"]) == ("close", True)
+    assert (events["XLE"]["kind"], events["XLE"]["reason"], events["XLE"]["recovered"]) == ("stop_fill", "gap_below_stop", True)
+    assert store.state()["stops"] == {}
+
+
+def test_sync_recovers_a_filled_buy_and_a_later_repeat_sends_nothing(env):
+    b = broker(env); api, store = env[3], env[1]
+    store.update_state(stops={"AAPL": 186.0})                        # намерение записано до заявки
+    api.submit_market_buy("AAPL", 150.0, "x/1")                      # исполнилась, события нет
+    (e,) = b.sync("2026-12-01")
+    assert (e["kind"], e["recovered"], e["stop_price"], e["thesis"]) == ("buy", True, 186.0, None)
+    assert e["client_order_id"] == "x/1" and e["qty"] == pytest.approx(0.75) and e["notional"] == pytest.approx(150.0)
+    assert b.sync("2026-12-01") == []
+    again = b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
+    assert again.qty == pytest.approx(0.75) and api.submitted == 1 and len(store.orders()) == 1
+
+
+def test_sync_recovers_the_filled_part_of_a_cancelled_order(env):
+    b = broker(env); api = env[3]
+    api.next_fill_fraction = 0.4
+    oid = api.submit_market_buy("AAPL", 150.0, "x/1")
+    api.cancel(oid)
+    (e,) = b.sync("2026-12-01")
+    assert e["kind"] == "buy" and e["qty"] == pytest.approx(0.3)
+
+
+def test_sync_ignores_orders_still_in_flight(env):
+    b = broker(env); api = env[3]
+    api.next_fill_fraction = 0.4
+    api.submit_market_buy("AAPL", 150.0, "x/1")                      # partially_filled, ещё идёт
+    assert b.sync("2026-12-01") == []
+
+
+# --- видимость покупки без стопа ---
+
+def test_events_say_whether_the_stop_was_placed(env):
+    b = broker(env); api, store = env[3], env[1]
+    b.buy("2026-12-01", "AAPL", 100.0, 186.0, "тезис", "x/1")
+    assert store.orders()[-1]["stop_placed"] is True
+    api.fail_stop_for = "AAPL"
+    b.buy("2026-12-01", "AAPL", 100.0, 188.0, "тезис", "x/2")
+    assert store.orders()[-1]["stop_placed"] is False
+    b.close("2026-12-01", "AAPL", 0.5, "причина", "x/3")
+    assert store.orders()[-1]["stop_placed"] is False
+    api.fail_stop_for = None
+    assert b.ensure_stops() == ["AAPL"]
+    b.close("2026-12-01", "AAPL", 0.5, "причина", "x/4")
+    assert store.orders()[-1]["stop_placed"] is True

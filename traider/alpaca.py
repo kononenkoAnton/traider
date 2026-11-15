@@ -28,7 +28,7 @@ from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, StopOr
 from traider.brokers import BrokerRejected, NoPrice
 from traider.cage import Account, Position
 from traider.config import RunConfig
-from traider.market import Market
+from traider.market import Market, ny_day
 from traider.nums import usable
 from traider.sim import Fill, mark_peak
 from traider.store import RunStore
@@ -47,6 +47,10 @@ def _tick(price: float) -> float:
 
 def _same(a: float, b: float) -> bool:
     return abs(a - b) <= 1e-7 * max(1.0, abs(b))
+
+
+def _stop_ok(cur: dict | None, qty: float, want: float) -> bool:
+    return cur is not None and _same(cur["qty"], qty) and _same(cur["stop_price"], want)
 
 
 def _floor9(qty: float) -> float:
@@ -79,7 +83,7 @@ class AlpacaApi(Protocol):
     def order_by_client_id(self, client_order_id: str) -> dict | None: ...
     def open_stop_orders(self) -> dict[str, dict]: ...   # тикер -> {"id", "qty", "stop_price"}
     def cancel(self, order_id: str) -> None: ...
-    def filled_stop_sells_since(self, since: datetime | None) -> list[dict]: ...   # как `order()`; отбор по времени исполнения
+    def filled_orders_since(self, since: datetime | None) -> list[dict]: ...   # как `order()`, любые заявки с исполнением, уже не идущие; отбор по времени исполнения
     def order_ids_since(self, since: datetime | None) -> list[str]: ...   # все заявки счёта, отбор по времени подачи
 
 
@@ -151,12 +155,19 @@ class AlpacaSdkApi:
     def cancel(self, order_id):
         self._trading.cancel_order_by_id(order_id)
 
-    def filled_stop_sells_since(self, since):
-        # `after` у Alpaca это время подачи, а DAY-стоп мог быть подан до выходных: берём с запасом, отбираем по исполнению
+    def filled_orders_since(self, since):
+        # `after` у Alpaca это время подачи, а DAY-стоп мог быть подан до выходных: берём с запасом, отбираем по исполнению;
+        # отменённая заявка с частичным исполнением тоже сделка, её время это последнее обновление
         after = None if since is None else since - timedelta(days=4)
-        return [_order_dict(o) for o in self._orders(QueryOrderStatus.CLOSED, after, OrderSide.SELL)
-                if _enum(o.type) == "stop" and _enum(o.status) == "filled"
-                and (since is None or o.filled_at >= since)]
+        out = []
+        for o in self._orders(QueryOrderStatus.CLOSED, after):
+            if not (_num(o.filled_qty) or 0.0) > 0:
+                continue
+            d = _order_dict(o)
+            d["filled_at"] = o.filled_at or o.updated_at
+            if since is None or d["filled_at"] >= since:
+                out.append(d)
+        return out
 
     def order_ids_since(self, since):
         return [str(o.id) for o in self._orders(QueryOrderStatus.ALL, since)]
@@ -285,7 +296,7 @@ class AlpacaBroker:
         want = self.store.state()["stops"].get(symbol)
         cur = (self.api.open_stop_orders() if open_stops is None else open_stops).get(symbol)
         need = want is not None and held_qty > 0
-        if cur is not None and need and _same(cur["qty"], held_qty) and _same(cur["stop_price"], want):
+        if need and _stop_ok(cur, held_qty, want):
             return False
         if cur is not None:
             self._cancel(cur["id"])
@@ -302,12 +313,19 @@ class AlpacaBroker:
             self.store.update_state(stops={k: v for k, v in stops.items() if k != symbol})
         self._sync_stop(symbol, qty)
 
-    def _restore_quietly(self, symbol: str, at_least: float = 0.0) -> None:
-        """Сделка уже записана; не вышло поставить стоп, его восстановит ensure_stops на ближайшем тике."""
+    def _restore_quietly(self, symbol: str, at_least: float = 0.0) -> bool:
+        """Не вышло поставить стоп: сделку это не отменяет, её записывают с `stop_placed: false`, а стоп
+        восстановит ensure_stops на ближайшем тике."""
         try:
             self._restore_stop(symbol, at_least)
+            return True
         except Exception:
             log.exception("стоп по %s не восстановлен, это сделает ensure_stops", symbol)
+            return False
+
+    def _set_stop(self, symbol: str, price: float | None) -> None:
+        stops = {k: v for k, v in self.store.state()["stops"].items() if k != symbol}
+        self.store.update_state(stops=stops if price is None else {**stops, symbol: price})
 
     def _restore_after_failure(self, symbol: str, error: BaseException) -> None:
         try:
@@ -333,13 +351,27 @@ class AlpacaBroker:
             self._price(symbol)   # без нашей котировки не покупаем; цену исполнения даёт брокер
             if notional > self.api.cash_and_positions()[0] + 1e-9:
                 raise ValueError(f"сумма {notional} больше свободных денег")
-            oid = self._submit(client_order_id, lambda: self.api.submit_market_buy(symbol, notional, client_order_id))
-        o = self._finish(oid)
         stop = _tick(stop_price)
-        self.store.update_state(stops={**self.store.state()["stops"], symbol: stop})   # желаемый стоп раньше самого стопа
-        self._restore_quietly(symbol, at_least=o["filled_qty"])
+        before = self.store.state()["stops"].get(symbol)
+        self._set_stop(symbol, stop)   # намерение раньше действия: позиции без желаемого стопа не бывает
+        try:
+            if oid is None:
+                oid = self._submit(client_order_id,
+                                   lambda: self.api.submit_market_buy(symbol, notional, client_order_id))
+        except Exception:
+            self._set_stop(symbol, before)   # заявки у брокера нет
+            raise
+        try:
+            o = self._finish(oid)
+        except BrokerRejected:
+            last = self.api.order(oid)
+            if last["status"] in TERMINAL and not last["filled_qty"]:   # ничего не куплено: намерение снимаем
+                self._set_stop(symbol, before)
+            raise
+        placed = self._restore_quietly(symbol, at_least=o["filled_qty"])
         self._log(day, "buy", symbol, o["filled_qty"], o["filled_avg_price"], notional=o["filled_qty"] * o["filled_avg_price"],
-                  stop_price=stop, thesis=thesis, client_order_id=client_order_id, broker_order_id=oid)
+                  stop_price=stop, thesis=thesis, client_order_id=client_order_id, broker_order_id=oid,
+                  stop_placed=placed)
         self.account()
         return Fill(symbol, o["filled_qty"], o["filled_avg_price"], "buy")
 
@@ -367,9 +399,9 @@ class AlpacaBroker:
             self._restore_after_failure(symbol, e)   # стоп снят, а продажи не вышло: вернуть до того, как ошибка уйдёт
             raise
         done_fraction = fraction if o["status"] == "filled" or not usable(o["qty"]) else fraction * o["filled_qty"] / o["qty"]
+        placed = self._restore_quietly(symbol)
         fill = self._record_sale(day, "close", symbol, o, entry, done_fraction, reason=reason,
-                                 client_order_id=client_order_id)
-        self._restore_quietly(symbol)
+                                 client_order_id=client_order_id, stop_placed=placed)
         self.account()
         return fill
 
@@ -385,15 +417,41 @@ class AlpacaBroker:
         self._log(day, "raise_stop", symbol, None, quote if usable(quote) else None, stop_price=stop)
         self._restore_stop(symbol)   # не вышло: желаемый стоп записан, ensure_stops дожмёт
 
+    def _sell_all(self, day: str, symbol: str, qty: float, entry: float | None, cid_base: str, reason: str,
+                  stop: dict | None) -> None:
+        """Продаёт позицию целиком по рынку (стоп бумаги снимается) и пишет `stop_fill`: стоп в сущности сработал."""
+        if stop is not None:
+            self._cancel(stop["id"])
+        cid = self._unique_id(cid_base)
+        o = self._finish(self._submit(cid, lambda: self.api.submit_market_sell(symbol, qty, cid)))
+        self._log(day, "stop_fill", symbol, o["filled_qty"], o["filled_avg_price"],
+                  stop_price=self.store.state()["stops"].get(symbol), entry_price=entry, reason=reason,
+                  broker_order_id=o["id"])
+        _, held = self._held()
+        if symbol not in held:
+            self._set_stop(symbol, None)
+
     def ensure_stops(self) -> list[str]:
         _, held = self._held()
-        desired, open_stops = self.store.state()["stops"], self.api.open_stop_orders()
+        stops, open_stops = self.store.state()["stops"], self.api.open_stop_orders()
+        day = ny_day(self.market.now())
+        quotes = self.market.last_prices(held)
         placed, errors = [], []
-        for symbol, (qty, _) in held.items():
-            if symbol not in desired:
-                continue
+        for symbol, (qty, entry) in held.items():
             try:
-                if self._sync_stop(symbol, qty, open_stops):
+                if symbol not in stops:   # куплено мимо нас: без стопа не оставляем
+                    default = _tick(entry * (1 - self.cfg.limits.stop_max))
+                    self._set_stop(symbol, default)
+                    quote = quotes.get(symbol)
+                    self._log(day, "raise_stop", symbol, None, quote if usable(quote) else None,
+                              stop_price=default, reason="default_stop")
+                want = self.store.state()["stops"][symbol]
+                quote = quotes.get(symbol)
+                if usable(quote) and quote <= want and not _stop_ok(open_stops.get(symbol), qty, want):
+                    # цена уже у стопа или ниже: брокер такой стоп не примет, а стоп в сущности сработал
+                    self._sell_all(day, symbol, qty, entry, f"gap/{day}/{symbol}", "gap_below_stop",
+                                   open_stops.get(symbol))
+                elif self._sync_stop(symbol, qty, open_stops):
                     placed.append(symbol)
             except Exception as e:   # одна бумага не должна оставлять без стопа остальные
                 errors.append(e)
@@ -402,30 +460,50 @@ class AlpacaBroker:
         return placed
 
     def sync(self, day: str) -> list[dict]:
+        """Пишет событие на каждую исполненную заявку брокера, которой нет в журнале (ключ `broker_order_id`)."""
         last = self.store.state()["last_sync"]
         since = datetime.fromisoformat(last) - timedelta(days=1) if last else None   # запас на расхождение часов
         known = {e.get("broker_order_id") for e in self.store.orders()}
         _, held = self._held()
         events = []
-        for o in sorted(self.api.filled_stop_sells_since(since), key=lambda o: o["filled_at"]):
-            symbol = o["symbol"]
-            if o["id"] not in known:   # повторный вызов и повторное окно не пишут второй раз
-                events.append(self._log(day, "stop_fill", symbol, o["filled_qty"], o["filled_avg_price"],
-                                        stop_price=o["stop_price"], reason="stop", broker_order_id=o["id"],
-                                        entry_price=self.store.state()["entries"].get(symbol)))
-                known.add(o["id"])
-            stops = self.store.state()["stops"]
-            if symbol not in held and symbol in stops:   # докупленная бумага стопа не теряет
-                self.store.update_state(stops={k: v for k, v in stops.items() if k != symbol})
+        for o in sorted(self.api.filled_orders_since(since), key=lambda o: o["filled_at"]):
+            if o["id"] in known:
+                if o["side"] == "sell" and o["symbol"] not in held and o["symbol"] in self.store.state()["stops"]:
+                    self._set_stop(o["symbol"], None)   # сбой после записи события, но до снятия стопа
+                continue
+            symbol, qty, price = o["symbol"], o["filled_qty"], o["filled_avg_price"]
+            entry = self.store.state()["entries"].get(symbol)
+            when = ny_day(o["filled_at"]) if o["filled_at"] else day
+            cid = o["client_order_id"] or ""
+            common = {"broker_order_id": o["id"]}
+            if o["side"] == "buy":
+                ev = self._log(when, "buy", symbol, qty, price, notional=qty * price, client_order_id=cid,
+                               stop_price=self.store.state()["stops"].get(symbol), recovered=True, **common)
+            elif o["type"] == "stop":   # обычное обнаружение сработавшего стопа, не восстановление
+                ev = self._log(when, "stop_fill", symbol, qty, price, stop_price=o["stop_price"], reason="stop",
+                               entry_price=entry, **common)
+            elif cid.startswith("gap/"):
+                ev = self._log(when, "stop_fill", symbol, qty, price, entry_price=entry, reason="gap_below_stop",
+                               stop_price=self.store.state()["stops"].get(symbol), recovered=True, **common)
+            elif cid.startswith("liquidate/"):
+                ev = self._log(when, "liquidate", symbol, qty, price, fraction=1.0, entry_price=entry,
+                               reason="liquidate", client_order_id=cid, recovered=True, **common)
+            else:
+                ev = self._log(when, "close", symbol, qty, price, fraction=None, entry_price=entry,
+                               client_order_id=cid, recovered=True, **common)
+            events.append(ev)
+            known.add(o["id"])
+            if o["side"] == "sell" and symbol not in held and symbol in self.store.state()["stops"]:
+                self._set_stop(symbol, None)   # докупленная бумага стопа не теряет
         self.store.update_state(last_sync=self.market.now().isoformat())
         return events
 
-    def _liquidation_id(self, day: str, symbol: str) -> str:
-        """Один id на (день, бумагу), чтобы повтор после сбоя нашёл свою заявку; отказанная заявка id сжигает."""
+    def _unique_id(self, base: str) -> str:
+        """Один id на (действие, день, бумагу), чтобы повтор после сбоя нашёл свою заявку; отказанная заявка id сжигает."""
         used = {e.get("broker_order_id") for e in self.store.orders()}
         n = 1
         while True:
-            cid = f"liquidate/{day}/{symbol}" + (f"/{n}" if n > 1 else "")
+            cid = base + (f"/{n}" if n > 1 else "")
             o = self.api.order_by_client_id(cid)
             dead = o is not None and o["status"] in ("rejected", "canceled") and not o["filled_qty"]
             if o is None or (o["id"] not in used and not dead):
@@ -441,7 +519,7 @@ class AlpacaBroker:
             try:
                 if symbol in stops:
                     self._cancel(stops[symbol]["id"])
-                cid = self._liquidation_id(day, symbol)
+                cid = self._unique_id(f"liquidate/{day}/{symbol}")
                 o = self._finish(self._submit(cid, lambda: self.api.submit_market_sell(symbol, qty, cid)))
                 whole = o["filled_qty"] >= qty * (1 - 1e-9)
                 fills.append(self._record_sale(day, "liquidate", symbol, o, entry,
