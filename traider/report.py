@@ -11,7 +11,12 @@
 объединение. Кривые (`equity`, `account_equity`, `spy`, `spy_same_exposure`, полоса) начинаются точкой
 старта, дальше по точке на день участника; у погибшего кривая кончается днём гибели. Тень, боты
 (`cfg.seed`, вселенная с дневными свечами), SPY считает `traider.replay` по журналу в порядке `seq`
-(события вне дней участника не берутся) и снимкам цен самого участника. Место среди ботов: None, пока нет
+(события вне дней участника не берутся) и снимкам цен самого участника. День без сохранённого снимка
+(день гибели: тик снимка не пишет; сессия, упавшая до снимка) получает снимок отчёта: закрытие дневной свечи
+каждой бумаги, а у бумаг, которыми участник торговал в этот день, котировка из исполнения в журнале (цена
+продажи / (1 - SLIPPAGE), покупки / (1 + SLIPPAGE)); иначе тень погибшего продала бы по вчерашней цене.
+Сохранённый снимок берётся как есть. Нет свечей бенчмарка: `spy` и `vs_spy_pp` None. `beyond_noise` None,
+пока разница близнецов ровно 0 или у одного из них нет покупок. Место среди ботов: None, пока нет
 покупок. Капитал счёта, HP и доля HP берутся из `ticks.jsonl`: последний тик дня с числом, иначе None.
 Прогнозы: `brier`, `reference`, `ci` по панели, `brier_picks` по прогнозам купленных в тот же день бумаг;
 нет созревших, значит None. Закрытая сделка это каждое событие продажи (`agent`, `stop`, `liquidation`);
@@ -31,6 +36,7 @@ from traider import forecasts, replay
 from traider.config import load_run
 from traider.market import Market, ny_day
 from traider.nums import usable
+from traider.sim import SLIPPAGE
 from traider.store import RunStore
 
 ORDER = ("haiku", "sonnet", "opus-a", "opus-b", "opus-analyst")
@@ -132,18 +138,34 @@ def _load(run: Path, market: Market) -> dict:
             "orders": store.orders(), "ticks": store.ticks(), "forecasts": store.forecasts()}
 
 
+def _snapshot(p: dict, day: str, closes: Mapping) -> dict:
+    """Сохранённый снимок дня как есть; без него закрытия свечей дня, а у бумаг со сделками котировка из исполнения."""
+    saved = p["store"].prices(day)
+    if saved is not None:
+        return saved
+    snap = {s: c[day] for s, c in closes.items() if usable(c.get(day))}
+    for e in p["orders"]:
+        if e.get("day") == day and usable(e.get("price")) and e.get("kind") in ("buy", *SALES):
+            snap[e["symbol"]] = e["price"] / ((1 + SLIPPAGE) if e["kind"] == "buy" else (1 - SLIPPAGE))
+    return snap
+
+
+def _has_benchmark(closes: Mapping) -> bool:
+    return any(usable(c) for c in closes.get(BENCHMARK, {}).values())
+
+
 def _curves(p: dict, bars: Mapping, closes: Mapping, tdays: Sequence[str]) -> None:
     cfg, days, start = p["cfg"], p["days"], p["cfg"].start_equity
     dayset = set(days)
     events = [e for e in p["orders"] if e.get("day") in dayset]
-    snaps = {d: p["store"].prices(d) or {} for d in days}
+    snaps = {d: _snapshot(p, d, closes) for d in days}
     universe = [s for s in cfg.universe if bars.get(s)]
     shadow = replay.shadow(events, snaps, bars, days, start)
     bots = replay.monkeys(events, snaps, bars, days, start, universe, n=MONKEYS, seed=cfg.seed)
     p["snaps"], p["buys"] = snaps, [e for e in events if e.get("kind") == "buy"]
     p["equity"] = [start, *shadow]
     p["same"] = [start, *replay.spy_same_exposure(events, snaps, bars, days, start)]
-    p["spy"] = [start, *replay.spy_buy_hold(bars, days, start)]
+    p["spy"] = [start, *replay.spy_buy_hold(bars, days, start)] if _has_benchmark(closes) else None
     p["band"] = {k: [start, *v] for k, v in replay.band(bots).items()}
     # итоги равны с точностью до микродоллара: разница в последних битах float не решает место
     p["percentile"] = (replay.percentile(round(shadow[-1], 6), [round(b[-1], 6) for b in bots])
@@ -177,11 +199,12 @@ def _summary(p: dict) -> dict:
         dd = min(dd, (x / peak - 1) * 100)
     costs = [r.get("cost") for r in p["records"] if _num(r.get("cost"))]
     ret = _pct(eq, start) if days else None
-    return {"equity": eq[-1], "return_pct": ret, "vs_spy_pp": ret - _pct(p["spy"], start) if days else None,
+    return {"equity": eq[-1], "return_pct": ret,
+            "vs_spy_pp": ret - _pct(p["spy"], start) if days and p["spy"] else None,
             "percentile": p["percentile"], "max_drawdown_pct": dd if days else None, "hp": hp, "hp_share": share,
             "trades": len(p["buys"]), "closed_trades": sum(e.get("kind") in SALES for e in p["orders"]),
             "brier": p["brier"], "reference": p["reference"], "ci": p["ci"], "brier_picks": p["brier_picks"],
-            "cost": sum(costs)}
+            "cost": float(sum(costs))}
 
 
 def _session_cost(r: dict):
@@ -240,8 +263,11 @@ def _incidents(ps: list[dict], checked: dict[str, list[str]], with_broker: set[s
             if r.get("fallback_used"):
                 out.append({"kind": "warning", "day": r["day"], "participant": pid, "title": "подмена модели",
                             "text": f"ответила {r.get('model_used')}, стоимость посчитана по основной модели"})
+        stale = {r["day"] for r in p["records"] if r.get("status") == "failed" and r.get("stop") == "stale"}
         seen: dict[tuple, dict] = {}
         for t in p["ticks"]:
+            if t.get("action") == "stale_failed" and t.get("day") in stale:
+                continue   # запись дня уже дала «сбой сессии»
             keys = [t.get("action")] + (["unpriced"] if t.get("unpriced") else [])
             for key in dict.fromkeys(k for k in keys if k in TICK_INCIDENTS):
                 kind, title = TICK_INCIDENTS[key]
@@ -277,8 +303,10 @@ def _compare(ps: dict[str, dict], summary: dict, positions: dict) -> dict:
 
     twins = diff(get("opus-a", "return_pct"), get("opus-b", "return_pct"))
 
-    def beyond(d):
-        return None if d is None or twins is None else abs(d) > 2 * abs(twins)
+    quiet = twins is None or twins == 0 or not (ps.get("opus-a", {}).get("buys") and ps.get("opus-b", {}).get("buys"))
+
+    def beyond(d):   # без шума близнецов мерить нечем: разница 0 или один из них не покупал
+        return None if d is None or quiet else abs(d) > 2 * abs(twins)
 
     def bought(pid):
         return {e["symbol"] for e in ps[pid]["buys"]} if pid in ps else set()
@@ -335,7 +363,7 @@ def build_report(exp_dir: Path, market: Market, broker_order_ids: Mapping[str, I
             if e.get("kind") in SALES:
                 entry, exit_, qty = e.get("entry_price"), e.get("price"), e.get("qty")
                 trades.append({"day": e.get("day"), "participant": pid, "symbol": e.get("symbol"), "entry": entry,
-                               "exit": exit_, "how": SALES[e["kind"]],
+                               "exit": exit_, "qty": qty, "how": SALES[e["kind"]],
                                "pnl": (exit_ - entry) * qty if usable(entry) and usable(exit_) and usable(qty) else None})
         checked[pid] = integrity(p["store"], ids.get(pid))
         done = [r for r in p["records"] if r.get("status") in DONE]
@@ -363,7 +391,8 @@ def build_report(exp_dir: Path, market: Market, broker_order_ids: Mapping[str, I
                          for p in ps],
         "equity": {p["id"]: p["equity"] for p in ps},
         "account_equity": {p["id"]: p["account_equity"] for p in ps},
-        "spy": [first.start_equity, *replay.spy_buy_hold(bars, days, first.start_equity)] if first else [],
+        "spy": [first.start_equity, *replay.spy_buy_hold(bars, days, first.start_equity)]
+               if first and _has_benchmark(closes) else None,
         "spy_same_exposure": {p["id"]: p["same"] for p in ps},
         "band": {p["id"]: p["band"] for p in ps},
         "summary": summary, "costs": costs, "tokens": tokens, "sessions": sessions,

@@ -1,8 +1,12 @@
+from statistics import mean
+
 import pytest
 
 from tests.fakes import FakeMarket
+from traider import replay
 from traider.config import load_run, start_experiment
 from traider.report import build_report, integrity, verdict, worst
+from traider.sim import SLIPPAGE
 from traider.store import RunStore
 
 CRIT = dict(min_sessions=40, max_missed_share=0.10, min_closed_trades=15, red_percentile=25, green_percentile=90)
@@ -146,3 +150,153 @@ def test_report_changes_no_file_of_the_runs(played):
 def test_percentile_counts_equity_equal_to_a_micro_dollar_as_a_tie(played):
     exp, market = played                  # все боты и тень продали всё по одним ценам: итог одинаков до копейки
     assert build_report(exp, market)["summary"]["haiku"]["percentile"] == 50.0
+
+
+# --- исправления после просмотра ---
+
+def test_dead_participant_shadow_takes_the_crash_of_its_death_day(played_with_death):
+    exp, market = played_with_death
+    r = build_report(exp, market)
+    cash = RunStore(exp / "opus-b").account().cash
+    # тень и счёт исполнили одни и те же сделки с теми же 5 б.п.: расходиться они могут только округлением float
+    assert r["equity"]["opus-b"][-1] == pytest.approx(cash, abs=0.01)
+    assert r["summary"]["opus-b"]["return_pct"] < 0
+
+
+def _closes(market, symbol):
+    return {b.day: b.close for b in market.bars[symbol]}
+
+
+def _hand_equity(run, market):
+    """Тень вручную: в движущемся мире стопы не срабатывают и продаж нет, поэтому капитал дня это деньги
+    минус покупки плюс количество (сумма на цену снимка с проскальзыванием) на закрытие дня."""
+    store = RunStore(run)
+    cash, qty, out = 1000.0, {}, [1000.0]
+    for d in [s["day"] for s in store.sessions()]:
+        for e in store.orders(d):
+            if e["kind"] == "buy":
+                n = min(e["notional"], cash)
+                cash -= n
+                qty[e["symbol"]] = qty.get(e["symbol"], 0.0) + n / (store.prices(d)[e["symbol"]] * (1 + SLIPPAGE))
+        out.append(cash + sum(q * _closes(market, s)[d] for s, q in qty.items()))
+    return out
+
+
+def test_shadow_spy_return_and_drawdown_follow_moving_prices(moving):
+    exp, market = moving
+    r = build_report(exp, market)
+    hand = _hand_equity(exp / "sonnet", market)
+    assert hand[2] != pytest.approx(hand[1])                                   # цены и правда двигались
+    assert r["equity"]["sonnet"][2] == pytest.approx(hand[2]) and r["equity"]["sonnet"][-1] == pytest.approx(hand[-1])
+    spy, days = _closes(market, "SPY"), r["days"]
+    assert r["spy"][-1] == pytest.approx(1000 * spy[days[-1]] / spy[days[0]])
+    ret = (hand[-1] / 1000 - 1) * 100
+    s = r["summary"]["sonnet"]
+    assert s["return_pct"] == pytest.approx(ret)
+    assert s["vs_spy_pp"] == pytest.approx(ret - (spy[days[-1]] / spy[days[0]] - 1) * 100)
+    dd = min((x / max(hand[:i + 1]) - 1) * 100 for i, x in enumerate(hand))
+    assert dd < 0 and s["max_drawdown_pct"] == pytest.approx(dd)
+
+
+def test_brier_and_reference_from_forecasts_and_bars(moving):
+    exp, market = moving
+    r = build_report(exp, market)
+    cfg, store = load_run(exp / "haiku")[0], RunStore(exp / "haiku")
+    tdays, spy = [b.day for b in market.bars["SPY"]], _closes(market, "SPY")
+    given = {(f["day"], f["symbol"]): f["p"] for f in store.forecasts()}
+    pairs = []
+    for d in [s["day"] for s in store.sessions()]:
+        i = tdays.index(d)
+        if i + 5 < len(tdays):                                                   # созрел: есть закрытие через 5 дней
+            end = tdays[i + 5]
+            for sym in cfg.panel:
+                c = _closes(market, sym)
+                pairs.append((given.get((d, sym), 0.5), int(c[end] / c[d] > spy[end] / spy[d])))
+    assert len(pairs) == 40                                                      # 01.12 и 02.12 по 20 бумаг
+    brier, f = mean((p - o) ** 2 for p, o in pairs), mean(o for _, o in pairs)
+    s = r["summary"]["haiku"]
+    assert s["brier"] == pytest.approx(brier) and s["reference"] == pytest.approx(f * (1 - f))
+    # интервал это «Брайер минус эталон»; при двух созревших днях блок один и интервал сжат в точку, отсюда 1e-9
+    assert s["ci"][0] - 1e-9 <= brier - f * (1 - f) <= s["ci"][1] + 1e-9
+
+
+def test_band_spreads_and_percentile_recounts_from_monkeys(moving):
+    exp, market = moving
+    r = build_report(exp, market)
+    band = r["band"]["sonnet"]
+    assert band["p95"][-1] > band["p5"][-1]
+    cfg, store, days = load_run(exp / "sonnet")[0], RunStore(exp / "sonnet"), r["days"]
+    bars = market.daily_bars(cfg.universe, 30)
+    bots = replay.monkeys(store.orders(), {d: store.prices(d) for d in days}, bars, days, 1000.0,
+                          list(cfg.universe), seed=cfg.seed)
+    me, finals = r["equity"]["sonnet"][-1], [b[-1] for b in bots]
+    below, equal = sum(x < me - 1e-6 for x in finals), sum(abs(x - me) <= 1e-6 for x in finals)
+    assert r["summary"]["sonnet"]["percentile"] == pytest.approx(100 * (below + equal / 2) / len(finals))
+
+
+def test_twins_numbers_and_open_position_value(moving):
+    exp, market = moving
+    r = build_report(exp, market)
+    a, b = _hand_equity(exp / "opus-a", market), _hand_equity(exp / "opus-b", market)
+    twins = r["compare"]["twins"]
+    assert twins["diff_pp"] == pytest.approx((a[-1] - b[-1]) / 10)              # доходности в п.п. при старте 1000
+    assert twins["common"] == 0.5                                                # XLE у обоих, XLU только у opus-b
+    store, last = RunStore(exp / "haiku"), r["days"][-1]
+    qty = sum(e["qty"] for e in store.orders() if e["kind"] == "buy")
+    assert r["positions"]["XLE"]["haiku"] == pytest.approx(qty * store.prices(last)["XLE"])
+
+
+def test_beyond_noise_compares_with_twice_the_twins(moving):
+    exp, market = moving
+    r = build_report(exp, market)
+    ret = {p: (_hand_equity(exp / p, market)[-1] / 1000 - 1) * 100 for p in ("haiku", "sonnet", "opus-a", "opus-b")}
+    noise = 2 * abs(ret["opus-a"] - ret["opus-b"])
+    steps = [ret["haiku"], ret["sonnet"], (ret["opus-a"] + ret["opus-b"]) / 2]
+    assert r["compare"]["ladder"]["beyond_noise"] is (max(steps) - min(steps) > noise)
+
+
+def test_beyond_noise_is_none_when_twins_tie_or_one_never_bought(played):
+    exp, market = played
+    assert build_report(exp, market)["compare"]["ladder"]["beyond_noise"] is None        # близнецы равны
+    (exp / "opus-b" / "orders.jsonl").write_text("")
+    r = build_report(exp, market)
+    assert r["compare"]["twins"]["diff_pp"] != 0
+    assert r["compare"]["ladder"]["beyond_noise"] is None and r["compare"]["analyst"]["beyond_noise"] is None
+
+
+def test_without_benchmark_bars_spy_is_not_a_number(played):
+    exp, market = played
+    del market.bars["SPY"]
+    r = build_report(exp, market)
+    assert r["spy"] is None and r["summary"]["haiku"]["vs_spy_pp"] is None
+
+
+def test_stale_session_is_one_incident(played):
+    exp, market = played
+    store = RunStore(exp / "sonnet")
+    store.finish_session("2026-12-03", "failed", {"stop": "stale", "errors": ["сессия зависла в статусе started"]})
+    store.append_tick({"ts": "x", "day": "2026-12-03", "action": "stale_failed"})
+    r = build_report(exp, market)
+    assert len([i for i in r["incidents"] if i["participant"] == "sonnet" and i["day"] == "2026-12-03"]) == 1
+
+
+def test_trades_carry_quantity_and_cost_is_float(played, tmp_path, example):
+    exp, market = played
+    r = build_report(exp, market)
+    sold = next(e for e in RunStore(exp / "haiku").orders() if e["kind"] == "liquidate")
+    assert next(t for t in r["trades"] if t["participant"] == "haiku")["qty"] == sold["qty"]
+    fresh = start_experiment(example, tmp_path / "fresh")
+    s = build_report(fresh, FakeMarket.with_history(list(load_run(fresh / "haiku")[0].universe), days=70))
+    assert isinstance(s["summary"]["haiku"]["cost"], float)
+
+
+def test_beyond_noise_needs_more_than_twice_the_twins_difference():
+    from types import SimpleNamespace
+    from traider.report import _compare
+    ps = {pid: {"buys": [{"symbol": "XLE"}], "forecasts": [], "cfg": SimpleNamespace(panel=())}
+          for pid in ("haiku", "opus-a", "opus-b", "opus-analyst")}
+    summary = {pid: {"return_pct": r, "percentile": None, "brier": None}
+               for pid, r in (("haiku", 2.0), ("opus-a", 1.0), ("opus-b", 0.0), ("opus-analyst", 3.0))}
+    c = _compare(ps, summary, {})              # шум близнецов 1 п.п.: порог 2 п.п.
+    assert c["ladder"]["beyond_noise"] is False   # разброс 1.5 п.п.: больше шума, но не вдвое
+    assert c["analyst"]["beyond_noise"] is True   # 3.0 против среднего 0.5: 2.5 п.п.
