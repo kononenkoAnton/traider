@@ -519,7 +519,8 @@ function renderMoney() {
     `Прогноз на месяц: траты месяца плюс средний расход дня сессии на каждый оставшийся торговый день месяца, то есть он считает, что сессия будет в каждый такой день, но не больше сессий, оставшихся до конца прогона.`,
     runGap && !(mo.run_spend_usd > 0) ? `Сколько потрачено за весь прогон, неизвестно: ${without(mo.sessions_without_cost)}.`
       : `За весь прогон потрачено ${usd2(mo.run_spend_usd)}${runGap ? `; не всё записано: ${without(mo.sessions_without_cost)}` : ""}.`].join(" ");
-  const forecast = num(mo.month_forecast_usd) ? `прогноз на месяц ${usd2(mo.month_forecast_usd)}` : "прогноза на месяц нет: ни одной записанной стоимости";
+  const forecast = num(mo.month_forecast_usd) ? `прогноз на месяц ${usd2(mo.month_forecast_usd)}`
+    : !num(mo.month_spend_usd) ? "прогноза на месяц нет, пока траты месяца неизвестны" : "прогноза на месяц нет: ни одной записанной стоимости";
   const meter = !(credits && month) ? null : !num(mo.month_spend_usd)
     ? h("p", { class: "note", style: "margin:6px 0 0" }, `${month}: сколько потрачено, неизвестно; не всё записано: ${without(mo.month_sessions_without_cost || 0)}. ${forecast[0].toUpperCase()}${forecast.slice(1)}.`)
     : h("div", { class: "progress", style: "margin-top:6px" },

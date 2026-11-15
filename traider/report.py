@@ -210,7 +210,7 @@ def _money(ps: list[dict], market: Market, target: int | None, done: int) -> dic
     """Расход всех участников: месяц последнего дня сессии, записанные траты в нём и за прогон, сессии без записанной
     стоимости (пропуск стоит 0 и записан) и прогноз на месяц: траты месяца плюс средний расход дня сессии (по дням,
     где записана хоть одна стоимость) на дни сессий, которые ещё ждут в этом месяце (торговые дни после последнего
-    дня сессии, но не больше сессий до цели)."""
+    дня сессии, но не больше сессий до цели); пока траты месяца неизвестны, прогноза нет."""
     recs = [(r["day"], _session_cost(r)) for p in ps for r in p["records"]]
     spent = [(d, c) for d, c in recs if c is not None]
     sdays = sorted({d for d, _ in recs})
@@ -226,11 +226,11 @@ def _money(ps: list[dict], market: Market, target: int | None, done: int) -> dic
     by_day: dict[str, float] = {}
     for d, c in spent:
         by_day[d] = by_day.get(d, 0.0) + c
-    if by_day:
+    if by_day and out["month_spend_usd"] is not None:          # неизвестные траты месяца не прогнозируются
         y, mo = int(month[:4]), int(month[5:])
         after = [d for d in market.trading_days(f"{month}-01", f"{month}-{calendar.monthrange(y, mo)[1]:02d}") if d > sdays[-1]]
         left = len(after) if target is None else min(len(after), max(0, target - done))
-        out["month_forecast_usd"] = (out["month_spend_usd"] or 0.0) + sum(by_day.values()) / len(by_day) * left
+        out["month_forecast_usd"] = out["month_spend_usd"] + sum(by_day.values()) / len(by_day) * left
     return out
 
 

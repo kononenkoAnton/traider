@@ -434,3 +434,8 @@ def test_death_incident_does_not_repeat_its_title(played_with_death):
     exp, market = played_with_death
     died = [i for i in build_report(exp, market)["incidents"] if i["title"].startswith("гибель")]
     assert died and all(i["title"] not in i["text"] for i in died)
+
+
+def test_no_forecast_while_the_month_spend_is_unknown():
+    m = _money_of([("2026-11-27", "ok", 1.0), ("2026-11-30", "ok", 1.0), ("2026-12-01", "failed", None)])
+    assert m["month"] == "2026-12" and m["month_spend_usd"] is None and m["month_forecast_usd"] is None
