@@ -203,3 +203,37 @@ def test_check_enforces_list_size_bounds():
     assert _check(schema, []) and "не меньше 1" in _check(schema, [])
     assert _check(schema, ["a"] * 4) and "не больше 3" in _check(schema, ["a"] * 4)
     assert _check(schema, ["a"]) is None and _check(schema, ["a"] * 3) is None
+
+
+# --- поиск: лимит на сессию держит API, потому что вся сессия это один ход ---
+def _search_tools(request):
+    return [t for t in request["tools"] if t.get("name") == "web_search"]
+
+
+def test_search_is_direct_with_the_session_limit_and_never_changes():
+    script = [use("echo", x="a", usage={"web_search_requests": 3}), use("nope"), use("echo", x="b"), use("finish")]
+    result, client = run(script, max_searches=8)
+    assert result.stop == "finished" and len(client.requests) == 4
+    defs = [_search_tools(r) for r in client.requests]
+    assert all(len(d) == 1 for d in defs) and all(d == defs[0] for d in defs)
+    assert defs[0][0]["allowed_callers"] == ["direct"] and defs[0][0]["max_uses"] == 8
+
+
+def test_every_follow_up_message_holds_only_tool_results():
+    boom = Tool("finish", "", DONE.input_schema, lambda a: 1 / 0, terminal=True)
+    good = Tool("done", "", DONE.input_schema, lambda a: "готово", terminal=True)
+    script = [use("echo", x="a"), use("nope"), use(("finish", {}), ("echo", dict(x="b"))),
+              use(("done", {}), ("echo", dict(x="late")))]
+    result, client = run(script, tools=[ECHO, boom, good])
+    assert result.stop == "finished" and len(client.requests) == 4
+    for r in client.requests[1:]:
+        last = r["messages"][-1]
+        assert last["role"] == "user" and all(b["type"] == "tool_result" for b in last["content"])
+    final = result.transcript[-1]          # шаг с пропущенными после завершающего вызовами
+    assert final["role"] == "user" and all(b["type"] == "tool_result" for b in final["content"])
+    assert final["content"][1]["is_error"] is True
+
+
+def test_no_search_tool_in_any_request_when_searches_are_off():
+    _, client = run([use("echo", x="a"), use("finish")], max_searches=0)
+    assert len(client.requests) == 2 and not any(_search_tools(r) for r in client.requests)

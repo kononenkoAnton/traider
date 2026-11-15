@@ -9,6 +9,14 @@
 ответа считается стоимость: при `cost >= max_usd` цикл обрывается до выполнения инструментов этого
 ответа. Ходов не больше `max_turns`. Вход инструмента проверяется по его JSON-схеме до вызова.
 Цикл ничего не решает о торговле и никогда не поднимает исключений: сбой клиента это `stop="error"`.
+
+Поиск. Лимит поисков держит API: `max_uses` считает поиски за ход, а ход продолжается, пока
+последнее сообщение запроса состоит только из блоков `tool_result` (или после `pause_turn`).
+Цикл после первого сообщения шлёт только такие сообщения, поэтому вся сессия это один ход, и
+`max_uses = max_searches` ограничивает сессию. Поиск вызывается напрямую
+(`allowed_callers: ["direct"]`), динамическая фильтрация выключена намеренно: поиски из
+выполнения кода между запросами не суммируются, а так все модели ищут одинаково. Определение
+инструмента одно на всю сессию, кэш промпта им не сбрасывается.
 """
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -184,7 +192,7 @@ def _loop(client, res, model, system, user, tools, prices, max_turns, max_usd, m
                   "eager_input_streaming": True} for t in tools]
     if max_searches > 0:
         api_tools.append({"type": SEARCH_TYPES.get(model, "web_search_20250305"), "name": "web_search",
-                          "max_uses": max_searches})
+                          "max_uses": max_searches, "allowed_callers": ["direct"]})
     extra = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"} if model in FALLBACK_MODELS else {}
     messages: list[dict] = [{"role": "user", "content": user}]
     res.stop = "max_turns"
@@ -244,6 +252,7 @@ def _loop(client, res, model, system, user, tools, prices, max_turns, max_usd, m
                 finished = not failed and by_name[b.name].terminal
             results.append({"type": "tool_result", "tool_use_id": b.id, "content": out,
                             **({"is_error": True} if failed else {})})
+        # только tool_result: любой другой блок здесь начал бы новый ход и обнулил счёт поисков API
         messages.append({"role": "user", "content": results})
         res.transcript.append({"role": "user", "content": _clean(results)})
         if finished:

@@ -5,7 +5,7 @@ type: leaf
 tags: ['architecture', 'tools', 'agent']
 categories: ['system-architecture']
 created: 2026-11-14T15:43:20+00:00
-modified: 2026-11-15T13:00:00+00:00
+modified: 2026-11-15T10:01:55+00:00
 ---
 
 # Инструменты агента
@@ -21,7 +21,7 @@ modified: 2026-11-15T13:00:00+00:00
 | `get_bars` | `symbols` до 10, `days` до 120 | дневные свечи текстом |
 | `get_news` | `symbols` до 10 (необязательно), `limit` до 20 | новости Alpaca; нет у участника с аналитиком |
 | `research` | `question` | ответ аналитика на Haiku ([[participants]]); только у участника с аналитиком, вместо `get_news` |
-| `web_search` | серверный инструмент | поиск Anthropic, не больше 8 запросов за сессию; добавляет цикл, а не этот модуль |
+| `web_search` | серверный инструмент | поиск Anthropic, не больше 8 запросов за сессию; добавляет цикл, а не этот модуль; лимит держит API, поиск вызывается напрямую ([[model-and-budget]]) |
 | `record_forecasts` | `forecasts`: список `symbol`, `p` от 0.01 до 0.99 | число записанных и чего не хватает по панели ([[forecasts-and-calibration]]) |
 | `buy` | `symbol`, `notional`, `stop_price`, `thesis` | «Куплено» или «Отказ» |
 | `close_position` | `symbol`, `fraction` от 0 до 1, `reason` | «Закрыто», «Отказ» или «Ошибка» |
