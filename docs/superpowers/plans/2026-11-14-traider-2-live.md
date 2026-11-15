@@ -981,7 +981,7 @@ Expected: все тесты проходят. Тест покупает и за�
 
 - [ ] **Step 3: Собрать вселенную с фильтром Alpaca**
 
-Run: `uv run python tools/build_universe.py && uv run pytest tests/test_market.py -q`
+Run: `uv run python tools/build_universe.py --alpaca && uv run pytest tests/test_market.py -q`, затем `git diff data/universe.txt`
 Expected: `data/universe.txt` обновлён, тесты проходят.
 
 - [ ] **Step 4: Один настоящий тик**
