@@ -1,7 +1,7 @@
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from traider.market import Bar
+from traider.market import Bar, completed_days
 
 NY = ZoneInfo("America/New_York")
 
@@ -55,7 +55,8 @@ class FakeMarket:
         return out
 
     def daily_bars(self, symbols, days):
-        return {s: self.bars[s][-days:] for s in symbols if s in self.bars}
+        today = self.clock.date().isoformat()
+        return {s: completed_days(self.bars[s], today, self.open)[-days:] for s in symbols if s in self.bars}
 
     def lows_since(self, symbols, since):
         # запись lows: одна свеча или список свечей по времени; свеча это (минимум, открытие)

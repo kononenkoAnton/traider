@@ -6,6 +6,8 @@ def run_market_contract(market):
     assert set(prices) == {"AAPL", "SPY"} and all(v > 0 for v in prices.values())
     bars = market.daily_bars(["AAPL"], 30)["AAPL"]
     assert 15 <= len(bars) <= 30 and [b.day for b in bars] == sorted(b.day for b in bars)
+    if market.is_open():  # сегодняшняя свеча ещё формируется: только завершённые дни
+        assert all(b.day < market.now().date().isoformat() for b in bars)
     assert all(b.low <= b.open <= b.high and b.low <= b.close <= b.high for b in bars)
     assert str(market.now().tzinfo) == "America/New_York" and isinstance(market.is_open(), bool)
     news = market.news(["AAPL"], 5)
