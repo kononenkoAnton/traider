@@ -8,6 +8,9 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = ["anthropic", "alpaca-py"]
 
+[project.scripts]
+traider = "traider.cli:main"
+
 [dependency-groups]
 dev = ["pytest", "python-frontmatter"]
 

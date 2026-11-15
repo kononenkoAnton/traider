@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Шаблон. Не ставится автоматически. Замените __PROJECT_DIR__ на абсолютный путь к проекту
+     (три места ниже) и допишите в PATH каталог с uv, если его там нет.
+     Каталог logs/ должен существовать: mkdir -p __PROJECT_DIR__/logs
+     Установка:  launchctl bootstrap gui/$(id -u) ops/com.traider.tick.plist
+     Проверка:   launchctl print gui/$(id -u)/com.traider.tick
+     Снятие:     launchctl bootout gui/$(id -u)/com.traider.tick -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.traider.tick</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>uv</string>
+        <string>run</string>
+        <string>traider</string>
+        <string>tick</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/logs/tick.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/logs/tick.log</string>
+</dict>
+</plist>
