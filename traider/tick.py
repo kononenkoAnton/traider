@@ -5,12 +5,15 @@
 :wk-categories: system-architecture
 
 Как это работает. `tick` ничего не делает при закрытом рынке и когда замок `runs/.tick.lock`
-(`{"pid", "ts"}`) моложе `lock_minutes`. Замок создаётся атомарно (`os.link` готового файла),
-нечитаемый или старый забирается. Метка `ts` берётся из `market.now()` и переписывается перед
-каждым прогоном, поэтому срок считается от последнего признака жизни, а не от старта тика.
-Замок снимается в `finally`. Порядок участников сдвигается по дням: первым идёт номер
+(`{"pid", "ts"}`) моложе `lock_minutes`. Замок создаётся атомарно (`os.link` готового файла) и несёт токен этого вызова:
+владелец тот, чей токен в файле. Нечитаемый или старый замок уходит атомарным `os.rename`
+(не вышло, значит другой тик успел) и создаётся заново. Метка `ts` берётся из `market.now()` и переписывается перед
+каждым прогоном, если замок ещё наш (иначе тик останавливается и замок не трогает), поэтому срок считается от последнего признака жизни, а не от старта тика.
+Замок снимается в `finally`, только если он наш. Порядок участников сдвигается по дням: первым идёт номер
 «день года по модулю числа участников».
 
+Перед всем: режим и брокер конфига должны совпасть с записью `started_with` в состоянии прогона
+(пишет `start_experiment`); иначе брокер не создаётся, статус `invalid`, действие `error`.
 Для одного прогона, в этом порядке, каждый шаг может закончить работу над ним:
 1. неверная контрольная сумма и статус не `invalid` дают `invalid`; 2. первый тик ставит
 `first_day`; 3. `run_safety` (погиб: `died`); 4. статус `invalid`: `invalid`, без сессии;
@@ -20,7 +23,7 @@
 день от `first_day` до вчера без записи пишется `missed`; 7. время позже `window_end` без
 записи за сегодня: `missed`; 8. не раньше `window_start`, рынок открыт, записи нет: при
 непустом `unpriced` это `unpriced`, иначе запись `started`, аналитик (второй клиент) для
-`research = "analyst"` и `run_session` (`session` со статусом и стоимостью); 9. иначе `safety`.
+`research = "analyst"` и `run_session` (`session` со статусом и стоимостью); 9. иначе `safety`. Статус не `active` после шагов 4 и 5 (неизвестный) даёт `safety` без учёта дней.
 Любое исключение по одному прогону даёт `error` с текстом и не мешает остальным. Клиенты
 создаются до записи `started`, чтобы сбой создания не оставил зависшую запись; когда
 сессии нет, `make_client` не вызывается.
@@ -45,9 +48,9 @@ from traider.store import RunStore
 FINISH_AFTER_DAYS = 5
 
 
-def _write_lock(lock: Path, now: datetime, exclusive: bool) -> bool:
+def _write_lock(lock: Path, now: datetime, token: str, exclusive: bool) -> bool:
     tmp = lock.with_name(f"{lock.name}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(json.dumps({"pid": os.getpid(), "ts": now.isoformat()}))
+    tmp.write_text(json.dumps({"pid": os.getpid(), "ts": now.isoformat(), "token": token}))
     try:
         if exclusive:
             os.link(tmp, lock)   # не перезаписывает: из двух одновременных тиков замок получит один
@@ -60,9 +63,17 @@ def _write_lock(lock: Path, now: datetime, exclusive: bool) -> bool:
         tmp.unlink(missing_ok=True)
 
 
-def _acquire(lock: Path, now: datetime, lock_minutes: int) -> bool:
+def _owned(lock: Path, token: str) -> bool:
+    """Замок наш, если в файле наш токен; pid только справка (в тестах два тика в одном процессе)."""
+    try:
+        return json.loads(lock.read_text())["token"] == token
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def _acquire(lock: Path, now: datetime, lock_minutes: int, token: str) -> bool:
     lock.parent.mkdir(parents=True, exist_ok=True)
-    if _write_lock(lock, now, exclusive=True):
+    if _write_lock(lock, now, token, exclusive=True):
         return True
     try:
         young = now - datetime.fromisoformat(json.loads(lock.read_text())["ts"]) < timedelta(minutes=lock_minutes)
@@ -70,8 +81,18 @@ def _acquire(lock: Path, now: datetime, lock_minutes: int) -> bool:
         young = False   # нечитаемый замок это след упавшего тика
     if young:
         return False
-    lock.unlink(missing_ok=True)
-    return _write_lock(lock, now, exclusive=True)   # проиграли гонку за замок: тик не идёт
+    moved = lock.with_name(f"{lock.name}.{uuid.uuid4().hex}.old")
+    try:
+        os.rename(lock, moved)   # атомарно: замок ушёл у нас или уже не существует (другой тик успел)
+    except FileNotFoundError:
+        return False
+    moved.unlink(missing_ok=True)
+    return _write_lock(lock, now, token, exclusive=True)
+
+
+def _refresh(lock: Path, now: datetime, token: str) -> bool:
+    # ponytail: между проверкой и заменой остаётся окно в доли миллисекунды; закрывает только flock
+    return _owned(lock, token) and _write_lock(lock, now, token, exclusive=False)
 
 
 def _finish_day_passed(market: Market, finish_day: str, day: str) -> bool:
@@ -107,6 +128,12 @@ def _one(run: Path, market: Market, make_broker, make_client) -> dict:
     store, now = RunStore(run), market.now()
     day = ny_day(now)
     out: dict[str, Any] = {"participant": cfg.participant}
+    if store.state().get("started_with") != {"mode": cfg.mode, "broker": cfg.broker}:
+        # конфиг правили: режим или брокер уже не те, что записаны при старте. Брокер не создаётся совсем,
+        # иначе правка paper на live вывела бы проверку HP на настоящий счёт
+        store.update_state(status="invalid")
+        return out | {"action": "error", "error": "конфиг больше не совпадает с режимом и брокером, записанными при "
+                      "старте прогона; брокер не создавался, ничего не отправлено, счёт нужно проверить вручную"}
     if not valid and store.state()["status"] != "invalid":
         store.update_state(status="invalid")
     if store.state().get("first_day") is None:
@@ -120,6 +147,8 @@ def _one(run: Path, market: Market, make_broker, make_client) -> dict:
         return out | {"action": "invalid"}
     if status == "finishing":
         return out | {"action": _finishing(cfg, store, broker, market, day)}
+    if status != "active":
+        return out | {"action": "safety"}   # неизвестный статус: ни учёта дней, ни сессии
     stale_today = _bookkeeping(store, market, day, now)
     clock = now.astimezone(NY).strftime("%H:%M")
     if store.session(day) is None:
@@ -140,20 +169,22 @@ def _one(run: Path, market: Market, make_broker, make_client) -> dict:
 
 def tick(runs_dir: Path, market: Market, make_broker: Callable[[RunConfig, RunStore], Broker],
          make_client: Callable[[], Any], lock_minutes: int = 60) -> list[dict]:
-    lock = Path(runs_dir) / ".tick.lock"
-    if not market.is_open() or not _acquire(lock, market.now(), lock_minutes):
+    lock, token = Path(runs_dir) / ".tick.lock", uuid.uuid4().hex
+    if not market.is_open() or not _acquire(lock, market.now(), lock_minutes, token):
         return []
+    out: list[dict] = []
     try:
-        out = []
         for run in _rotated(active_runs(runs_dir), ny_day(market.now())):
-            _write_lock(lock, market.now(), exclusive=False)
+            if not _refresh(lock, market.now(), token):
+                break   # замок забрал другой тик: не трогаем ни его, ни прогоны
             try:
                 out.append(_one(run, market, make_broker, make_client))
             except Exception as e:
                 out.append({"participant": run.name, "action": "error", "error": f"{type(e).__name__}: {e}"})
         return out
     finally:
-        lock.unlink(missing_ok=True)
+        if _owned(lock, token):
+            lock.unlink(missing_ok=True)
 
 
 def _rotated(runs: list[Path], day: str) -> list[Path]:

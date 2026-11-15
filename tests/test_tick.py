@@ -178,3 +178,76 @@ def test_started_record_blocks_a_second_start(world):
     runs, market, mb, mc, clients = world
     RunStore(runs / "pilot-1" / "haiku").start_session("2026-12-01", market.clock)      # свежая, не зависшая
     assert actions(tick(runs, market, mb, mc))["haiku"] == "safety"
+
+
+# --- раунд исправлений 1 ---
+
+def _edit_config(runs, name, old, new):
+    path = runs / "pilot-1" / name / "config.json"
+    assert old in path.read_text()
+    path.write_text(path.read_text().replace(old, new))
+
+def _guarded_tick(world, name, old, new):
+    runs, market, _, mc, _ = world
+    _edit_config(runs, name, old, new)
+    built = []
+    def broker(cfg, store):
+        built.append(cfg.participant); return SimBroker(cfg, store, market)
+    got = tick(runs, market, broker, mc)
+    by = {r["participant"]: r for r in got}
+    assert name not in built and by[name]["action"] == "error" and "вручную" in by[name]["error"]
+    assert RunStore(runs / "pilot-1" / name).state()["status"] == "invalid"
+    assert sorted(r["action"] for r in got).count("session") == 4
+    assert RunStore(runs / "pilot-1" / name).session("2026-12-01") is None
+    market.clock = ny(2026, 12, 1, 10, 20)                      # следующие тики делают то же
+    assert actions(tick(runs, market, broker, mc))[name] == "error" and name not in built
+
+def test_paper_run_edited_to_live_never_gets_a_broker(world):
+    _guarded_tick(world, "opus-a", '"mode": "paper"', '"mode": "live"')
+
+def test_sim_run_edited_to_alpaca_never_gets_a_broker(world):
+    _guarded_tick(world, "haiku", '"broker": "sim"', '"broker": "alpaca"')
+
+def test_run_without_the_mode_and_broker_record_never_gets_a_broker(world):
+    runs = world[0]
+    RunStore(runs / "pilot-1" / "sonnet").update_state(started_with=None)
+    _guarded_tick(world, "sonnet", '"seed": 20261114', '"seed": 20261114')
+
+def test_start_experiment_records_mode_and_broker(tmp_path, example):
+    paper = start_experiment(example, tmp_path / "p")
+    assert RunStore(paper / "opus-a").state()["started_with"] == {"mode": "paper", "broker": "alpaca"}
+    assert RunStore(paper / "haiku").state()["started_with"] == {"mode": "paper", "broker": "sim"}
+
+def test_live_start_records_live(tmp_path, example_live):
+    live = start_experiment(example_live, tmp_path / "l", live=True)
+    assert all(RunStore(r).state()["started_with"]["mode"] == "live" for r in live.iterdir())
+
+def test_foreign_lock_stops_the_tick_and_is_left_alone(world):
+    runs, market, _, mc, _ = world
+    lock, calls = runs / ".tick.lock", []
+    foreign = json.dumps({"pid": 7, "ts": market.clock.isoformat(), "token": "other"})
+    def broker(cfg, store):
+        calls.append(cfg.participant); lock.write_text(foreign)       # другой тик забрал замок
+        return SimBroker(cfg, store, market)
+    got = tick(runs, market, broker, mc)
+    assert len(got) == 1 and len(calls) == 1 and lock.read_text() == foreign
+
+def test_fresh_foreign_lock_survives_a_tick_that_returned_early(world):
+    runs, market, mb, mc, _ = world
+    (runs / ".tick.lock").write_text(json.dumps({"pid": 1, "ts": market.clock.isoformat(), "token": "other"}))
+    assert tick(runs, market, mb, mc) == [] and (runs / ".tick.lock").exists()
+
+def test_takeover_of_a_vanished_lock_loses_quietly(world, monkeypatch):
+    runs, market, mb, mc, _ = world
+    (runs / ".tick.lock").write_text("мусор")
+    real = tick_module.os.rename
+    def gone(src, dst): (runs / ".tick.lock").unlink(); return real(src, dst)   # другой тик успел раньше
+    monkeypatch.setattr(tick_module.os, "rename", gone)
+    assert tick(runs, market, mb, mc) == []
+
+def test_run_with_an_unknown_status_gets_no_session_and_no_bookkeeping(world):
+    runs, market, mb, mc, clients = world
+    RunStore(runs / "pilot-1" / "haiku").update_state(status="weird")
+    market.clock = ny(2026, 12, 3, 10, 5)
+    assert actions(tick(runs, market, mb, mc))["haiku"] == "safety"
+    assert RunStore(runs / "pilot-1" / "haiku").sessions() == []

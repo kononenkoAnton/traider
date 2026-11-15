@@ -16,7 +16,7 @@
 замороженный конфиг и возвращает признак, сошлась ли контрольная сумма: правка файла
 не скрывается, а помечается. У участника с аналитиком в конфиг замораживается и таблица цен модели аналитика
 (`analyst_token_prices`), у остальных там None. Лимиты у всех участников общие (`Limits()`), TOML
-переопределяет только `max_session_usd`. `active_runs` отдаёт планировщику каждый прогон,
+переопределяет только `max_session_usd`. При создании режим и брокер записываются в `state.json` прогона (`started_with`), вне `config.json`. `active_runs` отдаёт планировщику каждый прогон,
 чей статус не конечный (`TERMINAL_STATUSES`), в том числе `invalid`: у него отключаются
 только сессии агента, HP и стопы работают.
 """
@@ -128,6 +128,8 @@ def _build(toml_path: Path, live: bool) -> list[RunConfig]:
 
 
 def start_experiment(toml_path: Path, runs_dir: Path, live: bool = False) -> Path:
+    from traider.store import RunStore  # store импортирует cage, а cage импортирует config
+
     configs = _build(Path(toml_path), live)
     exp_dir = Path(runs_dir) / configs[0].experiment
     for cfg in configs:
@@ -139,6 +141,8 @@ def start_experiment(toml_path: Path, runs_dir: Path, live: bool = False) -> Pat
         data = json.dumps(asdict(cfg), sort_keys=True, ensure_ascii=False, indent=1).encode("utf-8")
         (run / "config.json").write_bytes(data)
         (run / "config.sha256").write_text(hashlib.sha256(data).hexdigest())
+        # режим и брокер ещё и вне config.json: тик сверяет с ними конфиг, чтобы правка файла не открыла живой счёт
+        RunStore(run).update_state(started_with={"mode": cfg.mode, "broker": cfg.broker})
     return exp_dir
 
 

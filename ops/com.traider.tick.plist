@@ -1,12 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Шаблон. Не ставится автоматически. Замените __PROJECT_DIR__ на абсолютный путь к проекту
-     (три места ниже) и допишите в PATH каталог с uv, если его там нет.
+     (три места ниже), __HOME_DIR__ на ваш домашний каталог.
+     Проверьте `which uv`: его каталог должен быть в PATH ниже (uv от установщика лежит в
+     ~/.local/bin, launchd не раскрывает ~, впишите полный путь, например /Users/имя/.local/bin).
      Каталог logs/ должен существовать: mkdir -p __PROJECT_DIR__/logs
-     Установка:  launchctl bootstrap gui/$(id -u) ops/com.traider.tick.plist
+     Заполненную копию положите в ~/Library/LaunchAgents/com.traider.tick.plist, этот файл не правьте.
+     Установка:  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.traider.tick.plist
      Проверка:   launchctl print gui/$(id -u)/com.traider.tick
-     Снятие:     launchctl bootout gui/$(id -u)/com.traider.tick -->
-<plist version="1.0">
+     Снятие:     launchctl bootout gui/$(id -u)/com.traider.tick --><plist version="1.0">
 <dict>
     <key>Label</key>
     <string>com.traider.tick</string>
@@ -23,8 +25,10 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>__HOME_DIR__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
+    <key>RunAtLoad</key>
+    <true/>
     <key>StartInterval</key>
     <integer>900</integer>
     <key>StandardOutPath</key>

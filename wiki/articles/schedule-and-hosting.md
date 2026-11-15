@@ -5,7 +5,7 @@ type: leaf
 tags: ['operations', 'schedule', 'hosting']
 categories: ['operations']
 created: 2026-11-14T15:43:20+00:00
-modified: 2026-11-15T10:21:06+00:00
+modified: 2026-11-15T10:45:00+00:00
 ---
 
 # Расписание и место работы
@@ -14,11 +14,13 @@ modified: 2026-11-15T10:21:06+00:00
 
 Идёт на Mac владельца (его решение). Системный планировщик `launchd` запускает `uv run traider tick` каждые 15 минут, вывод пишется в папку `logs/`. Mac должен не спать в часы торгов США.
 
-Шаблон лежит в `ops/com.traider.tick.plist`: запуск каждые 900 секунд, рабочий каталог проекта, вывод в `logs/tick.log`. В нём есть метка `__PROJECT_DIR__`, которую владелец заменяет путём к проекту; каталог `logs/` создаётся заранее. Код шаблон не ставит, это делает только владелец:
+Шаблон лежит в `ops/com.traider.tick.plist`: запуск каждые 900 секунд, рабочий каталог проекта, вывод в `logs/tick.log`. В нём есть метки `__PROJECT_DIR__` (путь к проекту) и `__HOME_DIR__` (домашний каталог, для PATH с `~/.local/bin`, куда ставится uv); есть `RunAtLoad`, поэтому первый тик идёт сразу при загрузке, а не через 900 секунд. Владелец проверяет `which uv`: каталог uv должен быть в PATH шаблона. Каталог `logs/` создаётся заранее. Отслеживаемый шаблон на месте не правится: владелец копирует заполненный файл в `~/Library/LaunchAgents/com.traider.tick.plist` и загружает оттуда, тогда расписание переживает перезагрузку (задание, загруженное из другого места, пропадает после выхода из системы или перезагрузки, и проверка HP молча прекращается). Ничто в проекте задание не ставит: это делает только владелец, вручную.
 
-- установка: `launchctl bootstrap gui/$(id -u) ops/com.traider.tick.plist`;
+- копия: `cp ops/com.traider.tick.plist ~/Library/LaunchAgents/com.traider.tick.plist`, затем замена меток в копии;
+- установка: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.traider.tick.plist`;
 - проверка: `launchctl print gui/$(id -u)/com.traider.tick`;
-- снятие: `launchctl bootout gui/$(id -u)/com.traider.tick`.
+- журнал тика: `tail -f logs/tick.log`;
+- снятие: `launchctl bootout gui/$(id -u)/com.traider.tick`, затем удалить копию из `~/Library/LaunchAgents/`.
 
 Требование «Mac не спит в часы торгов США» остаётся главным: на спящей машине тик не идёт.
 
