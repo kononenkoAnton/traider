@@ -113,6 +113,8 @@ blockquote{margin:16px 0 0;padding:0 0 0 14px;border-left:2px solid var(--axis);
 .multi figcaption{font-size:13px;margin-bottom:6px;display:flex;flex-wrap:wrap;align-items:center;gap:2px 8px}
 .multi figcaption span{color:var(--ink2);margin-left:auto;font-variant-numeric:tabular-nums}
 .multi figcaption small{flex-basis:100%;color:var(--ink2);font-size:12px}
+.h3{font-size:14px;font-weight:650;margin:28px 0 4px}
+.key.dash{height:0;border-top:2px dashed var(--muted);background:transparent}
 .three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px 40px}
 .three h3{font-size:14px;font-weight:650;margin:0 0 6px}
 .three p{margin:0 0 6px;font-size:13px;max-width:44ch}
@@ -199,6 +201,11 @@ footer{margin-top:36px;padding-top:16px;border-top:1px solid var(--hair);color:v
     <p class="note">Каждый день агент называет вероятность, что бумага обгонит рынок за 5 дней. Точки на диагонали значат, что его «70%» сбывается в 70% случаев. Оценка Брайера: чем меньше, тем лучше; эталон — всегда называть среднюю долю. Прогнозы за весь прогон.</p>
     <div class="multi" id="forecasts"></div>
     <details id="fc-more"><summary>Те же данные таблицей</summary><div class="scroll" id="fc-table"></div></details>
+    <h3 class="h3">Оценка по времени</h3>
+    <p class="note">Брайер по созревшим прогнозам по 20 бумагам панели, данным до этого дня включительно. Чем ниже линия, тем лучше. Пунктир — эталон «всегда называть среднюю долю»: линия ниже пунктира значит, что прогнозы лучше эталона. Период и участники берутся из фильтров.</p>
+    <div class="legend" id="bt-legend"></div>
+    <div id="brier-time"></div>
+    <details id="bt-more"><summary>Те же данные таблицей</summary><div class="scroll" id="bt-table"></div></details>
   </section>
 
   <section>
@@ -257,6 +264,7 @@ const META = DATA.meta || {};
 const DAYS = DATA.days || [];
 const N = DAYS.length;
 const num = x => typeof x === "number" && isFinite(x);
+const own = (map, k) => map && typeof map === "object" && Object.prototype.hasOwnProperty.call(map, k) ? map[k] : undefined;
 const MODEL = m => { const r = /^claude-([a-z]+)-(\d+)-(\d+)/.exec(String(m || "")); return r ? `${r[1][0].toUpperCase()}${r[1].slice(1)} ${r[2]}.${r[3]}` : String(m || ""); };
 const P = (DATA.participants || []).map(p => ({
   ...p, color: ORDER.includes(p.id) ? `var(--s${ORDER.indexOf(p.id) + 1})` : "var(--muted)",
@@ -324,7 +332,8 @@ function ticks(min, max, count) {
   for (let v = Math.ceil(min / step) * step; v <= max + step * 1e-6; v += step) out.push(+v.toFixed(6));
   return out;
 }
-const pill = (on, label, click, color) => h("button", { class: "pill", "aria-pressed": String(on), onclick: click },
+function refocus(key) { const el = [...document.querySelectorAll("[data-key]")].find(e => e.dataset.key === key); if (el) el.focus(); }
+const pill = (on, label, click, color, key) => h("button", { class: "pill", "aria-pressed": String(on), "data-key": key, onclick: () => { click(); refocus(key); } },
   color ? h("i", { class: "dot", style: `background:${color}` }) : null, label);
 
 /* ---------- заголовок ---------- */
@@ -348,12 +357,12 @@ function renderHeader() {
 /* ---------- фильтры ---------- */
 function renderFilters() {
   put("f-range", h("span", {}, "Период"), ...RANGES.map(([id, name]) =>
-    pill(state.range === id, name, () => { state.range = id; render(); })));
+    pill(state.range === id, name, () => { state.range = id; render(); }, null, `range:${id}`)));
   put("f-who", h("span", {}, "Участники"), ...P.map(p =>
     pill(state.on.has(p.id), p.id, () => {
       if (state.on.has(p.id)) { if (state.on.size > 1) state.on.delete(p.id); } else state.on.add(p.id);
       render();
-    }, p.color)));
+    }, p.color, `who:${p.id}`)));
 }
 
 /* ---------- сводка ---------- */
@@ -367,7 +376,7 @@ function verdictMark(v) {
   return g;
 }
 function verdictCell(p) {
-  const word = VERDICT[p.verdict] || DASH;
+  const word = own(VERDICT, p.verdict) || String(p.verdict ?? DASH);
   return h("span", { class: "verdict" }, verdictMark(p.verdict), h("span", {}, word,
     p.dead ? h("small", {}, "погиб, вердикт окончательный") : PRELIM ? h("small", {}, "предварительный") : null));
 }
@@ -403,14 +412,45 @@ function renderSummary() {
 }
 
 /* ---------- капитал ---------- */
-const curve = (key, pid) => ((DATA[key] || {})[pid]) || [];
+const curve = (key, pid) => own(DATA[key] || {}, pid) || [];
 const at = (arr, i) => num(arr[i]) ? arr[i] : null;
+/* Кривые участника начинаются точкой старта перед его первым днём сессии: точка i страницы (0 это старт отчёта)
+   у участника стоит под номером i - OFF. Кривая, которая не помещается в дни отчёта, не рисуется. */
+const OFF = Object.fromEntries(P.map(p => {
+  const ds = curveSessions(p.id).map(x => x.day).filter(d => DAYS.includes(d)).sort();
+  return [p.id, ds.length ? DAYS.indexOf(ds[0]) : 0];
+}));
+function curveSessions(pid) { return own(DATA.sessions || {}, pid) || []; }
+const fits = pid => { const len = curve("equity", pid).length; return len > 0 && OFF[pid] + len - 1 <= N; };
+const val = (arr, pid, i) => fits(pid) ? at(arr, i - OFF[pid]) : null;
+const eqAt = (pid, i) => val(curve("equity", pid), pid, i);
 function botsFor(ps) { return ps.find(p => p.id === state.bots) || ps[0] || null; }
+function crosshair(svg, o) {
+  const cross = s("g", { style: "display:none" }, s("line", { y1: o.m.t, y2: o.H - o.m.b, style: "stroke:var(--axis);stroke-width:1" }));
+  const dots = o.series.map(x => { const c = s("circle", { r: 4.5, style: `fill:${x.color};stroke:var(--page);stroke-width:2` }); cross.append(c); return c; });
+  svg.append(cross);
+  const hit = s("rect", { x: o.m.l, y: o.m.t, width: o.W - o.m.l - o.m.r, height: o.H - o.m.t - o.m.b, style: "fill:transparent", tabindex: 0, "aria-label": o.aria });
+  let cur = o.hi;
+  const point = (i, where) => {
+    cur = i; cross.style.display = ""; cross.firstChild.setAttribute("x1", o.X(i)); cross.firstChild.setAttribute("x2", o.X(i));
+    o.series.forEach((x, k) => { const v = x.get(i); dots[k].style.display = v == null ? "none" : ""; if (v != null) { dots[k].setAttribute("cx", o.X(i)); dots[k].setAttribute("cy", o.Y(v)); } });
+    showTip(where, o.title(i), o.rows(i));
+  };
+  const pick = px => Math.max(o.lo, Math.min(o.hi, Math.round(o.lo + (px - o.m.l) / (o.W - o.m.l - o.m.r) * Math.max(1, o.hi - o.lo))));
+  hit.addEventListener("pointermove", ev => { const r = svg.getBoundingClientRect(); point(pick((ev.clientX - r.left) * o.W / r.width), { x: ev.clientX, y: ev.clientY }); });
+  const off = () => { cross.style.display = "none"; hideTip(); };
+  hit.addEventListener("pointerleave", off); hit.addEventListener("blur", off);
+  const fromKey = i => { const r = svg.getBoundingClientRect(); point(i, { x: r.left + o.X(i) * r.width / o.W, y: r.top + r.height * .3 }); };
+  hit.addEventListener("focus", () => fromKey(cur < o.lo ? o.hi : cur));
+  hit.addEventListener("keydown", ev => { if (ev.key === "ArrowLeft") { fromKey(Math.max(o.lo, cur - 1)); ev.preventDefault(); } if (ev.key === "ArrowRight") { fromKey(Math.min(o.hi, cur + 1)); ev.preventDefault(); } });
+  svg.append(hit);
+}
+const pathOf = (idx, X, Y, f) => { let k = 0; return idx.filter(i => f(i) != null).map(i => `${k++ ? "L" : "M"}${X(i).toFixed(1)},${Y(f(i)).toFixed(1)}`).join(""); };
 function renderEquity() {
   const ps = shown(), bp = botsFor(ps);
-  put("f-bots", h("span", {}, "Случайные боты для"), ...ps.map(p => pill(bp && bp.id === p.id, p.id, () => { state.bots = p.id; renderEquity(); }, p.color)));
+  put("f-bots", h("span", {}, "Случайные боты для"), ...ps.map(p => pill(bp && bp.id === p.id, p.id, () => { state.bots = p.id; renderEquity(); }, p.color, `bots:${p.id}`)));
   if (N === 0) {
-    put("eq-legend", );
+    put("eq-legend");
     put("equity", empty("Кривые появятся после первого дня сессий."));
     $("eq-more").hidden = true;
     return;
@@ -418,73 +458,71 @@ function renderEquity() {
   $("eq-more").hidden = false;
   const a = i0(), span = Math.max(1, N - a), W = Math.max(560, $("equity").clientWidth || 1120), H = 330, m = { l: 58, r: 18, t: 10, b: 30 };
   const idx = []; for (let i = a; i <= N; i++) idx.push(i);
-  const band = bp ? DATA.band && DATA.band[bp.id] || {} : {}, spy = DATA.spy || [];
-  const B = k => band[k] || [];
-  const vals = idx.flatMap(i => [at(B("p5"), i), at(B("p95"), i), at(spy, i), ...ps.map(p => at(curve("equity", p.id), i))]).filter(num);
+  const lined = ps.filter(p => fits(p.id)), lost = ps.filter(p => !fits(p.id));
+  const band = bp && fits(bp.id) ? own(DATA.band || {}, bp.id) || {} : null;
+  const B = (k, i) => band ? val(band[k] || [], bp.id, i) : null;
+  const spy = DATA.spy || [], S = i => at(spy, i);
+  const vals = idx.flatMap(i => [B("p5", i), B("p95", i), S(i), ...lined.map(p => eqAt(p.id, i))]).filter(num);
+  if (!vals.length) vals.push(START ?? 0);
   const lo = Math.min(...vals), hi = Math.max(...vals), pad = Math.max(1, (hi - lo) * .05);
   const tk = ticks(lo - pad, hi + pad, 5);
   const y0 = Math.min(tk[0], lo - pad), y1 = Math.max(tk[tk.length - 1], hi + pad);
   const X = i => m.l + (W - m.l - m.r) * (i - a) / span, Y = v => m.t + (H - m.t - m.b) * (1 - (v - y0) / (y1 - y0));
-  const pts = arr => idx.filter(i => at(arr, i) != null);
-  const line = arr => pts(arr).map((i, k) => `${k ? "L" : "M"}${X(i).toFixed(1)},${Y(arr[i]).toFixed(1)}`).join("");
-  const area = (lo, hi) => { const ii = pts(lo).filter(i => at(hi, i) != null); if (!ii.length) return ""; return ii.map((i, k) => `${k ? "L" : "M"}${X(i).toFixed(1)},${Y(hi[i]).toFixed(1)}`).join("") + ii.slice().reverse().map(i => `L${X(i).toFixed(1)},${Y(lo[i]).toFixed(1)}`).join("") + "Z"; };
+  const area = (fl, fh) => { const ii = idx.filter(i => fl(i) != null && fh(i) != null); if (!ii.length) return ""; return ii.map((i, k) => `${k ? "L" : "M"}${X(i).toFixed(1)},${Y(fh(i)).toFixed(1)}`).join("") + ii.slice().reverse().map(i => `L${X(i).toFixed(1)},${Y(fl(i)).toFixed(1)}`).join("") + "Z"; };
   const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Капитал участников по дням" });
   for (const v of tk) svg.append(
     s("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), style: `stroke:${v === START ? "var(--axis)" : "var(--hair)"};stroke-width:1` }),
     s("text", { x: m.l - 8, y: Y(v) + 4, "text-anchor": "end", class: "ax" }, usd(v)));
   const every = Math.ceil(idx.length / Math.max(2, Math.floor((W - m.l - m.r) / 64)));
   idx.forEach((i, k) => { if (k % every === 0 || i === N) svg.append(s("text", { x: X(i), y: H - 8, "text-anchor": "middle", class: "ax" }, xLabel(i))); });
-  if (bp) svg.append(s("path", { d: area(B("p5"), B("p95")), style: "fill:var(--band-wide)" }), s("path", { d: area(B("p25"), B("p75")), style: "fill:var(--band-mid)" }));
-  if (DATA.spy) svg.append(s("path", { d: line(spy), style: "fill:none;stroke:var(--muted);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round" }));
-  for (const p of ps) {
-    const arr = curve("equity", p.id), ii = pts(arr);
+  if (band) svg.append(s("path", { d: area(i => B("p5", i), i => B("p95", i)), style: "fill:var(--band-wide)" }), s("path", { d: area(i => B("p25", i), i => B("p75", i)), style: "fill:var(--band-mid)" }));
+  if (DATA.spy) svg.append(s("path", { d: pathOf(idx, X, Y, S), style: "fill:none;stroke:var(--muted);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round" }));
+  for (const p of lined) {
+    const ii = idx.filter(i => eqAt(p.id, i) != null);
     if (!ii.length) continue;
-    const last = ii[ii.length - 1];
-    svg.append(s("path", { d: line(arr), style: `fill:none;stroke:${p.color};stroke-width:2;stroke-linejoin:round;stroke-linecap:round` }),
-      s("circle", { cx: X(last), cy: Y(arr[last]), r: 4.5, style: `fill:${p.color};stroke:var(--page);stroke-width:2` }));
-    if (p.dead) svg.append(s("text", { x: X(last) + (X(last) > W * .8 ? -8 : 8), y: Y(arr[last]) - 9, "text-anchor": X(last) > W * .8 ? "end" : "start", class: "ax" }, "погиб"));
+    const last = ii[ii.length - 1], ly = Y(eqAt(p.id, last));
+    svg.append(s("path", { d: pathOf(idx, X, Y, i => eqAt(p.id, i)), style: `fill:none;stroke:${p.color};stroke-width:2;stroke-linejoin:round;stroke-linecap:round` }),
+      s("circle", { cx: X(last), cy: ly, r: 4.5, style: `fill:${p.color};stroke:var(--page);stroke-width:2` }));
+    if (p.dead) svg.append(s("text", { x: X(last) + (X(last) > W * .8 ? -8 : 8), y: ly - 9, "text-anchor": X(last) > W * .8 ? "end" : "start", class: "ax" }, "погиб"));
   }
-  const cross = s("g", { style: "display:none" }, s("line", { y1: m.t, y2: H - m.b, style: "stroke:var(--axis);stroke-width:1" }));
-  const dots = ps.map(p => { const c = s("circle", { r: 4.5, style: `fill:${p.color};stroke:var(--page);stroke-width:2` }); cross.append(c); return c; });
-  svg.append(cross);
-  const hit = s("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, style: "fill:transparent", tabindex: 0, "aria-label": "Капитал по дням: стрелки влево и вправо переключают дни" });
-  let cur = N;
-  const point = (i, where) => {
-    cur = i; cross.style.display = ""; cross.firstChild.setAttribute("x1", X(i)); cross.firstChild.setAttribute("x2", X(i));
-    ps.forEach((p, k) => { const v = at(curve("equity", p.id), i); dots[k].style.display = v == null ? "none" : ""; if (v != null) { dots[k].setAttribute("cx", X(i)); dots[k].setAttribute("cy", Y(v)); } });
-    const rows = ps.filter(p => at(curve("equity", p.id), i) != null).sort((q, r) => curve("equity", r.id)[i] - curve("equity", q.id)[i])
-      .map(p => ({ color: p.color, value: usd(curve("equity", p.id)[i]), name: p.id }));
-    if (at(spy, i) != null) rows.push({ color: "var(--muted)", value: usd(spy[i]), name: "SPY" });
-    if (bp && at(B("p25"), i) != null) rows.push({ value: `${usd(B("p25")[i])}–${nf0.format(B("p75")[i])}`, name: `половина ботов ${bp.id}` });
-    showTip(where, xLabel(i), rows);
-  };
-  hit.addEventListener("pointermove", ev => { const r = svg.getBoundingClientRect(); const px = (ev.clientX - r.left) * W / r.width; point(Math.max(a, Math.min(N, Math.round(a + (px - m.l) / (W - m.l - m.r) * span))), { x: ev.clientX, y: ev.clientY }); });
-  const off = () => { cross.style.display = "none"; hideTip(); };
-  hit.addEventListener("pointerleave", off); hit.addEventListener("blur", off);
-  const fromKey = i => { const r = svg.getBoundingClientRect(); point(i, { x: r.left + X(i) * r.width / W, y: r.top + r.height * .3 }); };
-  hit.addEventListener("focus", () => fromKey(cur < a ? N : cur));
-  hit.addEventListener("keydown", ev => { if (ev.key === "ArrowLeft") { fromKey(Math.max(a, cur - 1)); ev.preventDefault(); } if (ev.key === "ArrowRight") { fromKey(Math.min(N, cur + 1)); ev.preventDefault(); } });
-  svg.append(hit);
-  put("equity", svg);
-  put("eq-legend", ...ps.map(p => h("span", {}, h("i", { class: "key", style: `background:${p.color}` }), p.id)),
+  crosshair(svg, { W, H, m, X, Y, lo: a, hi: N, aria: "Капитал по дням: стрелки влево и вправо переключают дни", title: xLabel,
+    series: lined.map(p => ({ color: p.color, get: i => eqAt(p.id, i) })),
+    rows: i => {
+      const rows = lined.filter(p => eqAt(p.id, i) != null).sort((q, r) => eqAt(r.id, i) - eqAt(q.id, i)).map(p => ({ color: p.color, value: usd(eqAt(p.id, i)), name: p.id }));
+      if (S(i) != null) rows.push({ color: "var(--muted)", value: usd(S(i)), name: "SPY" });
+      if (B("p25", i) != null && B("p75", i) != null) rows.push({ value: `${usd(B("p25", i))}–${nf0.format(B("p75", i))}`, name: `половина ботов ${bp.id}` });
+      return rows;
+    } });
+  put("equity", svg, lost.length ? h("p", { class: "note", style: "margin:8px 0 0" }, `Кривую ${lost.map(p => p.id).join(", ")} не удалось совместить с днями отчёта, поэтому её нет на графике.`) : null);
+  put("eq-legend", ...lined.map(p => h("span", {}, h("i", { class: "key", style: `background:${p.color}` }), p.id)),
     DATA.spy ? h("span", {}, h("i", { class: "key", style: "background:var(--muted)" }), "SPY, купил и держал") : h("span", {}, "SPY: дневных свечей нет, линии нет"),
-    bp ? h("span", {}, h("i", { class: "sw", style: "background:var(--band-mid);box-shadow:0 0 0 3px var(--band-wide)" }), `случайные боты ${bp.id}: половина и 90% из них`) : null);
+    band ? h("span", {}, h("i", { class: "sw", style: "background:var(--band-mid);box-shadow:0 0 0 3px var(--band-wide)" }), `случайные боты ${bp.id}: половина и 90% из них`) : null);
   const cellOf = v => h("td", {}, v == null ? DASH : usd(v));
-  put("eq-table", h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "День"), ...ps.map(p => h("th", {}, p.id)), h("th", {}, "SPY"), bp ? h("th", {}, `Боты ${bp.id}, середина`) : null)),
-    h("tbody", {}, idx.map(i => h("tr", {}, h("td", {}, xLabel(i)), ...ps.map(p => cellOf(at(curve("equity", p.id), i))), cellOf(at(spy, i)), bp ? cellOf(at(B("p50"), i)) : null)))));
+  put("eq-table", h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "День"), ...lined.map(p => h("th", {}, p.id)), h("th", {}, "SPY"), band ? h("th", {}, `Боты ${bp.id}, середина`) : null)),
+    h("tbody", {}, idx.map(i => h("tr", {}, h("td", {}, xLabel(i)), ...lined.map(p => cellOf(eqAt(p.id, i))), cellOf(S(i)), band ? cellOf(B("p50", i)) : null)))));
 }
 
 /* ---------- деньги и токены ---------- */
-const costOf = (pid, d) => { const c = ((DATA.costs || {})[pid] || [])[d]; return num(c) ? c : null; };
+const costOf = (pid, d) => { const c = (own(DATA.costs || {}, pid) || [])[d - (OFF[pid] || 0)]; return num(c) ? c : null; };
+const costMissing = (pid, d) => { const x = SESS[pid] && SESS[pid].get(DAYS[d]); return !!x && x.status !== "missed" && costOf(pid, d) == null; };
+const MONTHS_NOM = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"];
+const monthName = ym => { const m = /^(\d{4})-(\d\d)$/.exec(String(ym || "")); return m && +m[2] >= 1 && +m[2] <= 12 ? `${MONTHS_NOM[+m[2] - 1]} ${m[1]}` : null; };
 function renderMoney() {
   const a = i0(), ps = shown(), days = []; for (let d = a; d < N; d++) days.push(d);
   const totals = days.map(d => ps.reduce((t, p) => t + (costOf(p.id, d) || 0), 0));
+  const gap = days.map(d => ps.some(p => costMissing(p.id, d)));
+  const total = k => gap[k] ? `${usd2(totals[k])}, не всё записано` : usd2(totals[k]);
   const spent = totals.reduce((x, y) => x + y, 0);
-  const all = ps.reduce((t, p) => t + (num(((DATA.summary || {})[p.id] || {}).cost) ? DATA.summary[p.id].cost : 0), 0);
-  const credits = num(META.credits_month_usd) ? META.credits_month_usd : null;
-  $("money-note").textContent = `За период потрачено ${usd2(spent)}, за весь прогон ${usd2(all)}${credits ? `; кредитов на месяц ${usd(credits)}` : ""}. Прогноза расхода на месяц отчёт пока не считает.`;
+  const mo = DATA.money || {}, credits = num(META.credits_month_usd) ? META.credits_month_usd : null, month = monthName(mo.month);
+  $("money-note").textContent = [`За период у выбранных участников потрачено ${usd2(spent)}${gap.some(Boolean) ? " без сессий, чья стоимость не записана" : ""}.`,
+    `Столбики и эта сумма следуют фильтрам; траты месяца, прогноз на месяц и траты за прогон считаются по всем участникам вместе, потому что кредиты общие.`,
+    `За весь прогон потрачено ${usd2(mo.run_spend_usd)}.`].join(" ");
+  const meter = !(credits && month && num(mo.month_spend_usd)) ? h("p", { class: "note", style: "margin:6px 0 0" }, "Трат по месяцу пока нет: сессий ещё не было.")
+    : h("div", { class: "progress", style: "margin-top:6px" },
+      h("div", { class: "bar", style: "width:160px", role: "img", "aria-label": `${month}: потрачено ${usd2(mo.month_spend_usd)} из ${usd(credits)}` }, h("i", { style: `width:${Math.min(100, 100 * mo.month_spend_usd / credits)}%` })),
+      h("span", {}, `${month}: потрачено ${usd2(mo.month_spend_usd)} из ${usd(credits)} кредитов у всех участников; прогноз на месяц ${usd2(mo.month_forecast_usd)}`));
   if (!days.length) {
-    put("money", empty("Расходов пока нет: сессий ещё не было."));
+    put("money", empty("Расходов пока нет: сессий ещё не было."), month ? meter : null);
     $("money-more").hidden = true;
   } else {
     $("money-more").hidden = false;
@@ -496,7 +534,7 @@ function renderMoney() {
       s("text", { x: m.l - 8, y: Y(v) + 4, "text-anchor": "end", class: "ax" }, usdTick(v)));
     const labelEvery = Math.ceil(days.length / Math.max(2, Math.floor((W - m.l - m.r) / 48)));
     days.forEach((d, k) => {
-      const cx = m.l + slot * (k + .5), g = s("g", { tabindex: 0, role: "img", "aria-label": `${dayLabel(DAYS[d])}: ${usd2(totals[k])}` });
+      const cx = m.l + slot * (k + .5), g = s("g", { tabindex: 0, role: "img", "aria-label": `${dayLabel(DAYS[d])}: ${total(k)}` });
       let acc = 0;
       const parts = ps.filter(p => costOf(p.id, d) > 0);
       parts.forEach((p, j) => {
@@ -507,15 +545,14 @@ function renderMoney() {
       g.append(s("rect", { x: cx - slot / 2, y: m.t, width: slot, height: H - m.t - m.b, style: "fill:transparent" }));
       svg.append(g);
       if (k % labelEvery === 0) svg.append(s("text", { x: cx, y: H - 8, "text-anchor": "middle", class: "ax" }, dayLabel(DAYS[d])));
-      const rows = () => [...ps.map(p => ({ color: p.color, value: costCell(p.id, d), name: p.id })), { value: usd2(totals[k]), name: "всего" }];
+      const rows = () => [...ps.map(p => ({ color: p.color, value: costCell(p.id, d), name: p.id })), { value: total(k), name: "всего" }];
       g.addEventListener("pointermove", ev => { g.style.opacity = ".8"; showTip({ x: ev.clientX, y: ev.clientY }, dayLabel(DAYS[d]), rows()); });
       g.addEventListener("pointerleave", () => { g.style.opacity = ""; hideTip(); });
       g.addEventListener("focus", () => showTip(centre(g), dayLabel(DAYS[d]), rows())); g.addEventListener("blur", hideTip);
     });
-    const share = credits ? Math.min(100, 100 * all / credits) : 0;
-    put("money", svg, credits ? h("div", { class: "progress", style: "margin-top:6px" }, h("div", { class: "bar", style: "width:160px", role: "img", "aria-label": `Потрачено ${usd2(all)} из ${usd(credits)}` }, h("i", { style: `width:${share}%` })), h("span", {}, `за весь прогон ${usd2(all)} из ${usd(credits)} месячных кредитов`)) : null);
+    put("money", svg, meter);
     put("money-table", h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "День"), ...ps.map(p => h("th", {}, p.id)), h("th", {}, "Всего"))),
-      h("tbody", {}, days.map((d, k) => h("tr", {}, h("td", {}, dayLabel(DAYS[d])), ...ps.map(p => h("td", {}, costCell(p.id, d))), h("td", {}, usd2(totals[k])))))));
+      h("tbody", {}, days.map((d, k) => h("tr", {}, h("td", {}, dayLabel(DAYS[d])), ...ps.map(p => h("td", {}, costCell(p.id, d))), h("td", {}, total(k)))))));
   }
   const head = ["Токены за весь прогон", "Сессий", "Вход", "Из кэша", "Выход", "Поисков", "За сессию"];
   const rows = ps.flatMap(p => {
@@ -567,17 +604,17 @@ function renderGrid() {
     const x = SESS[p.id].get(d);
     if (!x) return h("td", {}, h("span", { class: "nocell", "aria-label": `${p.id}, ${dayLabel(d)}: сессии нет` }, DASH));
     const on = !!sel && sel.p === p.id && sel.d === d, st = x.status, b = x.buys || 0, sl = x.sells || 0;
-    return h("td", {}, h("button", { class: "cell", "aria-pressed": String(on), "aria-label": `${p.id}, ${dayLabel(d)}: ${STATUS_NAME[st] || "неизвестно"}`, onclick: () => { state.sel = { p: p.id, d }; renderGrid(); renderDetail(); } },
+    return h("td", {}, h("button", { class: "cell", "aria-pressed": String(on), "aria-label": `${p.id}, ${dayLabel(d)}: ${own(STATUS_NAME, st) || String(st ?? "неизвестно")}`, "data-key": `cell:${p.id}:${d}`, onclick: () => { state.sel = { p: p.id, d }; renderGrid(); renderDetail(); refocus(`cell:${p.id}:${d}`); } },
       glyph(st), h("small", {}, st === "missed" ? " " : `+${b} −${sl}`)));
   })));
   put("grid", h("table", { class: "grid" }, h("thead", {}, h("tr", {}, h("th", {}, ""), ...days.map(d => h("th", {}, dayLabel(d))))), h("tbody", {}, body)));
-  put("grid-legend", ...Object.keys(STATUS_NAME).map(k => h("span", {}, glyph(k), STATUS_NAME[k])), h("span", {}, "+2 −1: две покупки, одна продажа"), h("span", {}, "— сессии не было"));
+  put("grid-legend", ...Object.keys(STATUS_NAME).map(k => h("span", {}, glyph(k), STATUS_NAME[k])), h("span", {}, "+2 −1: за сессию две покупки и одна продажа"), h("span", {}, "— сессии не было"));
 }
 const LOOKED = { get_account: "Счёт", scan_universe: "Обзор всех бумаг", get_bars: "Цены и графики", get_news: "Новости", web_search: "Поиск в сети", research: "Вопросы аналитику" };
 function decisionLine(e) {
   const sym = e.symbol || "?";
   if (e.kind === "buy") return [`Купил ${sym} на ${usd2(e.notional)}${num(e.stop_price) ? `, стоп ${usd2(e.stop_price)}` : ""}`, e.thesis];
-  if (e.kind === "close") return [`Закрыл ${sym} ${num(e.fraction) && e.fraction < 1 ? `на ${nf0.format(e.fraction * 100)}%` : "целиком"}`, e.reason];
+  if (e.kind === "close") return [`Закрыл ${sym}${!num(e.fraction) ? (num(e.qty) ? `, ${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 4 }).format(e.qty)} шт.` : "") : e.fraction < 1 ? ` на ${nf0.format(e.fraction * 100)}%` : " целиком"}`, e.reason];
   if (e.kind === "raise_stop") return [`Поднял стоп ${sym} до ${usd2(e.stop_price)}`, e.reason];
   return [`${e.kind || "действие"} ${sym}`, e.reason];
 }
@@ -601,16 +638,16 @@ function renderDetail() {
   box.hidden = !N;
   if (!sel) return box.replaceChildren(h("p", { class: "note", style: "margin:0" }, N ? "В выбранном периоде у этих участников сессий нет." : "Сессий пока не было. Здесь появится разбор сессии: что агент смотрел, что решил и сколько это стоило."));
   const p = P.find(q => q.id === sel.p), x = SESS[p.id].get(sel.d), st = x.status;
-  const title = `${p.id}, ${dayLabel(sel.d)}: ${STATUS_NAME[st] || "неизвестно"}`;
+  const title = `${p.id}, ${dayLabel(sel.d)}: ${own(STATUS_NAME, st) || String(st ?? "неизвестно")}`;
   if (st === "missed") return box.replaceChildren(h("h3", {}, title), h("p", { class: "note", style: "margin:0" }, "Сессии не было: машина не работала в часы торгов. Проверка HP и стопы в этот день не работали."));
-  const looked = (x.looked || []).map(l => [`${LOOKED[l.name] || l.name}: ${l.calls} ${plural(l.calls, "раз", "раза", "раз")}`, l.example && Object.keys(l.example).length ? cut(json(l.example).replace(/\s+/g, " "), 140) : null]);
+  const looked = (x.looked || []).map(l => [`${own(LOOKED, l.name) || l.name}: ${l.calls} ${plural(l.calls, "раз", "раза", "раз")}`, l.example && Object.keys(l.example).length ? cut(json(l.example).replace(/\s+/g, " "), 140) : null]);
   if (!looked.length) looked.push(["Ничего не смотрел", null]);
   const decided = [];
   if (st === "failed") decided.push(["Сессия оборвалась", "Сделки, которые успели пройти, ниже."]);
   if (st === "cap") decided.push(["Сессия упёрлась в потолок", "Цикл оборван; сделки, которые успели пройти, ниже."]);
   for (const e of x.decisions || []) decided.push(decisionLine(e));
   if (!(x.decisions || []).length) decided.push(["Ничего не менял", null]);
-  const cage = (x.cage || []).map(c => [`Отказ: ${REJECT_LABEL[c.reason] || c.reason || "?"}${c.symbol ? `, ${c.symbol}` : ""}`, c.detail]);
+  const cage = (x.cage || []).map(c => [`Отказ: ${own(REJECT_LABEL, c.reason) || c.reason || "?"}${c.symbol ? `, ${c.symbol}` : ""}`, c.detail]);
   if (!cage.length) cage.push(["Отказов нет", null]);
   const u = x.usage || {};
   const price = [[`Ходов: ${num(x.turns) ? x.turns : DASH}`, st === "cap" ? "цикл оборван по потолку" : null],
@@ -655,7 +692,7 @@ function renderTrades() {
     return h("tr", {}, h("td", {}, dayLabel(t.day)), h("td", { class: "l" }, p ? who(p, true) : String(t.participant)), h("td", { class: "l" }, String(t.symbol ?? "")),
       h("td", {}, num(t.qty) ? new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 4 }).format(t.qty) : DASH),
       h("td", {}, `${num(t.entry) ? usd2(t.entry) : "н/д"} → ${num(t.exit) ? usd2(t.exit) : "н/д"}`),
-      h("td", { class: tone(t.pnl) }, num(t.pnl) ? (t.pnl >= 0 ? "+" : "") + usd2(t.pnl) : "н/д"), h("td", { class: "l" }, HOW[t.how] || String(t.how ?? DASH))); });
+      h("td", { class: tone(t.pnl) }, num(t.pnl) ? (t.pnl >= 0 ? "+" : "") + usd2(t.pnl) : "н/д"), h("td", { class: "l" }, own(HOW, t.how) || String(t.how ?? DASH))); });
   put("trades", h("table", {}, h("thead", {}, h("tr", {}, ["Дата", "Участник", "Бумага", "Штук", "Вход и выход, за штуку", "Итог", "Как закрыта"].map((x, i) => h("th", { class: [1, 2, 6].includes(i) ? "l" : null }, x)))), h("tbody", {}, rows)));
 }
 
@@ -689,6 +726,45 @@ function renderForecasts() {
   put("fc-table", h("table", {}, h("thead", {}, h("tr", {}, ["Участник", "Корзина", "Сказал в среднем", "Сбылось", "Прогнозов"].map(x => h("th", {}, x)))), h("tbody", {}, rows)));
 }
 
+function renderBrierTime() {
+  const ps = shown(), a = i0(), days = []; for (let d = a; d < N; d++) days.push(d);
+  const get = (pid, d) => { const x = (own(DATA.brier_series || {}, pid) || [])[d]; return x && num(x.brier) ? x : null; };
+  const ref = (pid, d) => { const x = get(pid, d); return x && num(x.reference) ? x.reference : null; };
+  const lined = ps.filter(p => days.some(d => get(p.id, d)));
+  if (!lined.length) {
+    put("bt-legend");
+    put("brier-time", empty("Созревших прогнозов пока нет: линия появится, когда созреет первый прогноз."));
+    $("bt-more").hidden = true;
+    return;
+  }
+  $("bt-more").hidden = false;
+  const W = Math.max(560, $("brier-time").clientWidth || 1120), H = 240, m = { l: 52, r: 18, t: 10, b: 30 };
+  const vals = days.flatMap(d => lined.flatMap(p => [get(p.id, d) && get(p.id, d).brier, ref(p.id, d)])).filter(num);
+  const tk = ticks(0, Math.max(...vals, .01), 4), top = tk[tk.length - 1];
+  const X = d => m.l + (W - m.l - m.r) * (days.length === 1 ? .5 : (d - a) / (days.length - 1)), Y = v => m.t + (H - m.t - m.b) * (1 - v / top);
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Оценка Брайера по дням" });
+  for (const v of tk) svg.append(s("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), style: `stroke:${v ? "var(--hair)" : "var(--axis)"};stroke-width:1` }),
+    s("text", { x: m.l - 8, y: Y(v) + 4, "text-anchor": "end", class: "ax" }, nf2.format(v)));
+  const every = Math.ceil(days.length / Math.max(2, Math.floor((W - m.l - m.r) / 64)));
+  days.forEach((d, k) => { if (k % every === 0 || k === days.length - 1) svg.append(s("text", { x: X(d), y: H - 8, "text-anchor": "middle", class: "ax" }, dayLabel(DAYS[d]))); });
+  for (const p of lined) svg.append(s("path", { d: pathOf(days, X, Y, d => ref(p.id, d)), style: "fill:none;stroke:var(--muted);stroke-width:1.5;stroke-dasharray:4 3" }));
+  for (const p of lined) {
+    const ii = days.filter(d => get(p.id, d)), last = ii[ii.length - 1];
+    svg.append(s("path", { d: pathOf(days, X, Y, d => get(p.id, d) && get(p.id, d).brier), style: `fill:none;stroke:${p.color};stroke-width:2;stroke-linejoin:round;stroke-linecap:round` }),
+      s("circle", { cx: X(last), cy: Y(get(p.id, last).brier), r: 4.5, style: `fill:${p.color};stroke:var(--page);stroke-width:2` }));
+  }
+  const refs = d => [...new Set(lined.map(p => ref(p.id, d)).filter(num).map(dec3))].join(" / ") || DASH;
+  crosshair(svg, { W, H, m, X, Y, lo: a, hi: N - 1, aria: "Оценка по дням: стрелки влево и вправо переключают дни", title: d => dayLabel(DAYS[d]),
+    series: lined.map(p => ({ color: p.color, get: d => get(p.id, d) && get(p.id, d).brier })),
+    rows: d => [...lined.filter(p => get(p.id, d)).sort((q, r) => get(q.id, d).brier - get(r.id, d).brier).map(p => ({ color: p.color, value: dec3(get(p.id, d).brier), name: `${p.id}, прогнозов ${get(p.id, d).n}` })),
+      { value: refs(d), name: "эталон" }] });
+  put("brier-time", svg);
+  put("bt-legend", ...lined.map(p => h("span", {}, h("i", { class: "key", style: `background:${p.color}` }), p.id)), h("span", {}, h("i", { class: "key dash" }), "эталон"));
+  put("bt-table", h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "День"), ...lined.map(p => h("th", {}, p.id)), h("th", {}, "Эталон"), h("th", {}, "Созревших прогнозов"))),
+    h("tbody", {}, days.map(d => h("tr", {}, h("td", {}, dayLabel(DAYS[d])), ...lined.map(p => h("td", {}, get(p.id, d) ? dec3(get(p.id, d).brier) : DASH)), h("td", {}, refs(d)),
+      h("td", {}, [...new Set(lined.map(p => get(p.id, d) && get(p.id, d).n).filter(num))].join(" / ") || DASH))))));
+}
+
 /* ---------- сравнения ---------- */
 function renderCompare() {
   const c = DATA.compare || {}, tw = c.twins || {}, la = c.ladder || {}, an = c.analyst || {};
@@ -700,7 +776,7 @@ function renderCompare() {
     h("div", {}, h("h3", {}, "Близнецы: opus-a и opus-b"), h("p", { class: "big" }, num(tw.diff_pp) ? signed(Math.abs(tw.diff_pp), " п.п.").replace("+", "") : DASH),
       h("p", {}, "Разница в доходности двух одинаковых участников."),
       h("p", {}, `Общих купленных бумаг: ${pct0(tw.common)}. Сейчас оба держат: ${(tw.held || []).length ? tw.held.join(", ") : "ничего общего"}. Согласие прогнозов: ${num(tw.forecast_corr) ? nf2.format(tw.forecast_corr) : DASH}.`),
-      opus ? h("p", {}, `Вердикт пары Opus по худшему из двух: ${VERDICT[opus] || opus}.`) : null),
+      opus ? h("p", {}, `Вердикт пары Opus по худшему из двух: ${own(VERDICT, opus) || opus}.`) : null),
     h("div", {}, h("h3", {}, "Лесенка моделей"), h("p", { class: "big" }, `${ret("haiku")}, ${ret("sonnet")}, ${ret("opus")}`), h("p", {}, "Haiku, Sonnet и среднее двух Opus."), h("p", {}, verdict(la.beyond_noise))),
     h("div", {}, h("h3", {}, "Аналитик"), h("p", { class: "big" }, signed(an.diff_pp, " п.п.")), h("p", {}, "Opus с аналитиком против среднего двух Opus, которые ищут сами."), h("p", {}, verdict(an.beyond_noise))));
 }
@@ -716,15 +792,15 @@ function renderIncidents() {
   const bad = list.filter(i => i.kind !== "good"), good = list.filter(i => i.kind === "good");
   const item = i => {
     const head = [i.day ? dayLabel(i.day) : null, i.participant, i.title].filter(Boolean).join(", ");
-    return h("li", {}, h("span", { style: `color:var(--${INC[i.kind] ? i.kind : "muted"});font-weight:700`, "aria-hidden": "true" }, INC[i.kind] || "•"),
+    return h("li", {}, h("span", { style: `color:var(--${own(INC, i.kind) ? i.kind : "muted"});font-weight:700`, "aria-hidden": "true" }, own(INC, i.kind) || "•"),
       h("span", {}, h("b", {}, head.charAt(0).toUpperCase() + head.slice(1) + "."), " ", String(i.text ?? "")));
   };
   put("incidents", ...(bad.length ? [] : [h("li", {}, h("span", { "aria-hidden": "true" }), h("span", {}, "Происшествий нет."))]), ...bad.map(item), ...good.map(item));
 }
 
-function render() { renderHeader(); renderFilters(); renderSummary(); renderEquity(); renderMoney(); renderGrid(); renderDetail(); renderPositions(); renderTrades(); renderForecasts(); renderCompare(); renderIncidents(); }
+function render() { renderHeader(); renderFilters(); renderSummary(); renderEquity(); renderMoney(); renderGrid(); renderDetail(); renderPositions(); renderTrades(); renderForecasts(); renderBrierTime(); renderCompare(); renderIncidents(); }
 render();
-let resizeTimer; addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { renderEquity(); renderMoney(); }, 120); });
+let resizeTimer; addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { renderEquity(); renderMoney(); renderBrierTime(); }, 120); });
 </script>
 </body>
 </html>
