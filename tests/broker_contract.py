@@ -28,8 +28,11 @@ def run_contract(make_broker, market):
     assert make_broker().account().peak_equity == flat.peak_equity
 
 
-def run_refusal_contract(make_broker, market):
-    """Отказы: негодная котировка даёт NoPrice, негодная заявка BrokerRejected; счёт не меняется."""
+def run_refusal_contract(make_broker, market, close_needs_quote: bool = True):
+    """Отказы: негодная котировка даёт NoPrice, негодная заявка BrokerRejected; счёт не меняется.
+
+    close_needs_quote=False у брокера, который продаёт по рынку и не ждёт нашей котировки: закрытие
+    уменьшает риск, поэтому оно не отказывает без котировки (его проверяет отдельный тест брокера)."""
     nan, day = float("nan"), "2026-12-01"
     b = make_broker()
     b.buy(day, "AAPL", 150.0, 186.0, "тезис", "r/1")
@@ -50,7 +53,7 @@ def run_refusal_contract(make_broker, market):
     for call in rejected:
         with pytest.raises(BrokerRejected):
             call()
-    for quote in (nan, None):
+    for quote in (nan, None) if close_needs_quote else ():
         if quote is None:
             del market.prices["AAPL"]
         else:

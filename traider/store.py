@@ -18,13 +18,14 @@ import json
 import os
 import uuid
 from collections.abc import Sequence
+from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 from traider.cage import Account, Position, SessionFacts
 
-DEFAULT_STATE = {"status": "active", "notes": "", "last_sync": None}
+DEFAULT_STATE = {"status": "active", "notes": "", "last_sync": None, "stops": {}, "entries": {}}
 
 
 def _dump_json(tmp: Path, data) -> None:
@@ -130,7 +131,7 @@ class RunStore:
 
     # состояние и счёт
     def state(self) -> dict:
-        return {**DEFAULT_STATE, **(_read_json(self.dir / "state.json") or {})}
+        return {**deepcopy(DEFAULT_STATE), **(_read_json(self.dir / "state.json") or {})}
 
     def update_state(self, **changes) -> dict:
         st = {**self.state(), **changes}
