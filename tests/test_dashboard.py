@@ -102,11 +102,38 @@ def test_failed_write_keeps_the_previous_page_and_leaves_no_temporary_file(tmp_p
     assert out.read_bytes() == before and sorted(p.name for p in tmp_path.iterdir()) == ["d.html"]
 
 
+def test_failure_while_writing_the_temporary_file_keeps_the_previous_page(tmp_path, monkeypatch):
+    import os
+    out = tmp_path / "d.html"
+    render(FIXTURE, out)
+    before, real = out.read_bytes(), os.fdopen
+
+    class Broken:
+        def __init__(self, f):
+            self.f = f
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.f.close()
+
+        def write(self, text):
+            self.f.write(text[:100])
+            raise OSError("диск полон")
+    monkeypatch.setattr("traider.dashboard.os.fdopen", lambda fd, *a, **k: Broken(real(fd, *a, **k)))
+    report = json.loads(json.dumps(FIXTURE))
+    report["meta"]["experiment"] = "другой"
+    with pytest.raises(OSError):
+        render(report, out)
+    assert out.read_bytes() == before and sorted(p.name for p in tmp_path.iterdir()) == ["d.html"]
+
+
 def test_template_pins_phrases_and_keys():
     t = pathlib.Path("traider/dashboard.html").read_text()
     for phrase in ["Сделок пока нет", "Созревших прогнозов пока нет", "Происшествий нет", "предварительный", "окончательный",
                    "погиб", "Случайные боты для", "Последние 10 дней", "Оценка по времени",
-                   "решение агента", "стоп", "ликвидация"]:
+                   "решение агента", "стоп", "ликвидация", "не всё записано"]:
         assert phrase in t, phrase
     for key in ["DATA.money", "DATA.brier_series"]:
         assert key in t, key
@@ -136,6 +163,7 @@ def late_starter() -> dict:
     r["costs"]["haiku"] = r["costs"]["haiku"][1:]
     r["sessions"]["haiku"] = r["sessions"]["haiku"][1:]
     r["brier_series"]["haiku"][0] = None
+    r["participants"][0].update(first_day="2026-12-02", day_offset=1)
     return r
 
 

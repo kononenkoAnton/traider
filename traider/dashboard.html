@@ -202,7 +202,7 @@ footer{margin-top:36px;padding-top:16px;border-top:1px solid var(--hair);color:v
     <div class="multi" id="forecasts"></div>
     <details id="fc-more"><summary>Те же данные таблицей</summary><div class="scroll" id="fc-table"></div></details>
     <h3 class="h3">Оценка по времени</h3>
-    <p class="note">Брайер по созревшим прогнозам по 20 бумагам панели, данным до этого дня включительно. Чем ниже линия, тем лучше. Пунктир — эталон «всегда называть среднюю долю»: линия ниже пунктира значит, что прогнозы лучше эталона. Период и участники берутся из фильтров.</p>
+    <p class="note">Точка дня — оценка Брайера прогнозов по бумагам панели, сделанных до этого дня включительно и созревших к моменту сборки этой страницы. Прогноз созревает через 5 торговых дней, поэтому последние дни повторяют предыдущее значение, пока их прогнозы не созреют. Оценка накопленная с начала прогона: фильтр периода только обрезает ось. Чем ниже линия, тем лучше. Пунктир — эталон «всегда называть среднюю долю», у каждого участника свой: линия ниже своего пунктира значит, что прогнозы лучше эталона.</p>
     <div class="legend" id="bt-legend"></div>
     <div id="brier-time"></div>
     <details id="bt-more"><summary>Те же данные таблицей</summary><div class="scroll" id="bt-table"></div></details>
@@ -415,13 +415,10 @@ function renderSummary() {
 const curve = (key, pid) => own(DATA[key] || {}, pid) || [];
 const at = (arr, i) => num(arr[i]) ? arr[i] : null;
 /* Кривые участника начинаются точкой старта перед его первым днём сессии: точка i страницы (0 это старт отчёта)
-   у участника стоит под номером i - OFF. Кривая, которая не помещается в дни отчёта, не рисуется. */
-const OFF = Object.fromEntries(P.map(p => {
-  const ds = curveSessions(p.id).map(x => x.day).filter(d => DAYS.includes(d)).sort();
-  return [p.id, ds.length ? DAYS.indexOf(ds[0]) : 0];
-}));
-function curveSessions(pid) { return own(DATA.sessions || {}, pid) || []; }
-const fits = pid => { const len = curve("equity", pid).length; return len > 0 && OFF[pid] + len - 1 <= N; };
+   у участника стоит под номером i - OFF, где OFF это day_offset из отчёта. Кривая без сдвига или не помещающаяся
+   в дни отчёта не рисуется. */
+const OFF = Object.fromEntries(P.map(p => [p.id, Number.isInteger(p.day_offset) && p.day_offset >= 0 ? p.day_offset : null]));
+const fits = pid => { const len = curve("equity", pid).length; return OFF[pid] != null && len > 1 && OFF[pid] + len - 1 <= N; };
 const val = (arr, pid, i) => fits(pid) ? at(arr, i - OFF[pid]) : null;
 const eqAt = (pid, i) => val(curve("equity", pid), pid, i);
 function botsFor(ps) { return ps.find(p => p.id === state.bots) || ps[0] || null; }
@@ -503,7 +500,7 @@ function renderEquity() {
 }
 
 /* ---------- деньги и токены ---------- */
-const costOf = (pid, d) => { const c = (own(DATA.costs || {}, pid) || [])[d - (OFF[pid] || 0)]; return num(c) ? c : null; };
+const costOf = (pid, d) => { if (OFF[pid] == null) return null; const c = (own(DATA.costs || {}, pid) || [])[d - OFF[pid]]; return num(c) ? c : null; };
 const costMissing = (pid, d) => { const x = SESS[pid] && SESS[pid].get(DAYS[d]); return !!x && x.status !== "missed" && costOf(pid, d) == null; };
 const MONTHS_NOM = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"];
 const monthName = ym => { const m = /^(\d{4})-(\d\d)$/.exec(String(ym || "")); return m && +m[2] >= 1 && +m[2] <= 12 ? `${MONTHS_NOM[+m[2] - 1]} ${m[1]}` : null; };
@@ -514,15 +511,22 @@ function renderMoney() {
   const total = k => gap[k] ? `${usd2(totals[k])}, не всё записано` : usd2(totals[k]);
   const spent = totals.reduce((x, y) => x + y, 0);
   const mo = DATA.money || {}, credits = num(META.credits_month_usd) ? META.credits_month_usd : null, month = monthName(mo.month);
-  $("money-note").textContent = [`За период у выбранных участников потрачено ${usd2(spent)}${gap.some(Boolean) ? " без сессий, чья стоимость не записана" : ""}.`,
+  const without = n => `у ${n} ${plural(n, "сессии", "сессий", "сессий")} стоимость неизвестна`;
+  const runGap = num(mo.sessions_without_cost) && mo.sessions_without_cost > 0, monthGap = num(mo.month_sessions_without_cost) && mo.month_sessions_without_cost > 0;
+  $("money-note").textContent = !month ? (credits ? `Кредиты общие для всех участников: ${usd(credits)} в месяц.` : "") : [
+    `За период у выбранных участников потрачено ${usd2(spent)}${gap.some(Boolean) ? " без сессий, чья стоимость не записана" : ""}.`,
     `Столбики и эта сумма следуют фильтрам; траты месяца, прогноз на месяц и траты за прогон считаются по всем участникам вместе, потому что кредиты общие.`,
-    `За весь прогон потрачено ${usd2(mo.run_spend_usd)}.`].join(" ");
-  const meter = !(credits && month && num(mo.month_spend_usd)) ? h("p", { class: "note", style: "margin:6px 0 0" }, "Трат по месяцу пока нет: сессий ещё не было.")
+    `Прогноз на месяц: траты месяца плюс средний расход дня сессии на каждый оставшийся торговый день месяца, то есть он считает, что сессия будет в каждый такой день, но не больше сессий, оставшихся до конца прогона.`,
+    runGap && !(mo.run_spend_usd > 0) ? `Сколько потрачено за весь прогон, неизвестно: ${without(mo.sessions_without_cost)}.`
+      : `За весь прогон потрачено ${usd2(mo.run_spend_usd)}${runGap ? `; не всё записано: ${without(mo.sessions_without_cost)}` : ""}.`].join(" ");
+  const forecast = num(mo.month_forecast_usd) ? `прогноз на месяц ${usd2(mo.month_forecast_usd)}` : "прогноза на месяц нет: ни одной записанной стоимости";
+  const meter = !(credits && month) ? null : !num(mo.month_spend_usd)
+    ? h("p", { class: "note", style: "margin:6px 0 0" }, `${month}: сколько потрачено, неизвестно; не всё записано: ${without(mo.month_sessions_without_cost || 0)}. ${forecast[0].toUpperCase()}${forecast.slice(1)}.`)
     : h("div", { class: "progress", style: "margin-top:6px" },
-      h("div", { class: "bar", style: "width:160px", role: "img", "aria-label": `${month}: потрачено ${usd2(mo.month_spend_usd)} из ${usd(credits)}` }, h("i", { style: `width:${Math.min(100, 100 * mo.month_spend_usd / credits)}%` })),
-      h("span", {}, `${month}: потрачено ${usd2(mo.month_spend_usd)} из ${usd(credits)} кредитов у всех участников; прогноз на месяц ${usd2(mo.month_forecast_usd)}`));
+      h("div", { class: "bar", style: "width:160px;flex:none", role: "img", "aria-label": `${month}: потрачено ${usd2(mo.month_spend_usd)} из ${usd(credits)}` }, h("i", { style: `width:${Math.min(100, 100 * mo.month_spend_usd / credits)}%` })),
+      h("span", {}, `${month}: потрачено ${usd2(mo.month_spend_usd)} из ${usd(credits)} кредитов у всех участников${monthGap ? `; не всё записано: ${without(mo.month_sessions_without_cost)}` : ""}; ${forecast}`));
   if (!days.length) {
-    put("money", empty("Расходов пока нет: сессий ещё не было."), month ? meter : null);
+    put("money", empty("Расходов пока нет: сессий ещё не было."), meter);
     $("money-more").hidden = true;
   } else {
     $("money-more").hidden = false;
@@ -753,16 +757,15 @@ function renderBrierTime() {
     svg.append(s("path", { d: pathOf(days, X, Y, d => get(p.id, d) && get(p.id, d).brier), style: `fill:none;stroke:${p.color};stroke-width:2;stroke-linejoin:round;stroke-linecap:round` }),
       s("circle", { cx: X(last), cy: Y(get(p.id, last).brier), r: 4.5, style: `fill:${p.color};stroke:var(--page);stroke-width:2` }));
   }
-  const refs = d => [...new Set(lined.map(p => ref(p.id, d)).filter(num).map(dec3))].join(" / ") || DASH;
+  const cell = (p, d) => { const x = get(p.id, d); return x ? `${dec3(x.brier)}, эталон ${dec3(x.reference)}, прогнозов ${x.n}` : DASH; };
   crosshair(svg, { W, H, m, X, Y, lo: a, hi: N - 1, aria: "Оценка по дням: стрелки влево и вправо переключают дни", title: d => dayLabel(DAYS[d]),
     series: lined.map(p => ({ color: p.color, get: d => get(p.id, d) && get(p.id, d).brier })),
-    rows: d => [...lined.filter(p => get(p.id, d)).sort((q, r) => get(q.id, d).brier - get(r.id, d).brier).map(p => ({ color: p.color, value: dec3(get(p.id, d).brier), name: `${p.id}, прогнозов ${get(p.id, d).n}` })),
-      { value: refs(d), name: "эталон" }] });
+    rows: d => lined.filter(p => get(p.id, d)).sort((q, r) => get(q.id, d).brier - get(r.id, d).brier)
+      .map(p => ({ color: p.color, value: dec3(get(p.id, d).brier), name: `${p.id}: эталон ${dec3(get(p.id, d).reference)}, прогнозов ${get(p.id, d).n}` })) });
   put("brier-time", svg);
   put("bt-legend", ...lined.map(p => h("span", {}, h("i", { class: "key", style: `background:${p.color}` }), p.id)), h("span", {}, h("i", { class: "key dash" }), "эталон"));
-  put("bt-table", h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "День"), ...lined.map(p => h("th", {}, p.id)), h("th", {}, "Эталон"), h("th", {}, "Созревших прогнозов"))),
-    h("tbody", {}, days.map(d => h("tr", {}, h("td", {}, dayLabel(DAYS[d])), ...lined.map(p => h("td", {}, get(p.id, d) ? dec3(get(p.id, d).brier) : DASH)), h("td", {}, refs(d)),
-      h("td", {}, [...new Set(lined.map(p => get(p.id, d) && get(p.id, d).n).filter(num))].join(" / ") || DASH))))));
+  put("bt-table", h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "День"), ...lined.map(p => h("th", {}, `${p.id}: Брайер, эталон, прогнозов`)))),
+    h("tbody", {}, days.map(d => h("tr", {}, h("td", {}, dayLabel(DAYS[d])), ...lined.map(p => h("td", {}, cell(p, d))))))));
 }
 
 /* ---------- сравнения ---------- */
