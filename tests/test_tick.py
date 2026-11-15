@@ -251,3 +251,36 @@ def test_run_with_an_unknown_status_gets_no_session_and_no_bookkeeping(world):
     market.clock = ny(2026, 12, 3, 10, 5)
     assert actions(tick(runs, market, mb, mc))["haiku"] == "safety"
     assert RunStore(runs / "pilot-1" / "haiku").sessions() == []
+
+
+# --- финальная волна, C1: один счёт Alpaca на один прогон ---
+
+def _second_experiment(example, name="official"):
+    toml = example.parent / f"{name}.toml"
+    toml.write_text(example.read_text().replace('experiment = "pilot-1"', f'experiment = "{name}"'))
+    return toml
+
+def test_start_refuses_a_second_alpaca_run_of_the_same_mode(tmp_path, example):
+    runs = tmp_path / "runs"; start_experiment(example, runs)
+    second = _second_experiment(example)
+    with pytest.raises(ValueError, match="pilot-1/opus-a"):
+        start_experiment(second, runs)
+    assert not (runs / "official").exists()
+    RunStore(runs / "pilot-1" / "opus-a").update_state(status="finished")
+    assert start_experiment(second, runs) == runs / "official"
+
+def test_two_alpaca_runs_of_one_mode_both_get_an_error_and_no_broker(world, example):
+    runs, market, _, mc, _ = world
+    pilot = RunStore(runs / "pilot-1" / "opus-a")
+    pilot.update_state(status="finished"); start_experiment(_second_experiment(example), runs)
+    pilot.update_state(status="finishing", finish_day="2026-11-30")    # пилот снова не завершён
+    built = []
+    def broker(cfg, store):
+        built.append(f"{cfg.experiment}/{cfg.participant}"); return SimBroker(cfg, store, market)
+    got = tick(runs, market, broker, mc)
+    errors = [r for r in got if r["action"] == "error"]
+    assert [r["participant"] for r in errors] == ["opus-a", "opus-a"]
+    assert all("pilot-1/opus-a" in r["error"] and "official/opus-a" in r["error"] and "ничего не отправлено" in r["error"]
+               for r in errors)
+    assert not any(b.endswith("/opus-a") for b in built)
+    assert [r["action"] for r in got].count("session") == 8

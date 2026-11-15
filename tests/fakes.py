@@ -255,6 +255,9 @@ class FakeAlpacaApi:
     def order_ids_since(self, since):
         return [o["id"] for o in self.orders.values() if since is None or o["submitted_at"] >= since]
 
+    def open_order_ids(self):
+        return [o["id"] for o in self.orders.values() if o["status"] in self.OPEN]
+
 
 class Block(SimpleNamespace):
     """Блок ответа модели: атрибуты как у блоков SDK, плюс model_dump."""

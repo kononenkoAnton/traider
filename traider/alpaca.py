@@ -14,6 +14,11 @@
 Каждая заявка брокера несёт id с префиксом прогона (`эксперимент/участник/run_uid/`), журнал хранит id
 вызывающего; чужие заявки на том же счёте ни `sync`, ни поиск по id не видят. Рабочий стоп переносится
 одним шагом (`replace_stop`), продажа не превышает того, что есть на счёте в момент отправки.
+Счёт принадлежит одному прогону. Позиция без желаемого стопа в состоянии значит, что на счёте торгует ещё
+кто-то: любая операция, читающая счёт (`account`, `buy`, `close`, `raise_stop`, `ensure_stops`, `sync`,
+`liquidate`), тогда поднимает RuntimeError с тикерами до любой заявки; стопа «по умолчанию» нет, чужое не
+продаётся. Перед записью `run_uid` (первое обращение прогона) счёт проверяется: деньги в пределах 2% от
+`cfg.start_equity`, ни позиций, ни открытых заявок; иначе ошибка, `run_uid` не пишется.
 """
 import logging
 import time
@@ -90,6 +95,7 @@ class AlpacaApi(Protocol):
     def cancel(self, order_id: str) -> None: ...
     def filled_orders_since(self, since: datetime | None) -> list[dict]: ...   # как `order()`, любые заявки с исполнением, уже не идущие; отбор по времени исполнения
     def order_ids_since(self, since: datetime | None) -> list[str]: ...   # все заявки счёта, отбор по времени подачи
+    def open_order_ids(self) -> list[str]: ...   # все открытые заявки счёта любого вида
 
 
 class AlpacaSdkApi:
@@ -187,6 +193,9 @@ class AlpacaSdkApi:
     def order_ids_since(self, since):
         return [str(o.id) for o in self._orders(QueryOrderStatus.ALL, since)]
 
+    def open_order_ids(self):
+        return [str(o.id) for o in self._orders(QueryOrderStatus.OPEN, None)]
+
 
 def make_alpaca_api(cfg: RunConfig, env: Mapping[str, str]) -> AlpacaSdkApi:
     live = cfg.mode == "live"   # живой режим только по конфигу прогона и только со своими ключами
@@ -218,10 +227,22 @@ class AlpacaBroker:
         if self._run_ids is None:
             st = self.store.state()
             if "run_uid" not in st:   # первое обращение прогона к брокеру
+                self._check_clean()
                 self.store.update_state(run_uid=uuid.uuid4().hex[:8], broker_since=self.market.now().isoformat())
                 st = self.store.state()
             self._run_ids = (f"{self.cfg.experiment}/{self.cfg.participant}/{st['run_uid']}/", st["broker_since"])
         return self._run_ids
+
+    def _check_clean(self) -> None:
+        """Счёт перед первым обращением: деньги в пределах 2% от начального капитала, ни позиций, ни открытых
+        заявок (без позиций капитал это деньги). Иначе ошибка, run_uid не записывается, проверка повторится."""
+        cash, held = self.api.cash_and_positions()
+        orders = self.api.open_order_ids()
+        start = self.cfg.start_equity
+        if held or orders or abs(cash - start) > 0.02 * start:
+            raise RuntimeError(f"счёт Alpaca не готов к прогону: деньги ${cash:.2f} при начальном капитале "
+                               f"${start:.2f} (допуск 2%), позиций {len(held)}, открытых заявок {len(orders)}; "
+                               "нужен счёт только под этот прогон. run_uid не записан, ничего не отправлено")
 
     def client_id(self, caller_id: str) -> str:
         """Id заявки у брокера: префикс прогона плюс id вызывающего (в журнале остаётся id вызывающего)."""
@@ -234,8 +255,13 @@ class AlpacaBroker:
 
     # --- чтение ---
     def _held(self) -> tuple[float, dict[str, tuple[float, float]]]:
-        """Деньги и позиции у брокера; цену входа помним в состоянии: после продажи брокер её уже не отдаёт."""
+        """Деньги и позиции у брокера; цену входа помним в состоянии: после продажи брокер её уже не отдаёт.
+        Бумага без желаемого стопа в состоянии не наша: счёт не принадлежит одному прогону, и операция
+        останавливается раньше любой заявки."""
         cash, held = self.api.cash_and_positions()
+        if foreign := sorted(s for s in held if s not in self.store.state()["stops"]):
+            raise RuntimeError(f"на счёте Alpaca позиции, которых нет у этого прогона: {', '.join(foreign)}; "
+                               "счёт не принадлежит одному прогону, ничего не отправлено")
         known = self.store.state()["entries"]
         entries = {**known, **{s: avg for s, (_, avg) in held.items()}}
         seen_before = self.store.state().get("seen_qty", {})   # последнее известное количество: нужно доле проданного
@@ -266,8 +292,8 @@ class AlpacaBroker:
 
     def account(self) -> Account:
         cash, held = self._held()
-        stops = self.store.state()["stops"]   # бумага без желаемого стопа (куплена не нами) идёт со стопом 0: риск полный
-        positions = tuple(Position(s, q, avg, stops.get(s, 0.0)) for s, (q, avg) in sorted(held.items()))
+        stops = self.store.state()["stops"]   # у каждой бумаги он есть: _held проверил
+        positions = tuple(Position(s, q, avg, stops[s]) for s, (q, avg) in sorted(held.items()))
         saved = self.store.account()
         acct = Account(cash, positions, max(saved.peak_equity if saved else 0.0, self.cfg.start_equity))
         prices = self.market.last_prices(held)
@@ -394,6 +420,7 @@ class AlpacaBroker:
     def buy(self, day, symbol, notional, stop_price, thesis, client_order_id) -> Fill:
         if (done := self._repeat(client_order_id, symbol)) is not None:
             return done
+        cash, _ = self._held()   # чужая позиция на счёте останавливает покупку до любой заявки
         wire = self.client_id(client_order_id)
         oid = self._find(wire, symbol, "buy")
         if oid is None:
@@ -401,7 +428,7 @@ class AlpacaBroker:
                 if not usable(x):
                     raise ValueError(f"{name} должно быть конечным положительным числом: {x}")
             self._price(symbol)   # без нашей котировки не покупаем; цену исполнения даёт брокер
-            if notional > self.api.cash_and_positions()[0] + 1e-9:
+            if notional > cash + 1e-9:
                 raise ValueError(f"сумма {notional} больше свободных денег")
         stop = _tick(stop_price)
         before = self.store.state()["stops"].get(symbol)
@@ -502,13 +529,7 @@ class AlpacaBroker:
         placed, errors = [], []
         for symbol, (qty, entry) in held.items():
             try:
-                if symbol not in stops:   # куплено мимо нас: без стопа не оставляем
-                    default = _tick(entry * (1 - self.cfg.limits.stop_max))
-                    self._set_stop(symbol, default)
-                    quote = quotes.get(symbol)
-                    self._log(day, "raise_stop", symbol, None, quote if usable(quote) else None,
-                              stop_price=default, reason="default_stop")
-                want = self.store.state()["stops"][symbol]
+                want = stops[symbol]   # у каждой бумаги он есть: _held проверил
                 quote = quotes.get(symbol)
                 if usable(quote) and quote <= want and not _stop_ok(open_stops.get(symbol), qty, want):
                     # цена уже у стопа или ниже: брокер такой стоп не примет, а стоп в сущности сработал

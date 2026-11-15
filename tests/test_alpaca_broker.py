@@ -217,13 +217,6 @@ def test_account_raises_the_peak_only_when_every_held_symbol_has_a_quote(env):
     assert b.account().peak_equity == pytest.approx(850.0 + 0.75 * 1000.0)
 
 
-def test_unknown_position_is_shown_without_a_stop(env):
-    b = broker(env); api = env[3]
-    api.positions["XLE"] = [2.0, 90.0]                               # куплено не нами
-    (p,) = b.account().positions
-    assert (p.symbol, p.stop_price) == ("XLE", 0.0)
-
-
 # --- стопы ---
 
 def test_stop_price_is_rounded_to_the_tick_the_broker_accepts(env):
@@ -317,6 +310,7 @@ def test_crash_after_order_sent_but_not_filled(env):
 
 def test_crash_after_fill_before_stop(env):
     b = broker(env); api, store = env[3], env[1]
+    store.update_state(stops={"AAPL": 186.0})                        # намерение записывается до заявки
     api.submit_market_buy("AAPL", 150.0, b.client_id("x/1"))                      # заявка исполнилась, стопа нет
     fill = b.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис", "x/1")
     assert api.submitted == 2                                        # покупка и стоп; вторая покупка не отправлялась
@@ -411,24 +405,48 @@ def test_failed_buy_keeps_the_stop_of_an_existing_position(env):
     assert store.state()["stops"] == {"AAPL": 186.0}
 
 
-# --- позиция без желаемого стопа ---
+# --- финальная волна, C1: счёт принадлежит одному прогону ---
 
-def test_ensure_stops_gives_an_unknown_position_a_default_stop(env):
+@pytest.mark.parametrize("call", ["ensure_stops", "account", "sync", "liquidate", "buy", "close", "raise_stop"])
+def test_a_position_without_a_stop_on_record_stops_every_operation(env, call):
     b = broker(env); api, store = env[3], env[1]
-    api.positions["XLE"] = [2.0, 90.0]                               # куплено руками
-    assert b.ensure_stops() == ["XLE"]
-    want = round(90.0 * (1 - env[0].limits.stop_max), 2)
-    assert store.state()["stops"] == {"XLE": want} and api.open_stop_orders()["XLE"]["stop_price"] == want
-    (e,) = store.orders()
-    assert (e["kind"], e["reason"], e["stop_price"], e["symbol"]) == ("raise_stop", "default_stop", want, "XLE")
-    assert b.ensure_stops() == [] and len(store.orders()) == 1       # второй раз ничего не пишет
+    b.buy("2026-12-01", "AAPL", 100.0, 186.0, "тезис", "x/1")
+    api.expire_day_orders()                                          # стоп AAPL сгорел: ensure_stops хотел бы его вернуть
+    api.positions["XLE"] = [2.0, 120.0]                              # куплено не этим прогоном
+    sent, ledger, state = api.submitted, store.orders(), store.state()
+    calls = {"ensure_stops": b.ensure_stops, "account": b.account, "sync": lambda: b.sync("2026-12-01"),
+             "liquidate": lambda: b.liquidate("2026-12-01"),
+             "buy": lambda: b.buy("2026-12-01", "AAPL", 50.0, 186.0, "тезис", "x/2"),
+             "close": lambda: b.close("2026-12-01", "AAPL", 1.0, "причина", "x/3"),
+             "raise_stop": lambda: b.raise_stop("2026-12-01", "AAPL", 190.0)}
+    with pytest.raises(RuntimeError, match="XLE.*ничего не отправлено"):
+        calls[call]()
+    assert api.submitted == sent and api.replaced == 0 and store.orders() == ledger
+    assert store.state()["stops"] == state["stops"] == {"AAPL": 186.0}
+    assert api.positions["XLE"] == [2.0, 120.0]                      # чужое не продано
 
 
-def test_default_stop_above_the_quote_means_the_position_is_sold(env):
+@pytest.mark.parametrize("dirty", ["default_paper_balance", "position", "open_order"])
+def test_first_use_refuses_an_account_that_is_not_this_runs_alone(env, dirty):
     b = broker(env); api, store = env[3], env[1]
-    api.positions["XLE"] = [2.0, 120.0]                              # котировка 100 ниже 120 * 0.85 = 102
-    assert b.ensure_stops() == [] and api.positions == {}
-    assert [e["reason"] for e in store.orders()] == ["default_stop", "gap_below_stop"]
+    if dirty == "default_paper_balance":
+        api.cash = 100_000.0
+    elif dirty == "position":
+        api.positions["XLE"] = [2.0, 90.0]
+    else:
+        api.next_order_mode = "never_fills"
+        api.submit_market_buy("AAPL", 100.0, "руками/1")
+    sent = api.submitted
+    for _ in range(2):                                               # проверка повторяется, пока счёт не чист
+        with pytest.raises(RuntimeError, match="run_uid не записан"):
+            b.sync("2026-12-01")
+        assert "run_uid" not in store.state() and api.submitted == sent
+
+
+def test_first_use_accepts_a_clean_account_within_two_percent(env):
+    b = broker(env); api, store = env[3], env[1]
+    api.cash = 1019.0
+    assert b.sync("2026-12-01") == [] and len(store.state()["run_uid"]) == 8
 
 
 # --- гэп через стоп ---
@@ -516,6 +534,7 @@ def test_sync_recovers_a_filled_buy_and_a_later_repeat_sends_nothing(env):
 
 def test_sync_recovers_the_filled_part_of_a_cancelled_order(env):
     b = broker(env); api = env[3]
+    env[1].update_state(stops={"AAPL": 186.0})                       # намерение записывается до заявки
     api.next_fill_fraction = 0.4
     oid = api.submit_market_buy("AAPL", 150.0, b.client_id("x/1"))
     api.cancel(oid)
@@ -525,6 +544,7 @@ def test_sync_recovers_the_filled_part_of_a_cancelled_order(env):
 
 def test_sync_ignores_orders_still_in_flight(env):
     b = broker(env); api = env[3]
+    env[1].update_state(stops={"AAPL": 186.0})
     api.next_fill_fraction = 0.4
     api.submit_market_buy("AAPL", 150.0, b.client_id("x/1"))                      # partially_filled, ещё идёт
     assert b.sync("2026-12-01") == []
@@ -645,17 +665,18 @@ def test_every_order_carries_the_run_prefix_and_the_ledger_keeps_the_callers_id(
     assert len(stop_ids) == len(set(stop_ids)) >= 2
 
 
-def test_two_runs_on_one_account_do_not_adopt_each_others_orders(env, tmp_path):
+def test_a_second_run_on_a_busy_account_sends_nothing_and_records_nothing(env, tmp_path):
     a, b = broker(env), second_broker(env, tmp_path)
     api = env[3]
     a.buy("2026-12-01", "AAPL", 150.0, 186.0, "тезис A", "x/1")
-    assert b.sync("2026-12-01") == [] and RunStore(env[1].dir.parent / "opus-b").orders() == []
-    fill = b.buy("2026-12-01", "AAPL", 50.0, 186.0, "тезис B", "x/1")   # тот же id, другой прогон
-    assert fill.qty == pytest.approx(0.25)
-    (e,) = RunStore(env[1].dir.parent / "opus-b").orders()
-    assert e["thesis"] == "тезис B" and e["qty"] == pytest.approx(0.25)
-    assert [x["kind"] for x in env[1].orders()] == ["buy"]            # у A ничего лишнего
-    assert a.sync("2026-12-01") == []
+    sent = api.submitted
+    for call in (lambda: b.sync("2026-12-01"), lambda: b.buy("2026-12-01", "AAPL", 50.0, 186.0, "тезис B", "x/1"),
+                 b.ensure_stops, lambda: b.liquidate("2026-12-01")):
+        with pytest.raises(RuntimeError):
+            call()
+    store_b = RunStore(env[1].dir.parent / "opus-b")
+    assert store_b.orders() == [] and "run_uid" not in store_b.state() and api.submitted == sent
+    assert a.sync("2026-12-01") == [] and [x["kind"] for x in env[1].orders()] == ["buy"]
 
 
 def test_liquidation_of_one_run_is_not_mistaken_for_the_other_runs(env, tmp_path):

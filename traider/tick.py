@@ -12,6 +12,8 @@
 Замок снимается в `finally`, только если он наш. Порядок участников сдвигается по дням: первым идёт номер
 «день года по модулю числа участников».
 
+В начале тика: если два и больше нетерминальных прогона с брокером `alpaca` в одном режиме (по
+`started_with`), каждый из них получает `error` с их именами, брокер для них не создаётся; остальные идут как обычно.
 Перед всем: режим и брокер конфига должны совпасть с записью `started_with` в состоянии прогона
 (пишет `start_experiment`); иначе брокер не создаётся, статус `invalid`, действие `error`.
 Для одного прогона, в этом порядке, каждый шаг может закончить работу над ним:
@@ -38,7 +40,7 @@ from typing import Any
 
 from traider.analyst import Analyst
 from traider.brokers import Broker
-from traider.config import RunConfig, active_runs, load_run
+from traider.config import MODES, RunConfig, active_runs, alpaca_runs, load_run
 from traider.market import NY, Market, ny_day
 from traider.nums import usable
 from traider.safety import run_safety
@@ -174,10 +176,14 @@ def tick(runs_dir: Path, market: Market, make_broker: Callable[[RunConfig, RunSt
         return []
     out: list[dict] = []
     try:
+        shared = _shared_alpaca(runs_dir)
         for run in _rotated(active_runs(runs_dir), ny_day(market.now())):
             if not _refresh(lock, market.now(), token):
                 break   # замок забрал другой тик: не трогаем ни его, ни прогоны
             try:
+                if run in shared:
+                    out.append({"participant": run.name, "action": "error", "error": shared[run]})
+                    continue
                 out.append(_one(run, market, make_broker, make_client))
             except Exception as e:
                 out.append({"participant": run.name, "action": "error", "error": f"{type(e).__name__}: {e}"})
@@ -185,6 +191,19 @@ def tick(runs_dir: Path, market: Market, make_broker: Callable[[RunConfig, RunSt
     finally:
         if _owned(lock, token):
             lock.unlink(missing_ok=True)
+
+
+def _shared_alpaca(runs_dir: Path) -> dict[Path, str]:
+    """Прогоны, которые делят один счёт Alpaca (два и больше нетерминальных в одном режиме), с текстом ошибки."""
+    out = {}
+    for mode in MODES:
+        found = alpaca_runs(runs_dir, mode)
+        if len(found) > 1:
+            names = ", ".join(f"{r.parent.name}/{r.name}" for r in found)
+            text = (f"на одном счёте Alpaca ({mode}) больше одного незавершённого прогона: {names}; брокер не "
+                    "создавался, ничего не отправлено. Оставьте один прогон (finished, dead или каталог вне runs/)")
+            out |= dict.fromkeys(found, text)
+    return out
 
 
 def _rotated(runs: list[Path], day: str) -> list[Path]:

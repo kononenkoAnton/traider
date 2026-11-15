@@ -19,6 +19,9 @@
 переопределяет только `max_session_usd`. При создании режим и брокер записываются в `state.json` прогона (`started_with`), вне `config.json`. `active_runs` отдаёт планировщику каждый прогон,
 чей статус не конечный (`TERMINAL_STATUSES`), в том числе `invalid`: у него отключаются
 только сессии агента, HP и стопы работают.
+Счёт Alpaca принадлежит одному прогону: `start_experiment` до первой записи отказывает, если в `runs_dir`
+уже есть нетерминальный прогон с брокером `alpaca` в том же режиме (`alpaca_runs`, по `started_with`), а
+новый эксперимент тоже берёт Alpaca.
 """
 import hashlib
 import json
@@ -27,6 +30,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 BROKERS = ("alpaca", "sim")
+MODES = ("paper", "live")
 TERMINAL_STATUSES = ("dead", "finished")   # прогон в этих статусах больше не проверяется
 RESEARCH = ("self", "analyst")
 CRITERIA_KEYS = ("min_sessions", "max_missed_share", "min_closed_trades", "red_percentile", "green_percentile")
@@ -78,7 +82,7 @@ class RunConfig:
 def _build(toml_path: Path, live: bool) -> list[RunConfig]:
     t = tomllib.loads(toml_path.read_text(encoding="utf-8"))
     base = toml_path.parent
-    if t["mode"] not in ("paper", "live"):
+    if t["mode"] not in MODES:
         raise ValueError(f"неизвестный режим: {t['mode']}")
     if t["mode"] == "live" and not live:
         raise ValueError("режим live требует явного флага live=True")
@@ -135,6 +139,11 @@ def start_experiment(toml_path: Path, runs_dir: Path, live: bool = False) -> Pat
     for cfg in configs:
         if (exp_dir / cfg.participant).exists():
             raise FileExistsError(exp_dir / cfg.participant)
+    if any(c.broker == "alpaca" for c in configs) and (busy := alpaca_runs(runs_dir, configs[0].mode)):
+        # брокер Alpaca считает своими все позиции счёта: второй прогон на тех же ключах торговал бы чужим
+        raise ValueError(f"счёт Alpaca ({configs[0].mode}) уже занят прогоном "
+                         f"{', '.join(f'{r.parent.name}/{r.name}' for r in busy)}: дождитесь у него статуса "
+                         f"finished или dead или уберите каталог его эксперимента из {runs_dir}")
     for cfg in configs:
         run = exp_dir / cfg.participant
         run.mkdir(parents=True)
@@ -167,3 +176,17 @@ def active_runs(runs_dir: Path) -> list[Path]:
             return True  # нечитаемое состояние не прячет прогон: тик сообщит об ошибке по нему
 
     return sorted(p.parent for p in Path(runs_dir).glob("*/*/config.json") if active(p.parent))
+
+
+def alpaca_runs(runs_dir: Path, mode: str) -> list[Path]:
+    """Нетерминальные прогоны на Alpaca в режиме `mode` по записи `started_with` (прогон с нечитаемым
+    состоянием сюда не входит: тик всё равно ничего по нему не делает)."""
+    from traider.store import RunStore
+
+    def match(run: Path) -> bool:
+        try:
+            return RunStore(run).state().get("started_with") == {"mode": mode, "broker": "alpaca"}
+        except (OSError, ValueError, TypeError):
+            return False
+
+    return [r for r in active_runs(runs_dir) if match(r)]
