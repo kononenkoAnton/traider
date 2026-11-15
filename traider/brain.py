@@ -72,9 +72,16 @@ def _is(value, kind) -> bool:
     return isinstance(value, _TYPES[kind])
 
 
+# Всё, что _check исполняет, и аннотации, которые он игнорирует по смыслу. Схема инструмента
+# с другим словом нарушила бы свой же предел молча: тест схем инструментов сверяется с этим набором.
+SCHEMA_KEYWORDS = frozenset({"type", "enum", "minimum", "maximum", "minItems", "maxItems", "required",
+                             "properties", "additionalProperties", "items", "description"})
+
+
 def _check(schema: dict, value, path: str = "вход") -> str | None:
-    """Первое нарушение схемы или None. Поддержано: type, enum, minimum/maximum, required,
-    properties, additionalProperties: false, items."""
+    """Первое нарушение схемы или None. Поддержано: SCHEMA_KEYWORDS (type, enum, minimum/maximum,
+    minItems/maxItems, required, properties, additionalProperties: false, items; description
+    это аннотация)."""
     kinds = schema.get("type")
     if kinds is not None:
         kinds = [kinds] if isinstance(kinds, str) else kinds
@@ -99,6 +106,11 @@ def _check(schema: dict, value, path: str = "вход") -> str | None:
         for key, sub in props.items():
             if key in value and (err := _check(sub, value[key], f"{path}.{key}")):
                 return err
+    if isinstance(value, list):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            return f"{path}: число элементов не меньше {schema['minItems']}"
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            return f"{path}: число элементов не больше {schema['maxItems']}"
     if isinstance(value, list) and "items" in schema:
         for i, item in enumerate(value):
             if err := _check(schema["items"], item, f"{path}[{i}]"):

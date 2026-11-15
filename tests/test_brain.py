@@ -195,3 +195,11 @@ def test_schema_rejects_extra_property_enum_and_bounds(args):
 def test_unknown_stop_reason_and_tool_use_without_calls_are_errors():
     assert run([text("x", stop_reason="model_context_window_exceeded")])[0].stop == "error"
     assert run([text("x", stop_reason="tool_use")])[0].stop == "error"
+
+
+def test_check_enforces_list_size_bounds():
+    from traider.brain import _check
+    schema = {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3}
+    assert _check(schema, []) and "не меньше 1" in _check(schema, [])
+    assert _check(schema, ["a"] * 4) and "не больше 3" in _check(schema, ["a"] * 4)
+    assert _check(schema, ["a"]) is None and _check(schema, ["a"] * 3) is None

@@ -275,7 +275,7 @@ def test_each_attempt_gets_a_fresh_order_id(ctx):
 
 def test_only_tools_py_places_orders():
     root = pathlib.Path(__file__).resolve().parent.parent / "traider"
-    allowed = {"tools.py", "brokers.py", "alpaca.py"}      # tools.py: слой клетки; остальные: сами брокеры
+    allowed = {"tools.py"}      # слой клетки: единственный, кто вызывает брокера
     hits = []
     for path in sorted(root.glob("*.py")):
         if path.name in allowed:
@@ -288,3 +288,56 @@ def test_only_tools_py_places_orders():
     used = {n.func.attr for n in ast.walk(ast.parse((root / "tools.py").read_text(encoding="utf-8")))
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
     assert {"buy", "close", "raise_stop"} <= used          # проверка видит вызовы, а не пустоту
+
+
+# --- границы схем, проверяемые циклом ---
+
+def schema_of(ctx, name):
+    return next(t for t in build_tools(ctx) if t.name == name).input_schema
+
+
+def keywords(schema):
+    """Все ключевые слова схемы (имена полей в properties не считаются)."""
+    found = set()
+    for key, value in schema.items():
+        found.add(key)
+        if key == "properties":
+            for sub in value.values():
+                found |= keywords(sub)
+        elif isinstance(value, dict):
+            found |= keywords(value)
+    return found
+
+
+def test_schemas_use_only_keywords_the_loop_enforces(ctx):
+    from traider.brain import SCHEMA_KEYWORDS
+    for research in (None, lambda q: "ответ"):
+        ctx.research = research
+        for t in build_tools(ctx):
+            assert keywords(t.input_schema) <= SCHEMA_KEYWORDS, (t.name, keywords(t.input_schema) - SCHEMA_KEYWORDS)
+
+
+def test_symbol_lists_are_bounded_by_the_loop_validator(ctx):
+    from traider.brain import _check
+    symbols = list(ctx.cfg.universe)
+    for name in ("get_bars", "get_news"):
+        assert _check(schema_of(ctx, name), {"symbols": symbols[:11]})
+        assert _check(schema_of(ctx, name), {"symbols": symbols[:10]}) is None
+    assert _check(schema_of(ctx, "get_bars"), {"symbols": []})
+
+
+# --- цены держимых бумаг и время событий ---
+
+def test_cage_values_held_positions_at_the_current_price(ctx):
+    panel(ctx)
+    assert buy(ctx, "AAPL", 190.0).startswith("Куплено")
+    ctx.market.prices["AAPL"] *= 0.5            # позиция обесценилась: капитал упал, лимит 20% тоже
+    out = buy(ctx, "MSFT", 190.0)   # по цене входа капитал 1000 и лимит 200: заявка прошла бы
+    assert out.startswith("Отказ") and code(ctx) == "position_too_large"
+
+
+def test_reject_events_carry_the_market_clock(ctx):
+    from tests.fakes import ny
+    ctx.market.clock = ny(2031, 3, 4, 11, 22)
+    call(ctx, "buy", symbol="AAPL", notional=50.0, stop_price=1.0, thesis="т")
+    assert last(ctx)["kind"] == "reject" and last(ctx)["ts"] == ctx.market.now().isoformat()
