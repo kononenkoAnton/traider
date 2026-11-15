@@ -8,7 +8,7 @@
 позиции (вход, цена, стоп, результат, тезис последней покупки из журнала заявок); HP, пол и
 пик; остаток покупок и потолки сессии; последние 10 записей журнала прошлых сессий; заметки;
 до 20 последних продаж (`close`, `stop_fill`, `liquidate`) с результатом по `entry_price` и
-`price`; сводку калибровки (`forecasts.summary_text` по закрытиям панели, SPY и бумаг из
+`price` (без годного входа или выхода результат «н/д», строка остаётся); сводку калибровки (`forecasts.summary_text` по закрытиям панели, SPY и бумаг из
 прогнозов за 90 дней, дни всех записей сессий); панель. Сводка аналитика, если передана, идёт
 последней под заголовком, который помечает её как данные.
 
@@ -43,6 +43,10 @@ JOURNAL_ENTRIES = 10
 CLOSED_TRADES = 20
 CALIBRATION_DAYS = 90
 SALES = {"close": "продажа", "stop_fill": "стоп", "liquidate": "ликвидация"}
+
+
+def _money(x) -> str:
+    return f"{x:.2f}" if usable(x) else "н/д"
 
 
 def _calibration(cfg: RunConfig, store: RunStore, market: Market) -> str:
@@ -85,9 +89,10 @@ def build_context(cfg: RunConfig, store: RunStore, broker: Broker, market: Marke
     sales = [e for e in orders if e["kind"] in SALES][-CLOSED_TRADES:]
     out += ["", f"## Закрытые сделки (последние {CLOSED_TRADES})"]
     for e in sales:
-        out.append(f"{e['day']} {e['symbol']} ({SALES[e['kind']]}): {e['qty']:.4f} шт, вход {e['entry_price']:.2f}, "
-                   f"выход {e['price']:.2f}, результат {e['price'] / e['entry_price'] - 1:+.1%}. "
-                   f"Причина: {e.get('reason') or 'нет'}")
+        entry, exit_ = e.get("entry_price"), e.get("price")
+        res = f"{exit_ / entry - 1:+.1%}" if usable(entry) and usable(exit_) else "н/д"
+        out.append(f"{e['day']} {e['symbol']} ({SALES[e['kind']]}): {e['qty']:.4f} шт, вход {_money(entry)}, "
+                   f"выход {_money(exit_)}, результат {res}. Причина: {e.get('reason') or 'нет'}")
     if not sales:
         out.append("Закрытых сделок нет.")
     out += ["", "## Калибровка прогнозов", _calibration(cfg, store, market),

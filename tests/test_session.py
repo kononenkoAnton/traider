@@ -1,3 +1,5 @@
+import dataclasses
+import math
 import pathlib
 
 import pytest
@@ -66,12 +68,14 @@ def test_the_system_prompt_comes_from_the_frozen_config(senv):
     cfg, store, market, broker = senv
     store.start_session("2026-12-01", NOW)
     client = FakeAnthropic([use("finish_session", journal="к")])
-    run_session(cfg, store, broker, market, client, "2026-12-01")
-    assert client.requests[0]["system"] == cfg.system_prompt
+    run_session(dataclasses.replace(cfg, system_prompt="X"), store, broker, market, client, "2026-12-01")
+    assert client.requests[0]["system"] == "X"
 
 
 @pytest.mark.parametrize("script, status", [
     ([use("get_account")] * 50, "cap"),
+    ([use("get_account", usage={"input_tokens": 10_000_000})], "cap"),       # budget
+    ([text("готово")], "ok"),                                                 # end_turn
     ([RuntimeError("сеть")], "failed"),
     ([text("", stop_reason="refusal")], "failed"),
 ])
@@ -80,6 +84,24 @@ def test_abnormal_endings_are_recorded_not_raised(senv, script, status):
     store.start_session("2026-12-01", NOW)
     assert run_session(cfg, store, broker, market, FakeAnthropic(script), "2026-12-01")["status"] == status
     assert store.prices("2026-12-01") is not None
+
+
+def test_sales_without_a_usable_entry_or_exit_price_do_not_break_the_context(senv):
+    cfg, store, market, broker = senv
+    base = {"kind": "stop_fill", "qty": 1.0, "notional": None, "stop_price": 9.0, "thesis": None, "reason": "stop",
+            "client_order_id": None, "broker_order_id": None}
+    store.append_order({**base, "day": "2026-11-27", "symbol": "MSFT", "price": 9.0, "entry_price": None})
+    store.append_order({**base, "day": "2026-11-30", "symbol": "NVDA", "price": None})
+    text = build_context(cfg, store, broker, market, "2026-12-01")
+    assert "MSFT" in text and "NVDA" in text and text.count("результат н/д") == 2
+
+
+def test_unusable_quotes_are_dropped_from_the_snapshot(senv):
+    cfg, store, market, broker = senv
+    market.prices.update(AAPL=math.nan, MSFT=0.0, NVDA=None)
+    store.start_session("2026-12-01", NOW)
+    rec = run_session(cfg, store, broker, market, FakeAnthropic([use("finish_session", journal="к")]), "2026-12-01")
+    assert set(store.prices("2026-12-01")) == set(cfg.universe) - {"AAPL", "MSFT", "NVDA"} and rec["errors"] == []
 
 
 def test_the_last_session_closes_everything(senv):

@@ -5,7 +5,7 @@ type: category
 tags: ['experiment']
 categories: ['traider']
 created: 2026-11-14T15:43:20+00:00
-modified: 2026-11-15T09:49:15+00:00
+modified: 2026-11-15T09:58:31+00:00
 ---
 
 # Эксперимент
