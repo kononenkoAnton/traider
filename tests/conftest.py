@@ -4,6 +4,7 @@ import re
 import pytest
 
 from tests.fakes import FakeMarket
+from traider.brokers import SimBroker
 from traider.config import load_run, start_experiment
 from traider.store import RunStore
 
@@ -35,6 +36,16 @@ def env(tmp_path, example):
     run = start_experiment(example, tmp_path / "runs") / "opus-b"
     cfg, _ = load_run(run)
     return cfg, RunStore(run), FakeMarket(prices={"AAPL": 200.0, "XLE": 100.0})
+
+
+@pytest.fixture
+def senv(tmp_path, example):
+    """Мир сессии для opus-b: конфиг, хранилище, рынок с историей по всей вселенной, SimBroker."""
+    run = start_experiment(example, tmp_path / "runs") / "opus-b"
+    cfg, _ = load_run(run)
+    store = RunStore(run)
+    market = FakeMarket.with_history(list(cfg.universe), days=70)
+    return cfg, store, market, SimBroker(cfg, store, market)
 
 
 @pytest.fixture

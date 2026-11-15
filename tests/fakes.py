@@ -12,6 +12,9 @@ def ny(year: int, month: int, day: int, hour: int = 10, minute: int = 0) -> date
     return datetime(year, month, day, hour, minute, tzinfo=NY)
 
 
+NOW = ny(2026, 12, 1)
+
+
 class FakeMarket:
     def __init__(self, prices=None, bars=None, lows=None, news_items=None, open=True, clock=None,
                  fractionable_symbols=None):
