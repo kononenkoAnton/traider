@@ -117,8 +117,6 @@ def test_reject_and_stop_fill_events_change_nothing():
 
 # --- раунд исправлений 1 ---
 
-from traider.replay import spy_buy_hold as _hold  # noqa: E402
-
 AAPL_BUY = BUY
 MSFT_BUY = {"kind": "buy", "day": DAYS[0], "symbol": "MSFT", "notional": 200.0, "price": 400.0, "stop_price": 380.0}
 to_xle = lambda e: "XLE"  # noqa: E731
@@ -133,12 +131,18 @@ def test_two_agent_positions_in_one_replacement_ticker_stay_separate():
     assert curve[3] == pytest.approx(1009.7, abs=0.1)
 
 def test_a_stopped_out_lot_does_not_hand_its_mapping_to_a_later_lot():
-    pick = lambda e: {"AAPL": "AAPL", "MSFT": "XLE"}[e["symbol"]]  # noqa: E731
-    msft = {**MSFT_BUY, "day": DAYS[3], "notional": 100.0}
+    # Оба символа в XLE. Лот AAPL: q = 200 / (100 * 1.0005), стоп 95; 03.12 минимум 94 <= 95, открытие 101:
+    # продан по 95 * 0.9995. Лот MSFT куплен 03.12 на 100 по 102: 100 / (102 * 1.0005) штук. 04.12 закрытие AAPL
+    # пропускается (лота нет), MSFT стоит по 103:
+    # 800 + q * 95 * 0.9995 - 100 + 100 / (102 * 1.0005) * 103 = 990.7400 (привязка по бумаге дала бы 990.6896).
+    xle = {**BARS, "XLE": bars([100, 100, 101, 102], [99, 99, 94, 101], [100, 101, 102, 103])}
+    snap = {d: {**SNAP[d], "XLE": xle["XLE"][i].close} for i, d in enumerate(DAYS)}
+    msft = {**MSFT_BUY, "day": DAYS[2], "notional": 100.0}
     events = [AAPL_BUY, msft, {"kind": "close", "day": DAYS[3], "symbol": "AAPL"}]
-    curve = replay(events, SNAP, BARS, DAYS, 1000.0, pick=pick)
-    qa = 200.0 / (201.0 * 1.0005)
-    assert curve[3] == pytest.approx(800.0 + qa * 190.95 * 0.9995 - 100.0 + 100.0 / 1.0005)     # лот MSFT цел
+    curve = replay(events, snap, xle, DAYS, 1000.0, pick=to_xle)
+    q = 200.0 / (100.0 * 1.0005)
+    assert curve[3] == pytest.approx(800.0 + q * 95.0 * 0.9995 - 100.0 + 100.0 / (102.0 * 1.0005) * 103.0)
+    assert curve[3] == pytest.approx(990.7400, abs=1e-4)
 
 def test_spy_replay_keeps_two_agent_positions_apart():
     q = 200.0 / (500.0 * 1.0005)
