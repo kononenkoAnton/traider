@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from traider.brokers import BrokerRejected
@@ -250,3 +251,70 @@ class FakeAlpacaApi:
 
     def order_ids_since(self, since):
         return [o["id"] for o in self.orders.values() if since is None or o["submitted_at"] >= since]
+
+
+class Block(SimpleNamespace):
+    """Блок ответа модели: атрибуты как у блоков SDK, плюс model_dump."""
+
+    def model_dump(self, mode=None, **_):
+        return {k: v for k, v in vars(self).items()}
+
+
+def use(*calls, usage=None, **input):
+    """Ответ с вызовами инструментов: use("name", x=1) или use(("a", {...}), ("b", {...}))."""
+    if calls and isinstance(calls[0], tuple):
+        pairs = list(calls)
+    else:
+        pairs = [(calls[0], input)]
+    blocks = [Block(type="tool_use", id=f"tu_{i}", name=n, input=a) for i, (n, a) in enumerate(pairs)]
+    return {"content": blocks, "stop_reason": "tool_use", "usage": usage or {}}
+
+
+def text(content, stop_reason="end_turn", usage=None):
+    blocks = [Block(type="text", text=content)] if content else []
+    return {"content": blocks, "stop_reason": stop_reason, "usage": usage or {}}
+
+
+class _FakeStream:
+    def __init__(self, message):
+        self.message = message
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get_final_message(self):
+        return self.message
+
+
+class FakeMessages:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def stream(self, **kw):
+        self.owner.requests.append(kw)
+        if not self.owner.script:
+            raise RuntimeError("сценарий FakeAnthropic кончился")
+        step = self.owner.script.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        u = step.get("usage") or {}
+        usage = SimpleNamespace(
+            input_tokens=u.get("input_tokens", 0), output_tokens=u.get("output_tokens", 0),
+            cache_read_input_tokens=u.get("cache_read_input_tokens", 0),
+            cache_creation_input_tokens=u.get("cache_creation_input_tokens", 0),
+            server_tool_use=SimpleNamespace(web_search_requests=u.get("web_search_requests", 0)))
+        return _FakeStream(SimpleNamespace(content=step["content"], stop_reason=step["stop_reason"],
+                                           usage=usage, model=step.get("model", kw["model"])))
+
+
+class FakeAnthropic:
+    """Как клиент SDK в цикле агента: client.beta.messages.stream(**kw) как менеджер контекста,
+    у потока get_final_message(). Запросы копятся в .requests; исключение в сценарии это сбой API."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.requests: list[dict] = []
+        self.beta = SimpleNamespace(messages=FakeMessages(self))
