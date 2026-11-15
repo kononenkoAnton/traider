@@ -63,7 +63,7 @@ def test_tick_wiring_picks_the_broker_by_config_and_prints_a_line_per_run(tmp_pa
     market = object()
     made = {}
     monkeypatch.setattr(cli, "AlpacaMarket", lambda key, secret: market)
-    monkeypatch.setattr(cli, "Anthropic", lambda api_key: SimpleNamespace(key=api_key))
+    monkeypatch.setattr(cli, "Anthropic", lambda **kw: SimpleNamespace(key=kw["api_key"], kw=kw))
     monkeypatch.setattr(cli, "make_alpaca_api", lambda cfg, env: ("api", cfg.participant))
     monkeypatch.setattr(cli, "AlpacaBroker", lambda cfg, store, mkt, api: ("alpaca", api, mkt))
     def fake_tick(runs_dir, mkt, make_broker, make_client):
@@ -71,16 +71,27 @@ def test_tick_wiring_picks_the_broker_by_config_and_prints_a_line_per_run(tmp_pa
         for name in ("haiku", "opus-a"):
             cfg, _ = load_run(tmp_path / "runs" / "pilot-1" / name)
             made[name] = make_broker(cfg, RunStore(tmp_path / "runs" / "pilot-1" / name))
-        return [{"participant": "haiku", "action": "session", "status": "ok", "cost": 0.123},
-                {"participant": "opus-a", "action": "safety"}]
+        ts = "2026-12-01T15:05:00+00:00"
+        return [{"experiment": "pilot-1", "participant": "haiku", "action": "session", "status": "ok", "cost": 0.123,
+                 "ts": ts}, {"experiment": "pilot-1", "participant": "opus-a", "action": "safety", "ts": ts}]
     monkeypatch.setattr(cli, "tick", fake_tick)
     assert main(["tick"]) == 0
     assert made["runs"] == "runs" and made["market"] is market and made["client"].key == "c"
     assert isinstance(made["haiku"], SimBroker) and made["opus-a"] == ("alpaca", ("api", "opus-a"), market)
     out = capsys.readouterr().out
-    assert "haiku: session ok $0.12" in out and "opus-a: safety" in out
+    assert out.splitlines() == ["2026-12-01 10:05 pilot-1/haiku: session ok $0.12", "2026-12-01 10:05 pilot-1/opus-a: safety"]
+    assert made["client"].kw == {"api_key": "c", "max_retries": 2, "timeout": 300.0}
 
 def test_tick_without_keys_prints_one_line_and_fails(tmp_path, capsys, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert main(["tick"]) == 1
     assert len(capsys.readouterr().err.strip().splitlines()) == 1
+
+
+# --- финальная волна, M24 ---
+
+def test_start_prints_the_worst_case_spend(tmp_path, example, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert main(["start", str(example)]) == 0
+    out = capsys.readouterr().out
+    assert "$7.55 в торговый день" in out and "$158.55 за 21 торговый день" in out and "Console" in out

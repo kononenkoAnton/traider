@@ -12,7 +12,9 @@
 временный файл и `os.replace`, чтобы сбой не оставил половину файла. NaN и бесконечность не
 записываются никуда: такая запись даёт ValueError до любого изменения файла. Факты сессии для
 клетки (`SessionFacts`) считаются из журнала заявок и прогнозов, отдельно не хранятся.
-Встроенный счёт лежит в `state.json` под ключом `account`.
+Встроенный счёт лежит в `state.json` под ключом `account`. `append_tick` дописывает строку в
+`ticks.jsonl` (одна на прогон на тик); только здесь ненормальное число не ошибка, а null: строка тика
+пишется и тогда, когда отчёт проверки HP пришёл с NaN.
 """
 import json
 import os
@@ -21,6 +23,7 @@ from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
+from math import isfinite
 from pathlib import Path
 
 from traider.cage import Account, Position, SessionFacts
@@ -93,6 +96,14 @@ class RunStore:
             return None
         return next((e for e in self.orders() if e.get("client_order_id") == client_order_id
                      and e.get("kind") in ("buy", "close")), None)
+
+    # тики
+    def append_tick(self, record: dict) -> None:
+        _append_line(self.dir / "ticks.jsonl", {k: None if isinstance(v, float) and not isfinite(v) else v
+                                                for k, v in record.items()})
+
+    def ticks(self) -> list[dict]:
+        return _read_lines(self.dir / "ticks.jsonl")
 
     # сессии
     def _session_path(self, day: str) -> Path:

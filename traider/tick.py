@@ -26,7 +26,11 @@
 записи за сегодня: `missed`; 8. не раньше `window_start`, рынок открыт, записи нет: при
 непустом `unpriced` это `unpriced`, иначе запись `started`, аналитик (второй клиент) для
 `research = "analyst"` и `run_session` (`session` со статусом и стоимостью); 9. иначе `safety`. Статус не `active` после шагов 4 и 5 (неизвестный) даёт `safety` без учёта дней.
-Любое исключение по одному прогону даёт `error` с текстом и не мешает остальным. Клиенты
+Любое исключение по одному прогону даёт `error` с текстом и не мешает остальным. Каждый элемент
+результата несёт `experiment`, `participant`, `action`, `ts` (время рынка) и, если проверка HP прошла,
+`equity`, `floor`, `hp`, `stops_placed`, `stop_fills`, `unpriced`; тот же набор (с `day`, `error`, а у сессии
+`status` и `cost`) пишется строкой в `ticks.jsonl` прогона через `RunStore.append_tick`, для ошибок тоже, если
+каталог прогона пишется. Клиенты
 создаются до записи `started`, чтобы сбой создания не оставил зависшую запись; когда
 сессии нет, `make_client` не вызывается.
 """
@@ -142,6 +146,8 @@ def _one(run: Path, market: Market, make_broker, make_client) -> dict:
         store.update_state(first_day=day)
     broker = make_broker(cfg, store)
     report = run_safety(cfg, store, broker, day)
+    out |= {"equity": report.equity, "floor": report.floor, "hp": report.hp, "stops_placed": list(report.stops_placed),
+            "stop_fills": list(report.stop_fills), "unpriced": list(report.unpriced)}
     status = store.state()["status"]
     if report.died:
         return out | {"action": "died"}
@@ -181,16 +187,31 @@ def tick(runs_dir: Path, market: Market, make_broker: Callable[[RunConfig, RunSt
             if not _refresh(lock, market.now(), token):
                 break   # замок забрал другой тик: не трогаем ни его, ни прогоны
             try:
-                if run in shared:
-                    out.append({"participant": run.name, "action": "error", "error": shared[run]})
-                    continue
-                out.append(_one(run, market, make_broker, make_client))
+                r = ({"participant": run.name, "action": "error", "error": shared[run]} if run in shared
+                     else _one(run, market, make_broker, make_client))
             except Exception as e:
-                out.append({"participant": run.name, "action": "error", "error": f"{type(e).__name__}: {e}"})
+                r = {"participant": run.name, "action": "error", "error": f"{type(e).__name__}: {e}"}
+            out.append({"experiment": run.parent.name, **r, "ts": market.now().isoformat()})
+            _log_tick(run, out[-1])
         return out
     finally:
         if _owned(lock, token):
             lock.unlink(missing_ok=True)
+
+
+TICK_FIELDS = ("equity", "floor", "hp", "stops_placed", "stop_fills", "unpriced", "error")
+
+
+def _log_tick(run: Path, r: dict) -> None:
+    """Строка в `ticks.jsonl` прогона; поля, до которых тик не дошёл, пишутся как null."""
+    rec = {"ts": r["ts"], "day": ny_day(datetime.fromisoformat(r["ts"])), "action": r["action"],
+           **{k: r.get(k) for k in TICK_FIELDS}}
+    if r["action"] == "session":
+        rec |= {"status": r["status"], "cost": r["cost"]}
+    try:
+        RunStore(run).append_tick(rec)
+    except OSError:
+        pass   # каталог прогона не пишется: результат тика всё равно вернётся и напечатается
 
 
 def _shared_alpaca(runs_dir: Path) -> dict[Path, str]:

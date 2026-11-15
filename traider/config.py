@@ -8,7 +8,8 @@
 до первой записи на диск: режим live требует флага `live=True`, модель должна быть в
 таблице `[prices]`, брокер из `alpaca|sim`, источник информации из `self|analyst`, все
 бумаги панели во вселенной, в `[criteria]` и в каждой таблице цен есть все ключи; длинные ставки (`long_prompt_threshold` и четыре `*_long`) заданы
-либо все, либо ни одной.
+либо все, либо ни одной. `window_start` и `window_end` это `HH:MM` с нулём впереди (тик сравнивает их
+строками), начало раньше конца.
 Пути к файлам вселенной и промптов считаются от каталога самого TOML. Для каждого
 участника в `runs/<experiment>/<participant>/` пишутся `config.json` (тексты промптов
 и вселенная встроены в него) и `config.sha256` (SHA-256 байтов `config.json`).
@@ -25,6 +26,7 @@
 """
 import hashlib
 import json
+import re
 import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -87,6 +89,11 @@ def _build(toml_path: Path, live: bool) -> list[RunConfig]:
         raise ValueError(f"неизвестный режим: {t['mode']}")
     if t["mode"] == "live" and not live:
         raise ValueError("режим live требует явного флага live=True")
+    for key in ("window_start", "window_end"):   # время сравнивается строками: только HH:MM с нулём впереди
+        if not (isinstance(t[key], str) and re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", t[key])):
+            raise ValueError(f"{key} должно быть временем HH:MM с нулём впереди, например 09:45: {t[key]!r}")
+    if t["window_start"] >= t["window_end"]:
+        raise ValueError(f"окно сессии пустое: {t['window_start']} не раньше {t['window_end']}")
     universe = tuple((base / t["universe_file"]).read_text(encoding="utf-8").split())
     system = (base / t["system_prompt_file"]).read_text(encoding="utf-8")
     analyst_text = (base / t["analyst_prompt_file"]).read_text(encoding="utf-8")

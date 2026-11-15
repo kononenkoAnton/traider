@@ -284,3 +284,28 @@ def test_two_alpaca_runs_of_one_mode_both_get_an_error_and_no_broker(world, exam
                for r in errors)
     assert not any(b.endswith("/opus-a") for b in built)
     assert [r["action"] for r in got].count("session") == 8
+
+
+# --- финальная волна, I6.3: ticks.jsonl ---
+
+def test_every_run_gets_a_tick_line_including_errors(world):
+    runs, market, _, mc, _ = world
+    def flaky(cfg, store):
+        if cfg.participant == "sonnet": raise RuntimeError("брокер недоступен")
+        return SimBroker(cfg, store, market)
+    got = tick(runs, market, flaky, mc)
+    assert all(r["experiment"] == "pilot-1" and r["ts"] == market.clock.isoformat() for r in got)
+    (err,) = RunStore(runs / "pilot-1" / "sonnet").ticks()
+    assert (err["action"], err["day"], err["equity"], err["unpriced"]) == ("error", "2026-12-01", None, None)
+    assert "брокер недоступен" in err["error"] and err["ts"] == market.clock.isoformat()
+    (ses,) = RunStore(runs / "pilot-1" / "haiku").ticks()
+    assert ses["action"] == "session" and ses["status"] == "ok" and ses["cost"] == 0.0 and ses["error"] is None
+    assert ses["equity"] == 1000.0 and ses["floor"] == 850.0 and ses["hp"] == 150.0
+    assert ses["stops_placed"] == [] and ses["stop_fills"] == [] and ses["unpriced"] == []
+    market.clock = ny(2026, 12, 1, 10, 20); tick(runs, market, flaky, mc)
+    assert [t["action"] for t in RunStore(runs / "pilot-1" / "haiku").ticks()] == ["session", "safety"]
+
+def test_tick_line_writes_non_finite_numbers_as_null(tmp_path):
+    store = RunStore(tmp_path)
+    store.append_tick({"ts": "t", "equity": float("nan"), "hp": float("inf"), "floor": 850.0})
+    assert store.ticks() == [{"ts": "t", "equity": None, "hp": None, "floor": 850.0}]

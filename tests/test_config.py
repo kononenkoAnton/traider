@@ -132,3 +132,24 @@ def test_haiku_long_rates_are_frozen_for_the_participant_and_the_analyst(tmp_pat
     for table in (load_run(exp / "haiku")[0].token_prices, load_run(exp / "opus-analyst")[0].analyst_token_prices):
         assert {k: table[k] for k in want} == want
     assert "input_long" not in load_run(exp / "opus-a")[0].token_prices
+
+
+# --- финальная волна ---
+
+def test_session_time_limit_is_frozen_and_read_back(tmp_path, example):            # M13
+    assert Limits().max_session_seconds == 1200
+    run = start_experiment(example, tmp_path / "runs") / "opus-b"
+    assert '"max_session_seconds": 1200' in (run / "config.json").read_text()
+    cfg, valid = load_run(run)
+    assert valid and cfg.limits == Limits(max_session_seconds=1200)
+
+
+@pytest.mark.parametrize("old, new", [('window_start = "10:00"', 'window_start = "9:45"'),
+                                      ('window_end = "15:30"', 'window_end = "15:3"'),
+                                      ('window_start = "10:00"', 'window_start = "15:30"')])
+def test_window_must_be_padded_hh_mm_and_start_before_end(tmp_path, example, old, new):  # L179
+    assert old in example.read_text()
+    example.write_text(example.read_text().replace(old, new))
+    with pytest.raises(ValueError, match="window|окно"):
+        start_experiment(example, tmp_path / "runs")
+    assert not (tmp_path / "runs").exists()
