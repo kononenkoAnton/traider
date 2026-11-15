@@ -48,14 +48,15 @@ class AgentResult:
     model_used: str
     transcript: list[dict] = field(default_factory=list)
     error: str | None = None
+    fallback_used: bool = False
 
 
 def cost_usd(usage: Usage, prices: Mapping[str, float]) -> float:
     """Цена ОДНОГО запроса; длинный запрос (вход + кэш выше порога) идёт по длинным ставкам."""
     prompt = usage.input + usage.cache_read + usage.cache_write
     long = "long_prompt_threshold" in prices and prompt > prices["long_prompt_threshold"]
-    rate_in = prices["input_long"] if long else prices["input"]
-    rate_out = prices["output_long"] if long else prices["output"]
+    rate_in = prices.get("input_long", prices["input"]) if long else prices["input"]    # нет длинной ставки: базовая
+    rate_out = prices.get("output_long", prices["output"]) if long else prices["output"]
     return (usage.input * rate_in + usage.output * rate_out + usage.cache_read * prices["cache_read"]
             + usage.cache_write * prices["cache_write"]) / 1e6 + usage.searches * prices["search"]
 
@@ -77,6 +78,8 @@ def _check(schema: dict, value, path: str = "вход") -> str | None:
     kinds = schema.get("type")
     if kinds is not None:
         kinds = [kinds] if isinstance(kinds, str) else kinds
+        if unknown := [k for k in kinds if k not in _TYPES and k not in ("number", "integer")]:
+            return f"{path}: схема с неподдерживаемым типом {unknown}"
         if not any(_is(value, k) for k in kinds):
             return f"{path}: нужен тип {'/'.join(kinds)}"
     if "enum" in schema and value not in schema["enum"]:
@@ -124,9 +127,9 @@ def _run_tool(tools: Mapping[str, Tool], name: str, args) -> tuple[str, bool]:
     tool = tools.get(name)
     if tool is None:
         return f"нет инструмента {name}", True
-    if err := _check(tool.input_schema, args):
-        return f"неверный вход: {err}", True
     try:
+        if err := _check(tool.input_schema, args):
+            return f"неверный вход: {err}", True
         return str(tool.fn(args)), False
     except Exception as e:
         return f"ошибка инструмента: {type(e).__name__}: {e}", True
@@ -142,8 +145,28 @@ def _echo(content: list) -> list:
             if i >= marks[-1] or b.type not in ("thinking", "redacted_thinking", "tool_use")]
 
 
+def _g(obj, name, default=0):
+    v = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+    return default if v is None else v
+
+
+def _usage_of(entry, searches: int = 0) -> Usage:
+    return Usage(_g(entry, "input_tokens"), _g(entry, "output_tokens"), _g(entry, "cache_read_input_tokens"),
+                 _g(entry, "cache_creation_input_tokens"), searches)
+
+
 def run_agent(client, *, model: str, system: str, user: str, tools: Sequence[Tool], prices: Mapping[str, float],
               max_turns: int, max_usd: float, max_searches: int, effort: str = "high") -> AgentResult:
+    """Никогда не поднимает исключений: любой сбой это stop="error" с накопленными ходами, расходом и записью."""
+    res = AgentResult("error", 0, Usage(), 0.0, model, [{"role": "user", "content": user}])
+    try:
+        _loop(client, res, model, system, user, tools, prices, max_turns, max_usd, max_searches, effort)
+    except Exception as e:
+        res.stop, res.error = "error", f"{type(e).__name__}: {e}"
+    return res
+
+
+def _loop(client, res, model, system, user, tools, prices, max_turns, max_usd, max_searches, effort) -> None:
     by_name = {t.name: t for t in tools}
     api_tools = [{"name": t.name, "description": t.description, "input_schema": t.input_schema,
                   "eager_input_streaming": True} for t in tools]
@@ -152,14 +175,9 @@ def run_agent(client, *, model: str, system: str, user: str, tools: Sequence[Too
                           "max_uses": max_searches})
     extra = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"} if model in FALLBACK_MODELS else {}
     messages: list[dict] = [{"role": "user", "content": user}]
-    transcript: list[dict] = [{"role": "user", "content": user}]
-    usage, cost, turns, used = Usage(), 0.0, 0, model
-
-    def done(stop, error=None):
-        return AgentResult(stop, turns, usage, cost, used, transcript, error)
-
-    while turns < max_turns:
-        turns += 1
+    res.stop = "max_turns"
+    while res.turns < max_turns:
+        res.turns += 1
         try:
             with client.beta.messages.stream(
                 model=model, max_tokens=MAX_TOKENS, system=system, tools=api_tools, messages=list(messages),
@@ -167,39 +185,55 @@ def run_agent(client, *, model: str, system: str, user: str, tools: Sequence[Too
                 cache_control={"type": "ephemeral"}, **extra,
             ) as stream:
                 response = stream.get_final_message()
-            u = response.usage
-            step = Usage(u.input_tokens or 0, u.output_tokens or 0, u.cache_read_input_tokens or 0,
-                         u.cache_creation_input_tokens or 0,
-                         getattr(getattr(u, "server_tool_use", None), "web_search_requests", 0) or 0)
         except Exception as e:
-            return done("error", f"{type(e).__name__}: {e}")
-        used = getattr(response, "model", None) or model
-        usage = Usage(usage.input + step.input, usage.output + step.output, usage.cache_read + step.cache_read,
-                      usage.cache_write + step.cache_write, usage.searches + step.searches)
-        cost += cost_usd(step, prices)
+            res.stop = "error"
+            res.error = f"{type(e).__name__}: {e}; запрос мог быть оплачен и не входит в cost"
+            return
+        u = response.usage
+        searches = _g(_g(u, "server_tool_use", None), "web_search_requests")
+        iterations = _g(u, "iterations", None)
+        # Верхний usage покрывает только ответившую попытку; при подмене истина в iterations.
+        # Все попытки оцениваются по таблице цен основной модели (приближение).
+        steps = [_usage_of(i) for i in iterations] if iterations else [_usage_of(u)]
+        steps[0].searches = searches
+        for step in steps:
+            res.cost += cost_usd(step, prices)
+            res.usage = Usage(*(a + b for a, b in zip(vars(res.usage).values(), vars(step).values())))
+        res.model_used = getattr(response, "model", None) or model
+        res.fallback_used = res.fallback_used or res.model_used != model or len(steps) > 1
         content = _echo(response.content)
         messages.append({"role": "assistant", "content": content})
-        transcript.append({"role": "assistant", "content": [_plain(b) for b in content]})
-        if cost >= max_usd:
-            return done("budget")
+        res.transcript.append({"role": "assistant", "content": [_plain(b) for b in content]})
+        if res.cost >= max_usd:
+            res.stop = "budget"
+            return
         reason = response.stop_reason
         if reason == "refusal":
-            return done("refusal")
+            res.stop = "refusal"
+            return
         if reason == "pause_turn":
             continue
         if reason == "max_tokens":
-            return done("error", "ответ оборван по max_tokens")
+            res.stop, res.error = "error", "ответ оборван по max_tokens"
+            return
         uses = [b for b in content if b.type == "tool_use"]
-        if not uses:
-            return done("end_turn")
+        if reason in ("end_turn", "stop_sequence") and not uses:
+            res.stop = "end_turn"
+            return
+        if reason != "tool_use" or not uses:
+            res.stop, res.error = "error", f"неожиданный stop_reason {reason!r} (вызовов инструментов: {len(uses)})"
+            return
         results, finished = [], False
         for b in uses:
-            out, failed = _run_tool(by_name, b.name, b.input)
-            finished |= by_name[b.name].terminal and not failed if b.name in by_name else False
+            if finished:        # сессия объявлена завершённой: остальные вызовы этого ответа не выполняются
+                out, failed = "не выполнено: сессия уже завершена", True
+            else:
+                out, failed = _run_tool(by_name, b.name, b.input)
+                finished = not failed and by_name[b.name].terminal
             results.append({"type": "tool_result", "tool_use_id": b.id, "content": out,
                             **({"is_error": True} if failed else {})})
         messages.append({"role": "user", "content": results})
-        transcript.append({"role": "user", "content": _clean(results)})
+        res.transcript.append({"role": "user", "content": _clean(results)})
         if finished:
-            return done("finished")
-    return done("max_turns")
+            res.stop = "finished"
+            return

@@ -113,3 +113,85 @@ def test_transcript_is_json_serializable_without_nan():
     result, _ = run([use("echo", x="a"), use("finish")])
     json.dumps(result.transcript, allow_nan=False)
     assert result.transcript[0] == {"role": "user", "content": "U"}
+
+
+# --- завершающий инструмент: после него ничего не выполняется ---
+def test_calls_after_the_terminal_tool_are_skipped_with_error_results():
+    result, client = run([use(("finish", {}), ("echo", dict(x="late")))])
+    assert (result.stop, calls) == ("finished", [])
+    sent = result.transcript[-1]["content"]
+    assert sent[1]["is_error"] is True and sent[1]["content"] == "не выполнено: сессия уже завершена"
+    assert "is_error" not in sent[0]
+
+
+def test_calls_before_the_terminal_tool_still_run():
+    result, _ = run([use(("echo", dict(x="a")), ("finish", {})) ])
+    assert (result.stop, calls) == ("finished", ["a"])
+
+
+def test_failing_terminal_call_does_not_end_the_session():
+    boom = Tool("finish", "", DONE.input_schema, lambda a: 1 / 0, terminal=True)
+    result, _ = run([use(("finish", {}), ("echo", dict(x="a"))), text("продолжаю")], tools=[boom, ECHO])
+    assert (result.stop, result.turns, calls) == ("end_turn", 2, ["a"])      # сессия не закончилась, echo выполнен
+    bad = run([use("finish", junk=1), use("finish")])[0]
+    assert (bad.stop, bad.turns) == ("finished", 2)
+
+
+# --- стоимость при подмене модели ---
+def test_iterations_are_summed_and_fallback_used_is_set():
+    step = use("finish", usage=dict(input_tokens=1, output_tokens=1, iterations=[
+        dict(input_tokens=1000, output_tokens=100), dict(input_tokens=2000, output_tokens=200, cache_read_input_tokens=3000)]))
+    step["model"] = "claude-opus-5"
+    result, _ = run([step])
+    want = cost_usd(Usage(1000, 100), PRICES) + cost_usd(Usage(2000, 200, 3000), PRICES)
+    assert result.cost == pytest.approx(want)
+    assert (result.usage.input, result.usage.output, result.usage.cache_read) == (3000, 300, 3000)
+    assert result.fallback_used is True and result.model_used == "claude-opus-5"
+
+
+def test_two_iterations_alone_mark_fallback_and_plain_run_does_not():
+    step = use("finish", usage=dict(iterations=[dict(input_tokens=10), dict(input_tokens=10)]))
+    assert run([step])[0].fallback_used is True
+    assert run([use("finish")])[0].fallback_used is False
+
+
+# --- цикл не поднимает исключений ---
+def test_unsupported_schema_type_is_an_error_result():
+    weird = Tool("echo", "", {"type": "object", "properties": {"x": {"type": "weird"}}}, lambda a: "ok")
+    result, client = run([use("echo", x="a"), use("finish")], tools=[weird, DONE])
+    assert result.stop == "finished" and client.requests[1]["messages"][-1]["content"][0]["is_error"] is True
+
+
+def test_missing_long_rates_fall_back_to_base_rates():
+    prices = {**PRICES, "long_prompt_threshold": 100}
+    assert cost_usd(Usage(input=1_000_000, output=1_000_000), prices) == pytest.approx(24.0)
+
+
+def test_failure_after_the_request_keeps_what_was_gathered():
+    bad = {"content": [object()], "stop_reason": "end_turn", "usage": dict(input_tokens=1000)}
+    result, _ = run([use("echo", x="a", usage=dict(input_tokens=1000)), bad])
+    assert result.stop == "error" and result.error and result.turns == 2
+    assert result.cost == pytest.approx(2 * cost_usd(Usage(1000), PRICES)) and calls == ["a"]
+    json.dumps(result.transcript, allow_nan=False)
+
+
+def test_failed_stream_error_says_the_request_may_have_been_billed():
+    result, _ = run([RuntimeError("обрыв")])
+    assert result.stop == "error" and "обрыв" in result.error
+    assert "мог быть оплачен" in result.error and "не входит в cost" in result.error
+
+
+# --- проверка схемы ---
+@pytest.mark.parametrize("args", [dict(n=1, extra=2), dict(n=1, kind="c"), dict(n=0), dict(n=11), dict(n=True)])
+def test_schema_rejects_extra_property_enum_and_bounds(args):
+    schema = {"type": "object", "properties": {"n": {"type": "number", "minimum": 1, "maximum": 10},
+                                               "kind": {"type": "string", "enum": ["a", "b"]}},
+              "required": ["n"], "additionalProperties": False}
+    t = Tool("echo", "", schema, lambda a: calls.append("ran") or "ok")
+    result, client = run([use("echo", **args), use("finish")], tools=[t, DONE])
+    assert calls == [] and client.requests[1]["messages"][-1]["content"][0]["is_error"] is True
+
+
+def test_unknown_stop_reason_and_tool_use_without_calls_are_errors():
+    assert run([text("x", stop_reason="model_context_window_exceeded")])[0].stop == "error"
+    assert run([text("x", stop_reason="tool_use")])[0].stop == "error"

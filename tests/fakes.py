@@ -301,7 +301,9 @@ class FakeMessages:
         if isinstance(step, BaseException):
             raise step
         u = step.get("usage") or {}
+        its = u.get("iterations")
         usage = SimpleNamespace(
+            iterations=None if its is None else [SimpleNamespace(**{"type": "message", **i}) for i in its],
             input_tokens=u.get("input_tokens", 0), output_tokens=u.get("output_tokens", 0),
             cache_read_input_tokens=u.get("cache_read_input_tokens", 0),
             cache_creation_input_tokens=u.get("cache_creation_input_tokens", 0),
