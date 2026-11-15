@@ -15,8 +15,12 @@
 (день гибели: тик снимка не пишет; сессия, упавшая до снимка) получает снимок отчёта: закрытие дневной свечи
 каждой бумаги, а у бумаг, которыми участник торговал в этот день, котировка из исполнения в журнале (цена
 продажи / (1 - SLIPPAGE), покупки / (1 + SLIPPAGE)); иначе тень погибшего продала бы по вчерашней цене.
-Сохранённый снимок берётся как есть. Нет свечей бенчмарка: `spy` и `vs_spy_pp` None. `beyond_noise` None,
-пока разница близнецов ровно 0 или у одного из них нет покупок. Место среди ботов: None, пока нет
+Сохранённый снимок берётся как есть, кроме дня гибели (`died_on`): гибель днём наступает после утреннего снимка,
+поэтому в этот день снимок отчёта строится всегда (без свечи у бумаги берётся сохранённая цена; ликвидация
+главнее других исполнений бумаги). Ограничение: лот, купленный и ликвидированный в сам день гибели, повтор
+покупает по цене ликвидации, и убытка у этого лота нет; лоты, купленные раньше, получают падение целиком.
+Нет свечей бенчмарка: `spy` и `vs_spy_pp` None. `beyond_noise` None,
+пока разница близнецов по модулю меньше 1e-9 (шум float) или у одного из них нет покупок. Место среди ботов: None, пока нет
 покупок. Капитал счёта, HP и доля HP берутся из `ticks.jsonl`: последний тик дня с числом, иначе None.
 Прогнозы: `brier`, `reference`, `ci` по панели, `brier_picks` по прогнозам купленных в тот же день бумаг;
 нет созревших, значит None. Закрытая сделка это каждое событие продажи (`agent`, `stop`, `liquidation`);
@@ -139,14 +143,15 @@ def _load(run: Path, market: Market) -> dict:
 
 
 def _snapshot(p: dict, day: str, closes: Mapping) -> dict:
-    """Сохранённый снимок дня как есть; без него закрытия свечей дня, а у бумаг со сделками котировка из исполнения."""
+    """Снимок дня для повтора: сохранённый как есть, кроме дня гибели; иначе закрытия свечей дня (без свечи цена
+    сохранённого снимка), а у бумаг со сделками котировка из исполнения."""
     saved = p["store"].prices(day)
-    if saved is not None:
+    if saved is not None and day != p["state"].get("died_on"):
         return saved
-    snap = {s: c[day] for s, c in closes.items() if usable(c.get(day))}
-    for e in p["orders"]:
-        if e.get("day") == day and usable(e.get("price")) and e.get("kind") in ("buy", *SALES):
-            snap[e["symbol"]] = e["price"] / ((1 + SLIPPAGE) if e["kind"] == "buy" else (1 - SLIPPAGE))
+    snap = {**(saved or {}), **{s: c[day] for s, c in closes.items() if usable(c.get(day))}}
+    fills = [e for e in p["orders"] if e.get("day") == day and usable(e.get("price")) and e.get("kind") in ("buy", *SALES)]
+    for e in sorted(fills, key=lambda e: e["kind"] == "liquidate"):     # ликвидация главнее, иначе последнее исполнение
+        snap[e["symbol"]] = e["price"] / ((1 + SLIPPAGE) if e["kind"] == "buy" else (1 - SLIPPAGE))
     return snap
 
 
@@ -303,7 +308,7 @@ def _compare(ps: dict[str, dict], summary: dict, positions: dict) -> dict:
 
     twins = diff(get("opus-a", "return_pct"), get("opus-b", "return_pct"))
 
-    quiet = twins is None or twins == 0 or not (ps.get("opus-a", {}).get("buys") and ps.get("opus-b", {}).get("buys"))
+    quiet = twins is None or abs(twins) < 1e-9 or not (ps.get("opus-a", {}).get("buys") and ps.get("opus-b", {}).get("buys"))
 
     def beyond(d):   # без шума близнецов мерить нечем: разница 0 или один из них не покупал
         return None if d is None or quiet else abs(d) > 2 * abs(twins)

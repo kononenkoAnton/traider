@@ -300,3 +300,30 @@ def test_beyond_noise_needs_more_than_twice_the_twins_difference():
     c = _compare(ps, summary, {})              # шум близнецов 1 п.п.: порог 2 п.п.
     assert c["ladder"]["beyond_noise"] is False   # разброс 1.5 п.п.: больше шума, но не вдвое
     assert c["analyst"]["beyond_noise"] is True   # 3.0 против среднего 0.5: 2.5 п.п.
+
+
+def test_intraday_death_after_the_snapshot_takes_the_crash(intraday_death):
+    exp, market = intraday_death
+    store = RunStore(exp / "opus-b")
+    assert store.state()["died_on"] == "2026-12-02" and store.prices("2026-12-02")      # снимок дня уже был
+    r = build_report(exp, market)
+    # тень и счёт исполнили одни и те же сделки с теми же 5 б.п.: расходиться они могут только округлением float
+    assert r["equity"]["opus-b"][-1] == pytest.approx(store.account().cash, abs=0.01)
+    assert r["summary"]["opus-b"]["return_pct"] < -20
+    assert r["summary"]["opus-b"]["percentile"] != 50.0
+
+
+def test_beyond_noise_float_noise_twins_and_exactly_twice():
+    from types import SimpleNamespace
+    from traider.report import _compare
+    ps = {pid: {"buys": [{"symbol": "XLE"}], "forecasts": [], "cfg": SimpleNamespace(panel=())}
+          for pid in ("haiku", "opus-a", "opus-b", "opus-analyst")}
+
+    def run(a, b, haiku, analyst):
+        summary = {pid: {"return_pct": r, "percentile": None, "brier": None}
+                   for pid, r in (("haiku", haiku), ("opus-a", a), ("opus-b", b), ("opus-analyst", analyst))}
+        return _compare(ps, summary, {})
+    c = run(1.0, 1.0 + 1e-12, 5.0, 5.0)                        # разница близнецов это шум float: мерить нечем
+    assert c["ladder"]["beyond_noise"] is None and c["analyst"]["beyond_noise"] is None
+    c = run(1.0, 0.0, 2.5, 2.5)                                # шум 1 п.п., разброс и разница ровно 2 п.п.
+    assert c["ladder"]["beyond_noise"] is False and c["analyst"]["beyond_noise"] is False

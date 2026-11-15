@@ -112,6 +112,40 @@ def played_with_death(tmp_path, example):
     return _play(tmp_path, example, death=True)
 
 
+@pytest.fixture
+def intraday_death(tmp_path, example):
+    """opus-b держит AAPL на $900 с 01.12; 02.12 сессия в 10:05 сохраняет снимок по утренней цене, потом AAPL
+    падает на 30% (и котировка, и свеча дня), и тик в 14:00 того же дня решает гибель."""
+    from tests.fakes import FakeAnthropic, ny, use
+    from traider.tick import tick
+
+    runs = tmp_path / "runs"
+    exp = start_experiment(example, runs)
+    market = FakeMarket.with_history(list(load_run(exp / "haiku")[0].universe), days=70, clock=ny(2026, 12, 2, 16, 30))
+
+    def make_client():
+        return FakeAnthropic([use("get_account"), use("finish_session", journal="ок")])
+
+    def make_broker(cfg, store):
+        return SimBroker(cfg, store, market)
+
+    run = exp / "opus-b"
+    market.prices = {s: next(b.open for b in market.bars[s] if b.day == "2026-12-01") for s in market.bars}
+    market.clock, market.open = ny(2026, 12, 1, 10, 5), True
+    SimBroker(load_run(run)[0], RunStore(run), market).buy("2026-12-01", "AAPL", 900.0, 1.0, "т", "seed/1")
+    tick(runs, market, make_broker, make_client)
+    market.prices = {s: next(b.open for b in market.bars[s] if b.day == "2026-12-02") for s in market.bars}
+    market.clock = ny(2026, 12, 2, 10, 5)
+    tick(runs, market, make_broker, make_client)                       # сессия: снимок 02.12 по утренней цене
+    market.prices["AAPL"] *= 0.7
+    market.bars["AAPL"] = [replace(b, low=b.open * .69, close=b.open * .7) if b.day == "2026-12-02" else b
+                           for b in market.bars["AAPL"]]
+    market.clock = ny(2026, 12, 2, 14, 0)
+    tick(runs, market, make_broker, make_client)                       # гибель днём, снимок уже есть
+    market.clock, market.open = ny(2026, 12, 2, 16, 30), False
+    return exp, market
+
+
 WAVE = (1.00, 1.03, 0.98, 1.02, 0.97, 1.01, 0.99, 1.04)     # множитель цены по торговым дням с 01.12, со сдвигом по тикеру
 MOVING_DAYS = ("2026-12-01", "2026-12-02", "2026-12-03", "2026-12-04")
 MOVING_BUYS = {"haiku": "XLE", "sonnet": "XLF", "opus-a": "XLE", "opus-b": "XLU", "opus-analyst": "QQQ"}
