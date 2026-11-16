@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Шаблон. Не ставится автоматически. Держит запущенной страницу управления (`traider serve`, только 127.0.0.1:8787).
+     Замените __PROJECT_DIR__ на абсолютный путь к проекту (три места ниже), __HOME_DIR__ на ваш домашний каталог.
+     Проверьте `which uv`: его каталог должен быть в PATH ниже (uv от установщика лежит в
+     ~/.local/bin, launchd не раскрывает ~, впишите полный путь, например /Users/имя/.local/bin).
+     Каталог logs/ должен существовать: mkdir -p __PROJECT_DIR__/logs
+     Заполненную копию положите в ~/Library/LaunchAgents/com.traider.serve.plist, этот файл не правьте.
+     Установка:  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.traider.serve.plist
+     Проверка:   launchctl print gui/$(id -u)/com.traider.serve
+     Снятие:     launchctl bootout gui/$(id -u)/com.traider.serve
+     С MacBook:  ssh -N -L 8787:127.0.0.1:8787 <пользователь>@<mac-mini>, затем откройте http://localhost:8787 --><plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.traider.serve</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>uv</string>
+        <string>run</string>
+        <string>traider</string>
+        <string>serve</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME_DIR__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/logs/serve.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/logs/serve.log</string>
+</dict>
+</plist>

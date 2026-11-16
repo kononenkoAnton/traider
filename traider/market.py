@@ -70,6 +70,11 @@ def ny_day(ts: datetime) -> str:
     return ts.astimezone(NY).date().isoformat()
 
 
+def today() -> str:
+    """Сегодняшний день в Нью-Йорке по часам системы: день решений владельца (команды и страница управления)."""
+    return ny_day(datetime.now(NY))
+
+
 def floor_minute(ts: datetime) -> datetime:
     """Начало минуты, в которой лежит `ts`: с него начинается свеча, содержащая `ts`."""
     return ts.replace(second=0, microsecond=0)

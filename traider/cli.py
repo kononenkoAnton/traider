@@ -1,4 +1,4 @@
-"""Командная строка: `traider start`, `traider tick`, `traider status`, `traider report`, `pause`, `resume`, `stop`.
+"""Командная строка: `traider start`, `traider tick`, `traider status`, `traider report`, `pause`, `resume`, `stop`, `serve`.
 
 :wk-id: cli-module
 :wk-tags: cli, schedule, status
@@ -33,12 +33,14 @@
 заново перед броском) и монотонный срок, проверяемый перед каждым шагом.
 Планировщик (`ops/com.traider.tick.plist`) вручную ставит владелец, без `--wiki`.
 `pause [эксперимент]`, `resume [эксперимент]`, `stop <эксперимент> --yes` работают без сети и `.env`, через модуль
-control (пишут только `control.json`); день это сегодняшняя дата в Нью-Йорке по часам системы (`_today`). Без имени `pause`
+control (пишут только `control.json`); день это сегодняшняя дата в Нью-Йорке по часам системы (`market.today`). Без имени `pause`
 и `resume` берут единственный незавершённый эксперимент (`summary` не `finished`); нет такого или их несколько:
 список и код 2. Неизвестный эксперимент: код 2. `stop` без `--yes` печатает, что произойдёт, и даёт код 2. Отказ модуля
 control (пауза после остановки, повреждённый `control.json`): одна строка в stderr и код 1. `status` перед строками
 прогонов печатает по строке на эксперимент: состояние, с какого дня пауза, запрошена ли остановка; число сессий в
 строке прогона без дней паузы.
+`serve [--port N]` (8787 по умолчанию) держит страницу управления на 127.0.0.1 (модуль serve), как и команды владельца
+без сети и `.env`; задание launchd для неё `ops/com.traider.serve.plist`.
 """
 import argparse
 import signal
@@ -56,7 +58,8 @@ from traider.brokers import SimBroker
 from traider.config import TERMINAL_STATUSES, load_run, start_experiment
 from traider.control import pause, request_stop, resume, summary
 from traider.env import load_env
-from traider.market import NY, AlpacaMarket, ny_day
+from traider.market import NY, AlpacaMarket, ny_day, today
+from traider.serve import main_serve
 from traider.store import RunStore
 from traider.tick import tick
 from traider.wiki_results import report_due, write_report
@@ -286,9 +289,6 @@ def _status(_args) -> int:
     return 0
 
 
-def _today() -> str:
-    return ny_day(datetime.now(NY))
-
 
 def _pick(name: str | None) -> Path | None:
     """Эксперимент по имени; без имени единственный незавершённый. Не нашёлся: строка в stderr и None."""
@@ -327,14 +327,14 @@ def _owner(act):
 
 
 def _pause(exp: Path, _args) -> int:
-    c = pause(exp, _today())
+    c = pause(exp, today())
     print(f"{exp.name}: на паузе с {c['pauses'][-1]['from']}; проверка HP и стопы работают, сессий нет")
     return 0
 
 
 def _resume(exp: Path, _args) -> int:
     before = summary(exp)["paused_since"]
-    resume(exp, day := _today())
+    resume(exp, day := today())
     print(f"{exp.name}: пауза снята ({before}–{day}), сессии со следующего торгового дня" if before
           else f"{exp.name}: паузы нет, ничего не изменилось")
     return 0
@@ -346,7 +346,7 @@ def _stop(exp: Path, args) -> int:
               "прогоны закончатся (через пять торговых дней статус finished). Отменить это нельзя. "
               f"Чтобы подтвердить: traider stop {exp.name} --yes")
         return 2
-    c = request_stop(exp, _today(), datetime.now(NY))
+    c = request_stop(exp, today(), datetime.now(NY))
     print(f"{exp.name}: остановка запрошена {c['stop']['day']}. Следующий тик при открытом рынке продаст все позиции "
           "и переведёт прогоны в finishing; отменить нельзя")
     return 0
@@ -375,5 +375,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     stop.add_argument("experiment")
     stop.add_argument("--yes", action="store_true", help="подтвердить: отменить остановку нельзя")
     stop.set_defaults(run=_owner(_stop))
+    srv = sub.add_parser("serve", help="страница управления на 127.0.0.1, без сети и .env")
+    srv.add_argument("--port", type=int, default=8787)
+    srv.set_defaults(run=lambda args: main_serve(RUNS, args.port))
     args = parser.parse_args(argv)
     return args.run(args)

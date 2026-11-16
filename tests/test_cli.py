@@ -543,7 +543,7 @@ def owner(tmp_path, example, monkeypatch, capsys):
     """Каталог с экспериментом pilot-1, сегодня в Нью-Йорке 2026-12-02; .env нет, сеть не нужна."""
     monkeypatch.chdir(tmp_path)
     start_experiment(example, tmp_path / "runs")
-    monkeypatch.setattr(cli, "_today", lambda: "2026-12-02")
+    monkeypatch.setattr(cli, "today", lambda: "2026-12-02")
     for name in ("AlpacaMarket", "Anthropic", "make_alpaca_api", "load_env"):
         monkeypatch.setattr(cli, name, lambda *a, **k: pytest.fail("команде владельца не нужны ни сеть, ни .env"))
     return tmp_path / "runs" / "pilot-1"
@@ -558,7 +558,7 @@ def test_pause_and_resume_record_today_in_new_york(owner, capsys):
 
 def test_today_is_the_new_york_date():
     from traider.market import NY
-    assert cli._today() == datetime.now(NY).date().isoformat()
+    assert cli.today() == datetime.now(NY).date().isoformat()
 
 
 def test_unknown_experiment_is_code_2(owner, capsys):

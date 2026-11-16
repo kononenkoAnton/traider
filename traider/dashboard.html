@@ -126,6 +126,24 @@ blockquote{margin:16px 0 0;padding:0 0 0 14px;border-left:2px solid var(--axis);
 .inc li{display:grid;grid-template-columns:18px 1fr;gap:8px;padding:7px 0;border-bottom:1px solid var(--hair);font-size:13px;overflow-wrap:anywhere}
 .inc b{font-weight:600}
 footer{margin-top:36px;padding-top:16px;border-top:1px solid var(--hair);color:var(--ink2);font-size:13px;max-width:78ch}
+/* полоса управления: видна, только когда страницу отдал сервер (traider serve) */
+.control{display:flex;flex-wrap:wrap;align-items:center;gap:10px 24px;margin-top:20px;padding:10px 14px;border:1px solid var(--axis);border-radius:8px;background:var(--surface);font-size:13px}
+.control[hidden]{display:none}
+.control .state{margin:0;flex:1 1 260px;overflow-wrap:anywhere}
+.control .state small{display:block;color:var(--ink2)}
+.acts{display:flex;flex-wrap:wrap;gap:8px}
+.btn{padding:6px 14px;border-radius:6px;border:1px solid var(--axis);background:var(--band-mid);cursor:pointer;font-size:13px}
+.btn:hover:not(:disabled){background:var(--band-wide)}
+.btn.out{background:transparent;border-color:var(--ink2);margin-left:16px}
+.btn:disabled{color:var(--muted);cursor:default}
+dialog{width:min(460px,calc(100vw - 32px));padding:20px;border:1px solid var(--axis);border-radius:8px;background:var(--surface);color:var(--ink)}
+dialog::backdrop{background:rgba(0,0,0,.4)}
+dialog p{font-size:13px;color:var(--ink2);margin:8px 0 14px}
+dialog label{display:block;font-size:13px}
+dialog input{display:block;width:100%;margin:6px 0 16px;padding:7px 9px;font:inherit;color:inherit;background:var(--page);border:1px solid var(--axis);border-radius:6px}
+dialog .acts{justify-content:flex-end}
+dialog .btn.out{margin-left:0}
+.not-built .wrap>:not(header){display:none}
 @media (max-width:860px){
   .filters{position:static}
   .two,.three,.split{grid-template-columns:minmax(0,1fr)} .two>section+section{border-top:1px solid var(--hair)}
@@ -141,6 +159,10 @@ footer{margin-top:36px;padding-top:16px;border-top:1px solid var(--hair);color:v
     <h1 id="title">Страница аналитики</h1>
     <p class="sub" id="sub"></p>
     <div class="progress" id="progress"></div>
+    <div class="control" id="control" hidden>
+      <p class="state" id="control-state" aria-live="polite"></p>
+      <div class="acts" id="control-acts"></div>
+    </div>
   </header>
 
   <div class="filters">
@@ -230,6 +252,13 @@ footer{margin-top:36px;padding-top:16px;border-top:1px solid var(--hair);color:v
   <footer id="footer"></footer>
 </div>
 <div id="tip" role="status"></div>
+<dialog id="stop-dialog" aria-labelledby="stop-title">
+  <h2 id="stop-title">Остановить эксперимент <span id="stop-name"></span>?</h2>
+  <p>Следующий тик при открытом рынке продаст все позиции всех участников, и прогоны перейдут к завершению: новых сессий не будет, через пять торговых дней эксперимент будет завершён. Отменить остановку нельзя.</p>
+  <label for="stop-input">Чтобы подтвердить, введите имя эксперимента</label>
+  <input id="stop-input" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <div class="acts"><button type="button" class="btn" id="stop-cancel">Отмена</button><button type="button" class="btn out" id="stop-ok" disabled>Остановить всё</button></div>
+</dialog>
 
 <script>
 "use strict";
@@ -805,7 +834,53 @@ function renderIncidents() {
   put("incidents", ...(bad.length ? [] : [h("li", {}, h("span", { "aria-hidden": "true" }), h("span", {}, "Происшествий нет."))]), ...bad.map(item), ...good.map(item));
 }
 
-function render() { renderHeader(); renderFilters(); renderSummary(); renderEquity(); renderMoney(); renderGrid(); renderDetail(); renderPositions(); renderTrades(); renderForecasts(); renderBrierTime(); renderCompare(); renderIncidents(); }
+/* ---------- полоса управления ---------- */
+/* Сервер (traider serve) отдаёт страницу и отвечает на control, pause, resume, stop рядом с ней. С диска полоса скрыта.
+   Текст из ответов сервера кладётся только через textContent и createTextNode. */
+const CONTROL_STATES = { running: "работает", stopping: "останавливается", finishing: "завершается", finished: "завершён", damaged: "файл управления повреждён" };
+const ctl = { state: null, token: null, busy: false };
+async function ask(path, body) {
+  const r = await fetch(path, body === undefined ? { cache: "no-store" }
+    : { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json", "X-Traider-Token": ctl.token || "" }, body: JSON.stringify(body) });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(String(data.error || `сервер ответил ${r.status}`));
+  return data;
+}
+function showControl(st, err) {
+  ctl.state = st;
+  if (!st) { $("control-state").textContent = "нет связи с сервером управления"; return put("control-acts"); }
+  const word = st.state === "paused" ? `на паузе с ${dayLabel(st.paused_since)}` : own(CONTROL_STATES, st.state) || String(st.state);
+  $("control-state").replaceChildren(h("b", {}, `Эксперимент ${st.experiment}: ${word}`),
+    st.state === "damaged" ? h("small", {}, String(st.error ?? "")) : null, err ? h("small", {}, err) : null);
+  const btn = (label, click, cls) => h("button", { type: "button", class: cls ? `btn ${cls}` : "btn", disabled: ctl.busy, onclick: click }, label);
+  put("control-acts", st.state === "running" ? btn("Пауза", () => act("pause")) : null, st.state === "paused" ? btn("Продолжить", () => act("resume")) : null,
+    st.state === "running" || st.state === "paused" ? btn("Остановить всё", openStop, "out") : null);
+}
+async function refresh(err) {
+  try { const st = await ask("control"); ctl.token = st.token; showControl(st, err); } catch (e) { showControl(null); }
+}
+async function act(action, body = {}) {
+  ctl.busy = true; showControl(ctl.state);
+  let err = null;
+  try { await ask(action, body); } catch (e) { err = e.message; }
+  ctl.busy = false;
+  await refresh(err);
+}
+const stopInput = $("stop-input"), stopOk = $("stop-ok");
+function openStop() { $("stop-name").textContent = ctl.state.experiment; stopInput.value = ""; stopOk.disabled = true; $("stop-dialog").showModal(); stopInput.focus(); }
+stopInput.addEventListener("input", () => { stopOk.disabled = !ctl.state || stopInput.value !== ctl.state.experiment; });
+$("stop-cancel").addEventListener("click", () => $("stop-dialog").close());
+stopOk.addEventListener("click", () => { $("stop-dialog").close(); act("stop", { confirm: stopInput.value }); });
+if (location.protocol !== "file:") { $("control").hidden = false; refresh(); setInterval(() => { if (!ctl.busy) refresh(); }, 60000); }
+
+function renderNotBuilt() {
+  document.body.classList.add("not-built");
+  $("title").textContent = "Отчёт ещё не собран";
+  document.title = "Traider — отчёт ещё не собран";
+  $("sub").textContent = `Эксперимент ${META.experiment}. Страница с данными появится после первого дня сессий: её собирает тик.`;
+}
+
+function render() { if (META.not_built) return renderNotBuilt(); renderHeader(); renderFilters(); renderSummary(); renderEquity(); renderMoney(); renderGrid(); renderDetail(); renderPositions(); renderTrades(); renderForecasts(); renderBrierTime(); renderCompare(); renderIncidents(); }
 render();
 let resizeTimer; addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { renderEquity(); renderMoney(); renderBrierTime(); }, 120); });
 </script>
