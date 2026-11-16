@@ -2,7 +2,7 @@ from statistics import mean
 
 import pytest
 
-from tests.fakes import FakeMarket
+from tests.fakes import FakeMarket, ny
 from traider import replay
 from traider.config import load_run, start_experiment
 from traider.report import build_report, integrity, verdict, worst
@@ -543,3 +543,104 @@ def test_the_stop_incident_is_one_with_the_file_and_the_states(moving):
     request_stop(exp, "2026-12-04", ny(2026, 12, 4, 11, 0))
     RunStore(exp / "haiku").update_state(status="finishing", finish_day="2026-12-04", stopped_by="owner")
     assert [i["title"] for i in build_report(exp, market)["incidents"]].count("остановлен владельцем") == 1
+
+
+# --- волна после проверки всей ветки ---
+
+def _lower(market, symbols, factor, from_day, only=("open", "high", "low", "close")):
+    from dataclasses import replace
+    for s in symbols:
+        market.bars[s] = [replace(b, **{k: getattr(b, k) * factor for k in only}) if b.day >= from_day else b
+                          for b in market.bars[s]]
+
+
+def _stop_tick(exp, market, when):
+    from tests.fakes import FakeAnthropic, use
+    from traider.brokers import SimBroker
+    from traider.tick import tick
+    market.clock, market.open = when, True
+    out = tick(exp.parent, market, lambda cfg, store: SimBroker(cfg, store, market),
+               lambda: FakeAnthropic([use("get_account"), use("finish_session", journal="ок")]))
+    market.clock, market.open = ny(2026, 12, 9, 16, 30), False
+    return out
+
+
+def test_an_owner_stop_before_the_open_shows_the_liquidation_day(moving):
+    from traider.control import request_stop
+    exp, market = moving
+    universe = list(load_run(exp / "haiku")[0].universe)
+    request_stop(exp, "2026-12-07", ny(2026, 12, 7, 9, 0))
+    _lower(market, universe, 0.8, "2026-12-07")
+    market.prices = {s: next(b.open for b in market.bars[s] if b.day == "2026-12-07") for s in universe}
+    assert {r["action"] for r in _stop_tick(exp, market, ny(2026, 12, 7, 9, 35))} == {"finishing"}
+    r = build_report(exp, market)
+    assert r["days"][-1] == "2026-12-07"
+    for pid in ("haiku", "opus-b"):
+        cash = RunStore(exp / pid).account().cash
+        # тень продаёт по цене ликвидации (не по закрытию свечи дня): совпадает со счётом до округления float
+        assert r["equity"][pid][-1] == pytest.approx(cash, abs=0.01)
+        assert len(r["account_equity"][pid]) == len(r["equity"][pid]) and r["account_equity"][pid][-1] is not None
+    assert r["summary"]["haiku"]["return_pct"] == pytest.approx((RunStore(exp / "haiku").account().cash / 1000 - 1) * 100,
+                                                                abs=0.001)
+
+
+def test_an_owner_stop_after_the_days_sessions_takes_the_intraday_fall(moving):
+    from traider.control import request_stop
+    exp, market = moving
+    universe = list(load_run(exp / "haiku")[0].universe)
+    morning = {s: next(b.open for b in market.bars[s] if b.day == "2026-12-07") for s in universe}
+    market.prices = dict(morning)
+    _stop_tick(exp, market, ny(2026, 12, 7, 10, 5))         # сессии 07.12 без покупок: снимок дня по утренним ценам
+    assert RunStore(exp / "haiku").session("2026-12-07")["status"] == "ok" and RunStore(exp / "haiku").prices("2026-12-07")
+    # к 13:00 всё на 20% ниже утра; минимумы свечей не трогаем: стопы не задеты ни у счёта, ни у тени
+    _lower(market, universe, 0.8, "2026-12-07", only=("close",))
+    market.prices = {s: p * 0.8 for s, p in morning.items()}
+    request_stop(exp, "2026-12-07", ny(2026, 12, 7, 12, 55))
+    _stop_tick(exp, market, ny(2026, 12, 7, 13, 0))
+    r = build_report(exp, market)
+    assert r["days"][-1] == "2026-12-07"
+    for pid in ("haiku", "sonnet", "opus-b"):
+        cash = RunStore(exp / pid).account().cash
+        assert r["equity"][pid][-1] == pytest.approx(cash, abs=0.01)      # не по утреннему снимку
+        assert r["summary"][pid]["return_pct"] < -1
+
+
+def test_the_death_day_liquidation_fill_wins_over_the_days_close(intraday_death):
+    from dataclasses import replace
+    exp, market = intraday_death
+    market.bars["AAPL"] = [replace(b, close=b.close * 1.2) if b.day == "2026-12-02" else b for b in market.bars["AAPL"]]
+    r = build_report(exp, market)                       # к закрытию бумага отыгралась, а продана была днём
+    assert r["equity"]["opus-b"][-1] == pytest.approx(RunStore(exp / "opus-b").account().cash, abs=0.01)
+
+
+def _drop_cost(exp, pid, *days):
+    import json
+    for d in days:
+        path = exp / pid / "sessions" / f"{d}.json"
+        rec = json.loads(path.read_text())
+        rec.pop("cost")
+        path.write_text(json.dumps(rec))
+
+
+def test_unknown_spend_is_never_a_zero_in_the_summary(played):
+    exp, market = played
+    _drop_cost(exp, "opus-b", "2026-12-02")
+    _drop_cost(exp, "haiku", "2026-12-01", "2026-12-02", "2026-12-03")
+    s = build_report(exp, market)["summary"]
+    assert s["opus-b"]["sessions_without_cost"] == 1 and s["opus-b"]["cost"] > 0      # записанное считается, пометка рядом
+    assert s["haiku"]["cost"] is None and s["haiku"]["sessions_without_cost"] == 3
+    assert s["sonnet"]["sessions_without_cost"] == 0 and s["sonnet"]["cost"] > 0
+
+
+def test_failed_sessions_count_as_missed_days_in_the_verdict(moving, monkeypatch):
+    from traider import report as report_module
+    exp, market = moving
+    for d in ("2026-12-01", "2026-12-02"):
+        (exp / "haiku" / "sessions" / f"{d}.json").write_text(f'{{"day": "{d}", "status": "failed"}}')
+    seen = {}
+    real = report_module.verdict
+    monkeypatch.setattr(report_module, "verdict", lambda m, c: seen.setdefault(len(seen), m) and real(m, c))
+    r = build_report(exp, market)
+    by = {r["participants"][i]["id"]: m for i, m in seen.items()}
+    assert by["haiku"]["sessions_done"] == 4 and by["haiku"]["missed_share"] == 0.5     # 2 сбоя из 4 сессий
+    assert by["sonnet"]["missed_share"] == 0.0

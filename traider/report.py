@@ -7,21 +7,25 @@
 Как это работает. `build_report` только читает: файлы прогонов через `load_run` и `RunStore` и рынок
 (`trading_days`, один вызов `daily_bars` на вселенную и бенчмарк, `now`). Брокер не создаётся, файлы
 не меняются, поэтому отчёт можно строить в любой момент, и во время тика. Дни участника это все торговые
-дни от первой записи сессии до последней записи или `died_on`, что позже; `days` отчёта это их
-объединение. Кривые (`equity`, `account_equity`, `spy`, `spy_same_exposure`, полоса) начинаются точкой
+дни от первой записи сессии до последней записи, `died_on` или дня остановки владельцем (`finish_day` при
+`stopped_by: "owner"`: в этот день тик продал всё), что позже; `days` отчёта это их объединение. Кривые (`equity`,
+`account_equity`, `spy`, `spy_same_exposure`, полоса) начинаются точкой
 старта, дальше по точке на день участника; у погибшего кривая кончается днём гибели. Тень, боты
 (`cfg.seed`, вселенная с дневными свечами), SPY считает `traider.replay` по журналу в порядке `seq`
 (события вне дней участника не берутся) и снимкам цен самого участника. День без сохранённого снимка
 (день гибели: тик снимка не пишет; сессия, упавшая до снимка) получает снимок отчёта: закрытие дневной свечи
 каждой бумаги, а у бумаг, которыми участник торговал в этот день, котировка из исполнения в журнале (цена
 продажи / (1 - SLIPPAGE), покупки / (1 + SLIPPAGE)); иначе тень погибшего продала бы по вчерашней цене.
-Сохранённый снимок берётся как есть, кроме дня гибели (`died_on`): гибель днём наступает после утреннего снимка,
-поэтому в этот день снимок отчёта строится всегда (без свечи у бумаги берётся сохранённая цена; ликвидация
-главнее других исполнений бумаги). Ограничение: лот, купленный и ликвидированный в сам день гибели, повтор
+Сохранённый снимок берётся как есть, кроме дня гибели (`died_on`) и дня остановки владельцем: ликвидация в эти дни
+бывает после утреннего снимка, поэтому в них снимок отчёта строится всегда (без свечи у бумаги берётся сохранённая цена;
+ликвидация главнее других исполнений бумаги). Ограничение: лот, купленный и ликвидированный в тот же такой день, повтор
 покупает по цене ликвидации, и убытка у этого лота нет; лоты, купленные раньше, получают падение целиком.
 Участник, у которого записанный при старте брокер `alpaca` (без записи: брокер конфига), а id заявок брокера не переданы, даёт происшествие `warning` «проверка по брокеру не проведена»; общее происшествие о целостности `good` только когда проведены все применимые проверки и они чисты. Нет свечей бенчмарка: `spy` и `vs_spy_pp` None. `beyond_noise` None,
 пока разница близнецов по модулю меньше 1e-9 (шум float) или у одного из них нет покупок. Место среди ботов: None, пока нет
 покупок. Капитал счёта, HP и доля HP берутся из `ticks.jsonl`: последний тик дня с числом, иначе None.
+Расход участника в `summary.cost`: сумма записанных стоимостей (пропуск и пауза стоят 0 и записаны); `None`, если
+ни у одной его сессии стоимость не записана; `sessions_without_cost` это число его сессий без записанной стоимости.
+Ликвидация без котировки (`no_quote_entry_price`) даёт происшествие `serious` на участника и день.
 Прогнозы: `brier`, `reference`, `ci` по панели, `brier_picks` по прогнозам купленных в тот же день бумаг;
 нет созревших, значит None. `brier_series` по дням отчёта: те же Брайер и эталон по созревшим прогнозам
 панели, данным до дня включительно (последняя точка равна сводке); вне дней участника и без таких прогнозов None.
@@ -30,7 +34,8 @@
 сессии на оставшиеся торговые дни месяца, не больше сессий до цели). У участника `first_day` и `day_offset`: его
 первый день сессии и номер этого дня в `days`, без сессий None. Закрытая сделка это каждое событие продажи (`agent`, `stop`, `liquidation`);
 без годных входа или выхода у неё `pnl` None. Диалог сессии в отчёте есть только у 10 последних дней
-сессий эксперимента, каждая строка режется до 2000 знаков с пометкой. Порядок правил `verdict`: гибель или
+сессий эксперимента, каждая строка режется до 2000 знаков с пометкой. Доля пропусков для вердикта: сессии `missed` и
+`failed` среди сессий (`ok`, `cap`, `failed`, `missed`). Порядок правил `verdict`: гибель или
 нарушение целостности, нехватка данных (в том числе нет места или интервала), красный, зелёный, жёлтый;
 пороги только из `cfg.criteria`. Всё детерминировано, кроме `meta.generated_at` (`market.now()`).
 День паузы владельца (запись `paused`) не сессия: его нет ни в `sessions_done`, ни в доле пропусков (числитель и
@@ -82,6 +87,7 @@ SESSION_INCIDENTS = {"missed": ("critical", "пропущенный день"), 
                      "cap": ("warning", "сессия упёрлась в потолок")}
 DONE = ("ok", "cap", "failed", "missed")      # `paused` (день паузы владельца) не сессия и не пропуск
 NOT_CHECKED = "проверка по брокеру не проведена"
+ENTRY_PRICE_SALE = "продано по цене входа: котировки не было"
 
 
 def verdict(m: Mapping, criteria: Mapping) -> str:
@@ -149,17 +155,22 @@ def _load(run: Path, market: Market) -> dict:
     cfg, _ = load_run(run)
     store = RunStore(run)
     state, records = store.state(), store.sessions()
-    ends = [r["day"] for r in records] + ([state["died_on"]] if state.get("died_on") else [])
+    ends = [r["day"] for r in records] + ([state["died_on"]] if state.get("died_on") else []) + \
+        ([state["finish_day"]] if _stopped(state) else [])
     days = market.trading_days(records[0]["day"] if records else ends[0], max(ends)) if ends else []
     return {"id": run.name, "cfg": cfg, "store": store, "state": state, "records": records, "days": days,
             "orders": store.orders(), "ticks": store.ticks(), "forecasts": store.forecasts()}
 
 
+def _stopped(state: Mapping) -> bool:
+    return state.get("stopped_by") == "owner" and bool(state.get("finish_day"))
+
+
 def _snapshot(p: dict, day: str, closes: Mapping) -> dict:
-    """Снимок дня для повтора: сохранённый как есть, кроме дня гибели; иначе закрытия свечей дня (без свечи цена
-    сохранённого снимка), а у бумаг со сделками котировка из исполнения."""
-    saved = p["store"].prices(day)
-    if saved is not None and day != p["state"].get("died_on"):
+    """Снимок дня для повтора: сохранённый как есть, кроме дня гибели и дня остановки владельцем; иначе закрытия свечей
+    дня (без свечи цена сохранённого снимка), а у бумаг со сделками котировка из исполнения."""
+    saved, state = p["store"].prices(day), p["state"]
+    if saved is not None and day != state.get("died_on") and not (_stopped(state) and day == state["finish_day"]):
         return saved
     snap = {**(saved or {}), **{s: c[day] for s, c in closes.items() if usable(c.get(day))}}
     fills = [e for e in p["orders"] if e.get("day") == day and usable(e.get("price")) and e.get("kind") in ("buy", *SALES)]
@@ -256,14 +267,16 @@ def _summary(p: dict) -> dict:
     for x in eq:
         peak = max(peak, x)
         dd = min(dd, (x / peak - 1) * 100)
-    costs = [r.get("cost") for r in p["records"] if _num(r.get("cost"))]
+    costs = [_session_cost(r) for r in p["records"]]
+    known = [c for c in costs if c is not None]
     ret = _pct(eq, start) if days else None
     return {"equity": eq[-1], "return_pct": ret,
             "vs_spy_pp": ret - _pct(p["spy"], start) if days and p["spy"] else None,
             "percentile": p["percentile"], "max_drawdown_pct": dd if days else None, "hp": hp, "hp_share": share,
             "trades": len(p["buys"]), "closed_trades": sum(e.get("kind") in SALES for e in p["orders"]),
             "brier": p["brier"], "reference": p["reference"], "ci": p["ci"], "brier_picks": p["brier_picks"],
-            "cost": float(sum(costs))}
+            "cost": float(sum(known)) if known or None not in costs else None,   # неизвестное не ноль
+            "sessions_without_cost": costs.count(None)}
 
 
 def _session_cost(r: dict):
@@ -291,7 +304,7 @@ def _sessions(p: dict, recent: set[str]) -> list[dict]:
     return out
 
 
-def _tokens(p: dict, cost: float) -> dict:
+def _tokens(p: dict, cost: float | None) -> dict:
     spent = [r for r in p["records"] if isinstance(r.get("usage"), dict)]
 
     def total(rows, key):
@@ -304,10 +317,10 @@ def _tokens(p: dict, cost: float) -> dict:
         au = [a.get("usage") or {} for a in an]
         analyst = {"cost": acost, "searches": sum(a.get("searches") or 0 for a in an),
                    "tokens": {k: total(au, k) for k in ("input", "cache_read", "output")},
-                   "share": acost / cost if cost > 0 else None}
+                   "share": acost / cost if cost else None}
     return {"sessions": len(spent), "input": total(usage, "input"), "cache_read": total(usage, "cache_read"),
             "output": total(usage, "output"), "searches": total(usage, "searches"),
-            "cost_per_session": cost / len(spent) if spent else None, "analyst": analyst}
+            "cost_per_session": cost / len(spent) if spent and cost is not None else None, "analyst": analyst}
 
 
 def _owner(exp_dir: Path, ps: list[dict]) -> list[dict]:
@@ -362,6 +375,13 @@ def _incidents(ps: list[dict], checked: dict[str, list[str]], with_broker: set[s
                 x["text"] = t.get("error") or ", ".join(t.get("unpriced") or []) or x["text"]
         out += [{**{k: v for k, v in x.items() if k != "n"}, "text": f"{x['text'] + '; ' if x['text'] else ''}тиков: {x['n']}"}
                 for x in seen.values()]
+        blind: dict[str, list[str]] = {}
+        for e in p["orders"]:
+            if e.get("kind") == "liquidate" and e.get("reason") == "no_quote_entry_price":
+                blind.setdefault(e.get("day"), []).append(str(e.get("symbol")))
+        out += [{"kind": "serious", "day": d, "participant": pid, "title": ENTRY_PRICE_SALE,
+                 "text": ", ".join(syms) + ": ликвидация без котировки записана по цене входа, убыток или прибыль не видны"}
+                for d, syms in blind.items()]
         if pid in with_broker:
             bad = checked[pid]
             out.append({"kind": "critical" if bad else "good", "day": None, "participant": pid,
@@ -458,7 +478,7 @@ def build_report(exp_dir: Path, market: Market, broker_order_ids: Mapping[str, I
         checked[pid] = integrity(p["store"], ids.get(pid))
         done = [r for r in p["records"] if r.get("status") in DONE]
         verdicts[pid] = verdict({"sessions_done": len(done), "closed_trades": s["closed_trades"],
-                                 "missed_share": sum(r["status"] == "missed" for r in done) / len(done) if done else None,
+                                 "missed_share": sum(r["status"] in ("missed", "failed") for r in done) / len(done) if done else None,
                                  "dead": p["state"]["status"] == "dead", "integrity_violations": len(checked[pid]),
                                  "percentile": p["percentile"], "ci": p["ci"]}, cfg.criteria)
         p["done"] = len(done)

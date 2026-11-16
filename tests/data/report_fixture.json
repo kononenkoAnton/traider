@@ -7008,6 +7008,7 @@
    "percentile": 27.0,
    "reference": 0.24937499999999999,
    "return_pct": -0.3284726996341636,
+   "sessions_without_cost": 0,
    "trades": 2,
    "vs_spy_pp": -9.482615042200315
   },
@@ -7027,6 +7028,7 @@
    "percentile": 27.0,
    "reference": 0.24937499999999999,
    "return_pct": -0.3284726996341636,
+   "sessions_without_cost": 0,
    "trades": 2,
    "vs_spy_pp": -9.482615042200315
   },
@@ -7046,6 +7048,7 @@
    "percentile": 42.0,
    "reference": 0.24937499999999999,
    "return_pct": -0.07005509770038332,
+   "sessions_without_cost": 0,
    "trades": 2,
    "vs_spy_pp": -9.224197440266535
   },
@@ -7065,6 +7068,7 @@
    "percentile": 16.5,
    "reference": 0.24937499999999999,
    "return_pct": -0.30247977057702435,
+   "sessions_without_cost": 0,
    "trades": 3,
    "vs_spy_pp": -9.456622113143176
   },
@@ -7084,6 +7088,7 @@
    "percentile": 60.0,
    "reference": 0.24937499999999999,
    "return_pct": 0.309634384545876,
+   "sessions_without_cost": 0,
    "trades": 3,
    "vs_spy_pp": -8.844507958020277
   }
