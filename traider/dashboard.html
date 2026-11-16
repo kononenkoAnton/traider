@@ -835,7 +835,8 @@ function renderIncidents() {
 }
 
 /* ---------- полоса управления ---------- */
-/* Сервер (traider serve) отдаёт страницу и отвечает на control, pause, resume, stop рядом с ней. С диска полоса скрыта.
+/* Сервер (traider serve) отдаёт страницу и отвечает на control, pause, resume, stop рядом с ней. Не по http(s) (с диска,
+   из data:-адреса) полоса скрыта и запросов нет.
    Текст из ответов сервера кладётся только через textContent и createTextNode. */
 const CONTROL_STATES = { running: "работает", stopping: "останавливается", finishing: "завершается", finished: "завершён", damaged: "файл управления повреждён" };
 const ctl = { state: null, token: null, busy: false };
@@ -843,6 +844,7 @@ async function ask(path, body) {
   const r = await fetch(path, body === undefined ? { cache: "no-store" }
     : { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json", "X-Traider-Token": ctl.token || "" }, body: JSON.stringify(body) });
   const data = await r.json().catch(() => ({}));
+  if (r.status === 403) throw new Error("Сервер управления был перезапущен: состояние обновлено, нажмите ещё раз.");
   if (!r.ok) throw new Error(String(data.error || `сервер ответил ${r.status}`));
   return data;
 }
@@ -850,7 +852,8 @@ function showControl(st, err) {
   ctl.state = st;
   if (!st) { $("control-state").textContent = "нет связи с сервером управления"; return put("control-acts"); }
   const word = st.state === "paused" ? `на паузе с ${dayLabel(st.paused_since)}` : own(CONTROL_STATES, st.state) || String(st.state);
-  $("control-state").replaceChildren(h("b", {}, `Эксперимент ${st.experiment}: ${word}`),
+  const stopNote = st.state === "stopping" && st.stop ? `Заявка от ${dayLabel(st.stop.day)}. Позиции продаст ближайший тик при открытом рынке.` : null;
+  put("control-state", h("b", {}, `Эксперимент ${st.experiment}: ${word}`), stopNote ? h("small", {}, stopNote) : null,
     st.state === "damaged" ? h("small", {}, String(st.error ?? "")) : null, err ? h("small", {}, err) : null);
   const btn = (label, click, cls) => h("button", { type: "button", class: cls ? `btn ${cls}` : "btn", disabled: ctl.busy, onclick: click }, label);
   put("control-acts", st.state === "running" ? btn("Пауза", () => act("pause")) : null, st.state === "paused" ? btn("Продолжить", () => act("resume")) : null,
@@ -871,7 +874,7 @@ function openStop() { $("stop-name").textContent = ctl.state.experiment; stopInp
 stopInput.addEventListener("input", () => { stopOk.disabled = !ctl.state || stopInput.value !== ctl.state.experiment; });
 $("stop-cancel").addEventListener("click", () => $("stop-dialog").close());
 stopOk.addEventListener("click", () => { $("stop-dialog").close(); act("stop", { confirm: stopInput.value }); });
-if (location.protocol !== "file:") { $("control").hidden = false; refresh(); setInterval(() => { if (!ctl.busy) refresh(); }, 60000); }
+if (location.protocol === "http:" || location.protocol === "https:") { $("control").hidden = false; refresh(); setInterval(() => { if (!ctl.busy) refresh(); }, 60000); }
 
 function renderNotBuilt() {
   document.body.classList.add("not-built");

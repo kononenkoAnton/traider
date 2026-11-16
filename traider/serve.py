@@ -9,8 +9,9 @@
 переход на его страницу, иначе список), `GET /e/<имя>/` (файл `dashboard.html` эксперимента или, пока его нет, тот же
 шаблон с `meta.not_built`), `GET /e/<имя>/control` (`control.summary` плюс токен; повреждённый `control.json` даёт
 состояние `damaged` с текстом ошибки), `POST /e/<имя>/pause|resume|stop` (действие модуля control, ответ новый
-`summary`). Имя годно, только если в `runs_dir` есть такой каталог хотя бы с одним `*/config.json`; путь из запроса
-к пути на диске не приставляется. Всё прочее 404, другие методы получают ответ стандартной библиотеки.
+`summary`). Сегмент имени раскодируется из %-записи (ссылки списка кодируют имя целиком) и годен, только если в
+`runs_dir` есть такой каталог (не символическая ссылка) хотя бы с одним `*/config.json`; имя служит лишь ключом
+словаря каталогов, к пути на диске не приставляется. Всё прочее 404, другие методы получают ответ стандартной библиотеки.
 
 Защита от чужой веб-страницы в том же браузере: заголовок `Host` только `127.0.0.1:<порт>` или `localhost:<порт>`
 (подмена DNS), иначе 403 на любой запрос; `POST` только с `X-Traider-Token`, равным случайному токену этого запуска
@@ -34,6 +35,7 @@ import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 from traider.control import pause, request_stop, resume, summary
 from traider.dashboard import page
@@ -48,7 +50,7 @@ ACTION = re.compile(r"/e/([^/]+)/(pause|resume|stop)")
 
 
 def _experiments(runs_dir: Path) -> dict[str, Path]:
-    return {p.name: p for p in runs_dir.glob("*") if p.is_dir() and any(p.glob("*/config.json"))}
+    return {p.name: p for p in runs_dir.glob("*") if p.is_dir() and not p.is_symlink() and any(p.glob("*/config.json"))}
 
 
 def _state(exp: Path) -> str:
@@ -84,7 +86,7 @@ def make_server(runs_dir: Path, port: int = 8787, token: str | None = None) -> T
 
         def route(self, pattern: re.Pattern):
             m = pattern.fullmatch(self.path.split("?", 1)[0])
-            exp = m and _experiments(runs_dir).get(m[1])
+            exp = m and _experiments(runs_dir).get(unquote(m[1]))   # имя только ключ словаря, не путь
             return (exp, m[2]) if exp else (None, None)
 
         def do_GET(self):
@@ -109,10 +111,12 @@ def make_server(runs_dir: Path, port: int = 8787, token: str | None = None) -> T
             exps = _experiments(runs_dir)
             live = [name for name, exp in sorted(exps.items()) if _state(exp) != "finished"]
             if len(live) == 1:
-                return self.reply(302, "", "text/plain", [("Location", f"/e/{live[0]}/")])
-            items = "".join(f'<li><a href="/e/{html.escape(n)}/">{html.escape(n)}</a></li>' for n in sorted(exps))
-            self.reply(200, f'<!doctype html><meta charset="utf-8"><title>Traider</title><h1>Эксперименты</h1>'
-                            f'<ul>{items or "<li>в runs/ нет экспериментов</li>"}</ul>', "text/html")
+                return self.reply(302, "", "text/plain", [("Location", f"/e/{quote(live[0], safe='')}/")])
+            items = "".join(f'<li><a href="/e/{quote(n, safe="")}/">{html.escape(n)}</a></li>' for n in sorted(exps))
+            self.reply(200, '<!doctype html><html lang="ru"><meta charset="utf-8"><title>Traider</title>'
+                            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+                            '<body style="font:15px/1.5 system-ui,-apple-system,sans-serif;max-width:40rem;margin:2rem auto;padding:0 16px">'
+                            f'<h1>Эксперименты</h1><ul>{items or "<li>в runs/ нет экспериментов</li>"}</ul>', "text/html")
 
         def do_POST(self):
             given = self.headers.get("X-Traider-Token", "").encode("utf-8", "replace")

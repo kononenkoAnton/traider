@@ -5,7 +5,7 @@ type: category
 tags: ['decisions', 'history']
 categories: ['traider']
 created: 2026-11-14T15:07:28+00:00
-modified: 2026-11-16T06:00:00+00:00
+modified: 2026-11-16T07:00:00+00:00
 ---
 
 # Решения

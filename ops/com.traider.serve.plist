@@ -9,7 +9,8 @@
      Установка:  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.traider.serve.plist
      Проверка:   launchctl print gui/$(id -u)/com.traider.serve
      Снятие:     launchctl bootout gui/$(id -u)/com.traider.serve
-     С MacBook:  ssh -N -L 8787:127.0.0.1:8787 <пользователь>@<mac-mini>, затем откройте http://localhost:8787 --><plist version="1.0">
+     С MacBook:  ssh -N -L 8787:127.0.0.1:8787 <пользователь>@<mac-mini>, затем откройте http://localhost:8787
+     Порт на MacBook должен совпадать с портом сервера: при -L 9000:127.0.0.1:8787 каждый запрос получит 403. --><plist version="1.0">
 <dict>
     <key>Label</key>
     <string>com.traider.serve</string>

@@ -4,6 +4,7 @@ import ast
 import http.client
 import json
 import pathlib
+import re
 import shutil
 import signal
 import socket
@@ -148,10 +149,10 @@ def test_control_answer_is_not_cached_and_carries_the_token(served):
 def test_template_has_the_control_bar_and_no_external_address():
     t = TEMPLATE
     for word in ["работает", "на паузе с", "останавливается", "завершается", "завершён", "файл управления повреждён",
-                 "нет связи с сервером управления", "Пауза", "Продолжить", "Остановить всё", "Отмена", "Отчёт ещё не собран"]:
+                 "нет связи с сервером управления", "Сервер управления был перезапущен", "Позиции продаст ближайший тик", "Пауза", "Продолжить", "Остановить всё", "Отмена", "Отчёт ещё не собран"]:
         assert word in t, word
     assert 'id="control"' in t and 'aria-live="polite"' in t and "<dialog" in t and "showModal" in t
-    assert 'location.protocol !== "file:"' in t and 'ask("control")' in t and "X-Traider-Token" in t
+    assert 'location.protocol === "http:" || location.protocol === "https:"' in t and 'protocol !== "file:"' not in t and 'ask("control")' in t and "X-Traider-Token" in t
     assert "prompt(" not in t and "confirm(" not in t and "innerHTML" not in t
     assert "https://" not in t and "http://" not in t.replace("http://www.w3.org", "")
 
@@ -261,7 +262,7 @@ def test_the_server_builds_no_broker_reads_no_env_and_opens_no_connection():
     names = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     names |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
     assert names <= {"hmac", "html", "json", "re", "secrets", "signal", "sys", "threading", "datetime", "http.server",
-                     "pathlib", "traider.control", "traider.dashboard", "traider.market"}, names
+                     "pathlib", "urllib.parse", "traider.control", "traider.dashboard", "traider.market"}, names
     imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module == "traider.market" for a in n.names}
     assert imported <= {"NY", "today"}                                            # из рынка только часы, без клиента
 
@@ -290,3 +291,33 @@ def test_cli_serve_passes_the_port(monkeypatch):
     monkeypatch.setattr(cli, "main_serve", lambda runs, port: seen.append((runs, port)) or 0)
     assert cli.main(["serve"]) == 0 and cli.main(["serve", "--port", "9000"]) == 0
     assert seen == [(cli.RUNS, 8787), (cli.RUNS, 9000)]
+
+
+# --- задача 7, первый круг правок ---
+
+def test_control_bar_inserts_into_the_page_only_through_put_and_h():
+    bar = TEMPLATE[TEMPLATE.index("/* ---------- полоса управления"):TEMPLATE.index("function renderNotBuilt")]
+    assert "replaceChildren(" not in bar and ".append(" not in bar    # DOM превращает null в текст «null», put() его отбрасывает
+
+
+def test_a_symlink_in_runs_is_not_an_experiment(served, tmp_path):
+    base, port, token, runs = served
+    outside = tmp_path / "outside"
+    shutil.copytree(runs / "pilot-1", outside / "pilot-x")
+    (outside / "pilot-x" / "dashboard.html").write_text("чужой файл", encoding="utf-8")
+    (runs / "pilot-x").symlink_to(outside / "pilot-x", target_is_directory=True)
+    assert get(base, "/e/pilot-x/", host=f"127.0.0.1:{port}").status == 404
+    assert post(base, "/e/pilot-x/pause", host=f"127.0.0.1:{port}", token=token).status == 404
+
+
+def test_a_name_with_odd_characters_is_reachable_through_its_quoted_link(served):
+    base, port, token, runs = served
+    host = f"127.0.0.1:{port}"
+    shutil.copytree(runs / "pilot-1", runs / "пилот 2?")
+    page = get(base, "/", host=host).body.decode()
+    link = re.search(r'href="(/e/[^"]*%3F[^"]*)"', page)[1]
+    assert get(base, link + "control", host=host).json["experiment"] == "пилот 2?"
+    assert post(base, link + "pause", host=host, token=token).json["state"] == "paused"
+    assert read_control(runs / "пилот 2?")["pauses"][0]["to"] is None
+    for path in ("/e/..%2F..%2Fetc/", "/e/%2e%2e/", "/e/%zz/", "/e/pilot-1%2F/", "/e/%2E%2E%2F.env/", "/e/%ff/"):
+        assert get(base, path, host=host).status == 404, path
