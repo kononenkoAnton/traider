@@ -12,10 +12,15 @@
 готовое название); число, которого в отчёте нет (None), показано как «—». `upsert_results` создаёт статью или
 обновляет её (`created` сохраняется), вписывает её в блок `ai` категории `results`, если её там нет, и ставит `modified`
 у статьи, категории `results` и корня `traider` (категория не уходит назад, если часы отстают от записи).
-Файлы вики пишутся через временный файл и переименование, frontmatter пишется здесь же в формате
-существующих статей. Имя эксперимента должно быть слагом `[A-Za-z0-9_-]+`, иначе `ValueError` до любой записи.
+Файлы вики пишутся через временный файл с уникальным именем и переименование, frontmatter пишется здесь же в формате
+существующих статей. Перед любой записью читаются обе категории и проверяются (есть файл, frontmatter с `modified`, у
+`results` блок `ai`; есть каталог `articles`), иначе исключение без записи; пишутся по порядку корень `traider`, категория `results`,
+статья. Обновление существующей статьи, прерванное после любой записи, оставляет вики, которую принимает проверка; при первом создании
+между записью категории и статьи остаётся ссылка на ещё не созданную статью (две записи в разные файлы атомарно не сделать). `modified` статьи не идёт назад и не раньше `created`, у категорий не раньше `modified` статьи. Имя эксперимента должно быть слагом `[A-Za-z0-9_-]+`, иначе `ValueError` до любой записи.
 
-`report_due(exp_dir, day)` истинно, когда за `day` отчёта ещё нет и: у каждого прогона со статусом `active` есть запись
+`report_due(exp_dir, day)`: когда все прогоны `finished` или `dead`, истинно один раз, в первый день `day` позже последней строки
+`ticks.jsonl` любого прогона, если `report.json` нет или статусы его `participants` не равны текущим (дальше они равны, отчёт больше не нужен).
+Иначе истинно, когда за `day` отчёта ещё нет и: у каждого прогона со статусом `active` есть запись
 сессии за `day`; а если активных нет, хотя бы у одного прогона вне `finished` и `dead` есть строка тика за `day`
 (прогон ждёт конца: `finishing` или `invalid` идут тиками каждый день, без тика за день отчёту нечего добавить).
 Отчёт «собран за `day`», когда в существующем `report.json` день `meta.generated_at` (по Нью-Йорку) равен `day` и
@@ -25,6 +30,7 @@
 import json
 import os
 import re
+import uuid
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,9 +49,13 @@ AI = ("<!-- ai:start -->", "<!-- ai:end -->")
 
 
 def _write(path: Path, text: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")   # у каждой записи свой файл: две сборки не мешают друг другу
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _f(x, spec: str = ".2f", pre: str = "", post: str = "") -> str:
@@ -88,7 +98,7 @@ def results_article(report: Mapping) -> str:
         f"{_f(money['month_spend_usd'], '.2f', '$')} из ${meta['credits_month_usd']} кредитов.",
         f"- Отчёт собран {meta['generated_at']}.", "",
         "## Участники", "",
-        "| Участник | Капитал | Доход | Место среди случайных, % | Оценка прогнозов (Брайер) | Расход | Вердикт |",
+        "| Участник | Капитал | Доход | Обогнал случайных, % | Оценка прогнозов (Брайер) | Расход | Вердикт |",
         "|---|---|---|---|---|---|---|", *(rows or [f"| {DASH} | {DASH} | {DASH} | {DASH} | {DASH} | {DASH} | {DASH} |"]), "",
         "## Три сравнения", "",
         f"- Близнецы. Разница доходностей opus-a и opus-b {_f(twins['diff_pp'], '+.2f', '', ' п.п.')}; общих покупок "
@@ -109,18 +119,18 @@ def _field(text: str, name: str) -> str | None:
     return m and m.group(1).strip()
 
 
-def _later(old: str | None, now: datetime) -> str:
-    """Новое `modified`: не раньше прежнего (часы бывают отстающие)."""
+def _time(x) -> datetime | None:
     try:
-        return max(datetime.fromisoformat(old), now).isoformat() if old else now.isoformat()
+        return datetime.fromisoformat(x)
     except (ValueError, TypeError):
-        return now.isoformat()
+        return None
 
 
-def _touch(path: Path, now: datetime, entry: tuple[str, str] | None = None) -> None:
-    """Категория: `modified` вперёд; со статьёй (id, текст записи) ещё и запись в блок `ai`, если её там нет."""
-    text = path.read_text(encoding="utf-8")
-    text = re.sub(r"^modified: .*$", lambda _: f"modified: {_later(_field(text, 'modified'), now)}", text, count=1, flags=re.M)
+def _touch(path: Path, text: str, modified: datetime, entry: tuple[str, str] | None = None) -> None:
+    """Категория: `modified` не назад (и не раньше статьи); со статьёй (id, текст записи) ещё и запись в блок `ai`."""
+    old = _time(_field(text, "modified"))
+    when = max(old, modified) if old else modified
+    text = re.sub(r"^modified: .*$", lambda _: f"modified: {when.isoformat()}", text, count=1, flags=re.M)
     if entry:
         head, rest = text.split(AI[0], 1)
         block, tail = rest.split(AI[1], 1)
@@ -131,22 +141,41 @@ def _touch(path: Path, now: datetime, entry: tuple[str, str] | None = None) -> N
     _write(path, text)
 
 
+def _category(path: Path, ai: bool) -> str:
+    """Текст категории, годный к правке; иначе исключение до любой записи."""
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n") or _time(_field(text, "modified")) is None:
+        raise ValueError(f"{path}: нет frontmatter с полем modified")
+    if ai and not (text.count(AI[0]) == 1 and text.count(AI[1]) == 1 and text.index(AI[0]) < text.index(AI[1])):
+        raise ValueError(f"{path}: нет блока ai (по одному маркеру начала и конца)")
+    return text
+
+
 def upsert_results(wiki_dir: Path, report: Mapping, now: datetime) -> Path:
     exp = report["meta"]["experiment"]
     if not isinstance(exp, str) or not SLUG.fullmatch(exp):
         raise ValueError(f"имя эксперимента негодно для статьи вики: {exp!r}")
     wiki, aid = Path(wiki_dir), f"results-{exp}"
     path = wiki / "articles" / f"{aid}.md"
+    root, results = wiki / "categories" / "traider.md", wiki / "categories" / "results.md"
+    root_text, results_text = _category(root, False), _category(results, True)   # до любой записи
+    if not path.parent.is_dir():
+        raise ValueError(f"{wiki}: нет каталога articles")
     now = now.astimezone(timezone.utc).replace(microsecond=0)
     old = path.read_text(encoding="utf-8") if path.exists() else ""
+    created = _time(_field(old, "created")) or now
+    prev = _time(_field(old, "modified"))
+    modified = max(now, created, *([prev] if prev else []))   # не назад и не раньше `created`
     kind = "pilot" if report["meta"]["pilot"] else "official"
+    entry = (aid, f"### [[{aid}|Результаты: {exp}]]\n"
+             f"Отчёт {'пилота' if kind == 'pilot' else 'прогона'} {exp}: участники, сравнения, происшествия. Обновляется программой.")
+    # порядок: корень, категория, статья; оборванное обновление оставляет вики, которую проверка принимает
+    _touch(root, root_text, modified)
+    _touch(results, results_text, modified, entry)
     _write(path, "\n".join([
         "---", f"id: {aid}", f'title: "Результаты: {exp}"', "type: leaf", f"tags: ['results', '{kind}']",
-        "categories: ['results']", f"created: {_field(old, 'created') or now.isoformat()}", f"modified: {now.isoformat()}",
+        "categories: ['results']", f"created: {created.isoformat()}", f"modified: {modified.isoformat()}",
         "---", "", results_article(report)]))
-    _touch(wiki / "categories" / "results.md", now, (aid, f"### [[{aid}|Результаты: {exp}]]\n"
-           f"Отчёт {'пилота' if kind == 'pilot' else 'прогона'} {exp}: участники, сравнения, происшествия. Обновляется программой."))
-    _touch(wiki / "categories" / "traider.md", now)
     return path
 
 
@@ -165,10 +194,24 @@ def _built(exp_dir: Path, day: str, stores: Mapping[str, RunStore]) -> bool:
         return False
 
 
+def _final_due(exp_dir: Path, day: str, stores: Mapping[str, RunStore], status: Mapping[str, str]) -> bool:
+    """Все прогоны окончены: один итоговый отчёт в первый открытый день после последнего тика, пока отчёт не
+    показывает текущие статусы участников (прогнозы последнего дня к тому дню созрели)."""
+    try:
+        rep = json.loads((exp_dir / "report.json").read_text(encoding="utf-8"))
+        if {p["id"]: p["status"] for p in rep["participants"]} == dict(status):
+            return False
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return all(day > (t.get("day") or "") for st in stores.values() for t in st.ticks()[-1:])
+
+
 def report_due(exp_dir: Path, day: str) -> bool:
     exp_dir = Path(exp_dir)
     stores = {c.parent.name: RunStore(c.parent) for c in sorted(exp_dir.glob("*/config.json"))}
     status = {pid: st.state()["status"] for pid, st in stores.items()}
+    if stores and all(s in TERMINAL_STATUSES for s in status.values()):
+        return _final_due(exp_dir, day, stores, status)
     active = [pid for pid, s in status.items() if s == "active"]
     ready = (all(_day_status(stores[pid], day) for pid in active) if active else
              any(s not in TERMINAL_STATUSES and any(t.get("day") == day for t in stores[pid].ticks())

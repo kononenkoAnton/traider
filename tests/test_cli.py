@@ -1,3 +1,4 @@
+import json
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -125,8 +126,8 @@ def world(tmp_path, example, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(ENV)
     start_experiment(example, tmp_path / "runs")
-    w = SimpleNamespace(market=SimpleNamespace(now=lambda: datetime(2026, 12, 1, 15, 5, tzinfo=timezone.utc)),
-                        calls=[], api=Api(), apis=[], root=tmp_path)
+    w = SimpleNamespace(calls=[], api=Api(), apis=[], root=tmp_path, open=True)
+    w.market = SimpleNamespace(now=lambda: datetime(2026, 12, 1, 15, 5, tzinfo=timezone.utc), is_open=lambda: w.open)
 
     def write(exp, market, wiki, ids=None):
         w.calls.append((exp.name, market, wiki, ids))
@@ -143,9 +144,14 @@ def world(tmp_path, example, monkeypatch):
     return w
 
 
-def started(w):
-    """opus-a «обращался к брокеру»: run_uid и время первого обращения, как их пишет AlpacaBroker."""
-    RunStore(w.root / "runs" / "pilot-1" / "opus-a").update_state(run_uid="u1", broker_since="2026-12-01T14:00:00+00:00")
+def started(w, last_sync="2026-12-01T15:00:00+00:00"):
+    """opus-a «обращался к брокеру»: run_uid и время первого обращения, как их пишет AlpacaBroker, и последняя сверка."""
+    RunStore(w.root / "runs" / "pilot-1" / "opus-a").update_state(
+        run_uid="u1", broker_since="2026-12-01T14:00:00+00:00", last_sync=last_sync)
+
+
+def at(h, m):
+    return datetime(2026, 12, 1, h, m, tzinfo=timezone.utc)
 
 
 def test_report_prints_the_paths_and_passes_no_wiki_by_default(world, capsys):
@@ -172,6 +178,34 @@ def test_report_without_a_name_covers_every_experiment_in_runs(world, example, t
     assert capsys.readouterr().out.count("report.json") == 2
 
 
+def test_no_experiments_is_one_line_and_code_0(world, capsys):
+    shutil.rmtree(world.root / "runs")
+    assert main(["report"]) == 0
+    assert len(capsys.readouterr().err.strip().splitlines()) == 1 and not world.calls
+
+
+def test_one_failing_experiment_does_not_stop_the_others_and_the_command_returns_1(world, example, tmp_path, capsys):
+    other = tmp_path / "other"; other.mkdir()
+    shutil.copytree(example.parent, other / "exp")
+    toml = other / "exp" / "experiment.toml"
+    toml.write_text(toml.read_text().replace('experiment = "pilot-1"', 'experiment = "second"').replace('broker = "alpaca"', 'broker = "sim"'))
+    start_experiment(toml, tmp_path / "runs")
+    started(world)
+    real = cli.write_report
+
+    def flaky(exp, market, wiki, ids=None):
+        if exp.name == "pilot-1":
+            raise RuntimeError("упал")
+        return real(exp, market, wiki, ids)
+    cli.write_report = flaky
+    try:
+        assert main(["report"]) == 1
+    finally:
+        cli.write_report = real
+    out, err = capsys.readouterr()
+    assert [c[0] for c in world.calls] == ["second"] and "second/report.json" in out and "упал" in err
+
+
 def test_unknown_experiment_is_one_line_and_code_2(world, capsys):
     assert main(["report", "nope"]) == 2
     assert len(capsys.readouterr().err.strip().splitlines()) == 1 and not world.calls
@@ -191,14 +225,52 @@ def test_a_market_error_is_one_line_and_code_1(world, capsys):
     assert len(err) == 1 and "рынок недоступен" in err[0]
 
 
-def test_broker_ids_are_the_filled_orders_with_this_runs_prefix(world, capsys):
-    started(world)
-    world.api.orders = [{"id": "mine-1", "client_order_id": "pilot-1/opus-a/u1/buy/1"},
-                        {"id": "other-run", "client_order_id": "pilot-1/opus-a/zzzz/buy/1"},
-                        {"id": "by-hand", "client_order_id": None}]
+def test_broker_ids_are_the_filled_orders_with_this_runs_prefix_made_before_the_last_sync(world, capsys):
+    started(world)                                                  # last_sync 15:00, граница 14:58
+    world.api.orders = [{"id": "mine-1", "client_order_id": "pilot-1/opus-a/u1/buy/1", "filled_at": at(14, 30)},
+                        {"id": "edge", "client_order_id": "pilot-1/opus-a/u1/stop/AAPL/1", "filled_at": at(14, 58)},
+                        {"id": "late", "client_order_id": "pilot-1/opus-a/u1/buy/2", "filled_at": at(14, 59)},
+                        {"id": "other-run", "client_order_id": "pilot-1/opus-a/zzzz/buy/1", "filled_at": at(14, 30)},
+                        {"id": "by-hand", "client_order_id": None, "filled_at": at(14, 30)}]
     assert main(["report", "pilot-1"]) == 0
-    assert world.calls[0][3] == {"opus-a": ["mine-1"]}
+    assert world.calls[0][3] == {"opus-a": ["mine-1", "edge"]}
     assert world.apis == ["opus-a"] and world.api.asked == [datetime(2026, 11, 30, 14, 0, tzinfo=timezone.utc)]
+
+
+def test_without_last_sync_the_last_tick_row_is_the_sync_time(world):
+    started(world, last_sync=None)
+    RunStore(world.root / "runs" / "pilot-1" / "opus-a").append_tick({"ts": "2026-12-01T15:00:00+00:00", "day": "2026-12-01", "action": "safety"})
+    world.api.orders = [{"id": "a", "client_order_id": "pilot-1/opus-a/u1/x", "filled_at": at(14, 50)},
+                        {"id": "b", "client_order_id": "pilot-1/opus-a/u1/y", "filled_at": at(14, 59)}]
+    assert main(["report", "pilot-1"]) == 0 and world.calls[0][3] == {"opus-a": ["a"]}
+
+
+def test_without_last_sync_and_tick_rows_the_check_is_skipped_with_a_line(world, capsys):
+    started(world, last_sync=None)
+    assert main(["report", "pilot-1"]) == 0
+    err = capsys.readouterr().err.strip().splitlines()
+    assert world.apis == [] and world.calls[0][3] == {} and len(err) == 1 and "пропущена" in err[0]
+
+
+def test_a_fill_after_the_last_sync_is_no_violation_but_an_older_missing_one_is(played, tmp_path, monkeypatch):
+    """Настоящий write_report на мире `played`: прогон pilot-1 лежит в runs/ рабочего каталога."""
+    exp, market = played
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(ENV)
+    api = Api()
+    monkeypatch.setattr(cli, "AlpacaMarket", lambda k, s: market)
+    monkeypatch.setattr(cli, "make_alpaca_api", lambda cfg, env: api)
+    RunStore(exp / "opus-a").update_state(run_uid="u1", broker_since="2026-12-01T14:00:00+00:00", last_sync="2026-12-03T20:00:00+00:00")
+    pref = "pilot-1/opus-a/u1/"
+    api.orders = [{"id": "late", "client_order_id": pref + "stop/XLE/1", "filled_at": datetime(2026, 12, 3, 19, 59, tzinfo=timezone.utc)}]
+    assert main(["report", "pilot-1"]) == 0
+    rep = json.loads((exp / "report.json").read_text())
+    assert rep["verdict"]["by_participant"]["opus-a"] != "red" and not any(i["kind"] == "critical" for i in rep["incidents"])
+    api.orders = [{"id": "missing-1", "client_order_id": pref + "stop/XLE/1", "filled_at": datetime(2026, 12, 3, 19, 0, tzinfo=timezone.utc)}]
+    assert main(["report", "pilot-1"]) == 0
+    rep = json.loads((exp / "report.json").read_text())
+    assert rep["verdict"]["by_participant"]["opus-a"] == "red"
+    assert any(i["kind"] == "critical" and "missing-1" in i["text"] for i in rep["incidents"])
 
 
 def test_the_api_is_not_asked_for_a_run_that_fails_the_mode_and_broker_check(world, capsys):
@@ -222,6 +294,14 @@ def test_a_failing_broker_request_skips_the_check_and_still_builds(world, capsys
     assert world.calls[0][3] == {} and len(world.calls) == 1
     err = capsys.readouterr().err.strip().splitlines()
     assert len(err) == 1 and "пропущена" in err[0] and "нет связи" in err[0]
+
+
+def test_the_broker_is_decided_by_the_recorded_started_with_not_by_the_config(world, capsys):
+    RunStore(world.root / "runs" / "pilot-1" / "opus-a").update_state(started_with={"mode": "paper", "broker": "sim"})
+    RunStore(world.root / "runs" / "pilot-1" / "haiku").update_state(started_with={"mode": "paper", "broker": "alpaca"})
+    assert main(["report", "pilot-1"]) == 0
+    err = capsys.readouterr().err.strip().splitlines()
+    assert world.apis == [] and len(err) == 1 and "pilot-1/haiku" in err[0]    # haiku: записан alpaca, конфиг правили
 
 
 def test_sim_participants_are_never_sent_to_the_broker(world):
@@ -263,11 +343,37 @@ def test_auto_report_without_the_option_touches_no_wiki(world, monkeypatch):
     assert world.calls[0][2] is None
 
 
-def test_auto_report_is_skipped_when_the_market_was_closed(world, monkeypatch):
+def test_auto_report_is_skipped_when_the_market_is_closed(world, monkeypatch):
+    world.open = False
     monkeypatch.setattr(cli, "Anthropic", lambda **kw: None)
     monkeypatch.setattr(cli, "report_due", lambda exp, day: pytest.fail("не должен вызываться"))
     monkeypatch.setattr(cli, "tick", tick_returning([]))
     assert main(["tick"]) == 0 and not world.calls
+
+
+def test_auto_report_is_attempted_on_an_open_market_even_when_the_tick_returned_nothing(world, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "Anthropic", lambda **kw: None)
+    monkeypatch.setattr(cli, "report_due", lambda exp, day: True)
+    monkeypatch.setattr(cli, "tick", tick_returning([]))
+    assert main(["tick"]) == 0 and [c[0] for c in world.calls] == ["pilot-1"] and capsys.readouterr().out == ""
+
+
+def test_a_blocked_auto_report_is_cut_off_by_the_alarm(world, capsys, monkeypatch):
+    import signal
+    import time
+    old = signal.getsignal(signal.SIGALRM)
+    monkeypatch.setattr(cli, "AUTO_REPORT_SECONDS", 1)
+    monkeypatch.setattr(cli, "Anthropic", lambda **kw: None)
+    monkeypatch.setattr(cli, "report_due", lambda exp, day: True)
+    monkeypatch.setattr(cli, "write_report", lambda *a, **k: time.sleep(10))
+    started(world)
+    monkeypatch.setattr(cli, "tick", tick_returning([{"experiment": "pilot-1", "participant": "haiku", "action": "safety", "ts": TS}]))
+    t0 = time.monotonic()
+    assert main(["tick"]) == 0
+    cap = capsys.readouterr()
+    assert time.monotonic() - t0 < 5 and cap.out.splitlines() == ["2026-12-01 10:05 pilot-1/haiku: safety"]
+    assert len(cap.err.strip().splitlines()) == 1 and "TimeoutError" in cap.err
+    assert signal.alarm(0) == 0 and signal.getsignal(signal.SIGALRM) is old
 
 
 def test_a_failing_report_due_is_one_stderr_line_too(world, capsys, monkeypatch):

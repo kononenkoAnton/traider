@@ -19,7 +19,7 @@
 поэтому в этот день снимок отчёта строится всегда (без свечи у бумаги берётся сохранённая цена; ликвидация
 главнее других исполнений бумаги). Ограничение: лот, купленный и ликвидированный в сам день гибели, повтор
 покупает по цене ликвидации, и убытка у этого лота нет; лоты, купленные раньше, получают падение целиком.
-Нет свечей бенчмарка: `spy` и `vs_spy_pp` None. `beyond_noise` None,
+Участник, у которого записанный при старте брокер `alpaca` (без записи: брокер конфига), а id заявок брокера не переданы, даёт происшествие `warning` «проверка по брокеру не проведена»; общее происшествие о целостности `good` только когда проведены все применимые проверки и они чисты. Нет свечей бенчмарка: `spy` и `vs_spy_pp` None. `beyond_noise` None,
 пока разница близнецов по модулю меньше 1e-9 (шум float) или у одного из них нет покупок. Место среди ботов: None, пока нет
 покупок. Капитал счёта, HP и доля HP берутся из `ticks.jsonl`: последний тик дня с числом, иначе None.
 Прогнозы: `brier`, `reference`, `ci` по панели, `brier_picks` по прогнозам купленных в тот же день бумаг;
@@ -75,6 +75,7 @@ TICK_INCIDENTS = {"unpriced": ("serious", "нет котировки у удер
 SESSION_INCIDENTS = {"missed": ("critical", "пропущенный день"), "failed": ("serious", "сбой сессии"),
                      "cap": ("warning", "сессия упёрлась в потолок")}
 DONE = ("ok", "cap", "failed", "missed")
+NOT_CHECKED = "проверка по брокеру не проведена"
 
 
 def verdict(m: Mapping, criteria: Mapping) -> str:
@@ -302,7 +303,7 @@ def _tokens(p: dict, cost: float) -> dict:
             "cost_per_session": cost / len(spent) if spent else None, "analyst": analyst}
 
 
-def _incidents(ps: list[dict], checked: dict[str, list[str]], with_broker: set[str]) -> list[dict]:
+def _incidents(ps: list[dict], checked: dict[str, list[str]], with_broker: set[str], on_alpaca: set[str]) -> list[dict]:
     out = []
     for p in ps:
         pid = p["id"]
@@ -333,11 +334,16 @@ def _incidents(ps: list[dict], checked: dict[str, list[str]], with_broker: set[s
             out.append({"kind": "critical" if bad else "good", "day": None, "participant": pid,
                         "title": "целостность записей нарушена" if bad else "целостность в порядке",
                         "text": ", ".join(bad) or "все исполненные заявки брокера есть в журнале"})
+        elif pid in on_alpaca:   # счёт брокера есть, а сверки не было: «в порядке» про него никто не прочтёт
+            out.append({"kind": "warning", "day": None, "participant": pid, "title": NOT_CHECKED,
+                        "text": "заявки брокера не сверены с журналом"})
     bad = {pid: v for pid, v in checked.items() if v}
-    out.append({"kind": "critical" if bad else "good", "day": None, "participant": None,
-                "title": "целостность записей нарушена" if bad else "целостность в порядке",
+    unchecked = on_alpaca - with_broker
+    out.append({"kind": "critical" if bad else "warning" if unchecked else "good", "day": None, "participant": None,
+                "title": "целостность записей нарушена" if bad else NOT_CHECKED if unchecked else "целостность в порядке",
                 "text": "; ".join(f"{pid}: {', '.join(v)}" for pid, v in bad.items())
-                        or "журналы без пропусков, заявки брокера на месте"})
+                        or ("сверка с брокером не проведена у: " + ", ".join(sorted(unchecked)) if unchecked else
+                            "журналы без пропусков, заявки брокера на месте")})
     return out
 
 
@@ -428,7 +434,8 @@ def build_report(exp_dir: Path, market: Market, broker_order_ids: Mapping[str, I
     rejects = Counter(e.get("reason") for p in ps for e in p["orders"] if e.get("kind") == "reject")
     twins = [verdicts[x] for x in ("opus-a", "opus-b") if x in verdicts]
     first = ps[0]["cfg"] if ps else None
-    incidents = _incidents(ps, checked, {pid for pid in order if pid in ids})
+    on_alpaca = {p["id"] for p in ps if (p["state"].get("started_with") or {}).get("broker", p["cfg"].broker) == "alpaca"}
+    incidents = _incidents(ps, checked, {pid for pid in order if pid in ids}, on_alpaca)
     severity = ("critical", "serious", "warning", "good")
     incidents.sort(key=lambda i: (i["day"] is None, i["day"] or "", severity.index(i["kind"]),
                                   order.index(i["participant"]) if i["participant"] in order else len(order), i["title"]))

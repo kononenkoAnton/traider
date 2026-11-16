@@ -24,11 +24,15 @@
 команда спрашивает у API (`make_alpaca_api`, больше ничего у брокера) исполненные заявки с первого обращения прогона и передаёт
 отчёту id тех, что несут префикс этого прогона; только для прогона, у которого `started_with` совпал с режимом и брокером
 конфига, как у тика. Иначе, и при сбое запроса, проверка брокера пропускается одной строкой в stderr, отчёт строится.
-`tick [--wiki DIR]` после обхода, когда замок уже снят и рынок был открыт, для каждого эксперимента с `report_due` на сегодняшний день
-рынка собирает отчёт тем же путём; любое исключение там это одна строка в stderr, строки тика и код выхода не меняются.
+`tick [--wiki DIR]` после обхода, когда замок уже снят и рынок открыт (его спрашивает команда у рынка: тик пуст и без активных
+прогонов), для каждого эксперимента с `report_due` на сегодняшний день рынка собирает отчёт тем же путём; любое исключение там
+это одна строка в stderr, строки тика и код выхода не меняются. Весь раздел ограничен `AUTO_REPORT_SECONDS` (`signal.alarm`, прежние
+обработчик и будильник возвращаются), ручной `report` не ограничен. Брокера проверяют по записанному при старте `started_with["broker"]`.
+Сверка идёт по заявкам с `filled_at` не позже последней сверки (`last_sync`, без него последняя строка тика) минус две минуты.
 Планировщик (`ops/com.traider.tick.plist`) вручную ставит владелец, без `--wiki`.
 """
 import argparse
+import signal
 import sys
 import tomllib
 from collections.abc import Sequence
@@ -50,6 +54,8 @@ RUNS = Path("runs")
 KEYS = ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ANTHROPIC_API_KEY")
 MONTH_DAYS = 21               # торговых дней в месяце для оценки худшего расхода
 API_TIMEOUT = 300.0           # секунд на каждое ожидание сети в одном запросе (связь, каждое чтение потока)
+AUTO_REPORT_SECONDS = 120     # потолок всего отчёта после тика (рынок, API брокера, запись файлов)
+SYNC_MARGIN = timedelta(minutes=2)   # заявки позже последней сверки минус это в сверку целостности не идут
 API_RETRIES = 2               # повторов одного запроса после сбоя связи, 408, 409, 429 и 5xx
 
 
@@ -93,8 +99,7 @@ def _tick(args) -> int:
         extra = f" {r['status']} ${r['cost']:.2f}" if r["action"] == "session" else f" {r['error']}" if "error" in r else ""
         when = datetime.fromisoformat(r["ts"]).astimezone(NY).strftime("%Y-%m-%d %H:%M")
         print(f"{when} {r['experiment']}/{r['participant']}: {r['action']}{extra}")
-    if results:   # рынок был открыт; замок тика уже снят
-        _auto_report(market, env, args.wiki)
+    _auto_report(market, env, args.wiki)   # замок тика уже снят
     return 0
 
 
@@ -102,24 +107,38 @@ def _experiments() -> list[Path]:
     return sorted(p for p in RUNS.glob("*") if p.is_dir() and any(p.glob("*/config.json")))
 
 
+def _synced(state: dict, run: Path) -> datetime:
+    """Время последней завершённой сверки: `last_sync` из состояния (пишут оба брокера), без него время последней строки
+    `ticks.jsonl`; нет ни того ни другого: ValueError."""
+    when = state.get("last_sync") or next((t["ts"] for t in reversed(RunStore(run).ticks()) if t.get("ts")), None)
+    if when is None:
+        raise ValueError("нет ни last_sync, ни строки тика: нечем отделить заявки, которые журнал ещё не успел записать")
+    return datetime.fromisoformat(when)
+
+
 def _broker_ids(exp: Path, env) -> dict[str, list[str]]:
-    """Исполненные заявки брокера с префиксом прогона, по участникам со счётом Alpaca. Прогон, не прошедший проверку режима
-    и брокера, или запрос, который не удался, даёт строку в stderr и ничего в ответ; к брокеру ходит только API."""
+    """Исполненные заявки брокера с префиксом прогона, по участникам, чей записанный при старте брокер `alpaca`. Берутся
+    заявки с `filled_at` (время исполнения из `filled_orders_since`) не позже последней сверки минус SYNC_MARGIN: позже
+    журнал мог ещё не успеть записать, это не нарушение. Прогон, не прошедший проверку режима и брокера, без времени
+    сверки или с неудавшимся запросом даёт строку в stderr и ничего в ответ; к брокеру ходит только API."""
     out = {}
     for run in sorted(c.parent for c in exp.glob("*/config.json")):
         cfg, _ = load_run(run)
-        if cfg.broker != "alpaca":
-            continue
         state, who = RunStore(run).state(), f"{cfg.experiment}/{cfg.participant}"
+        recorded = (state.get("started_with") or {}).get("broker", cfg.broker)
+        if recorded != "alpaca":
+            continue
         try:
             if state.get("started_with") != {"mode": cfg.mode, "broker": cfg.broker}:
                 raise ValueError("конфиг не совпадает с режимом и брокером, записанными при старте")
             if "run_uid" not in state:
                 raise ValueError("прогон ещё не обращался к брокеру")
+            cutoff = _synced(state, run) - SYNC_MARGIN
             prefix = f"{cfg.experiment}/{cfg.participant}/{state['run_uid']}/"
             since = datetime.fromisoformat(state["broker_since"]) - timedelta(days=1)   # запас на часы, как у sync
             out[cfg.participant] = [o["id"] for o in make_alpaca_api(cfg, env).filled_orders_since(since)
-                                    if (o["client_order_id"] or "").startswith(prefix)]
+                                    if (o["client_order_id"] or "").startswith(prefix)
+                                    and o.get("filled_at") is not None and o["filled_at"] <= cutoff]
         except Exception as e:
             print(f"{who}: проверка брокера пропущена ({type(e).__name__}: {e})", file=sys.stderr)
     return out
@@ -129,18 +148,37 @@ def _build(exp: Path, market, env, wiki: Path | None) -> None:
     write_report(exp, market, wiki, _broker_ids(exp, env))
 
 
+def _on_alarm(signum, frame):
+    raise TimeoutError(f"не уложился в {AUTO_REPORT_SECONDS} с")
+
+
 def _auto_report(market, env, wiki: Path | None) -> None:
-    """Ничего не печатает в stdout и не бросает: отчёт не должен менять ни строки тика, ни код выхода."""
+    """Ничего не печатает в stdout и не бросает: отчёт не должен менять ни строки тика, ни код выхода. Весь раздел, с
+    запросами к рынку и брокеру, ограничен будильником: зависший запрос не должен держать задание launchd, а с ним
+    проверку HP и стопы следующих тиков."""
+    prev = None
     try:
+        prev = signal.signal(signal.SIGALRM, _on_alarm)
+        pending = signal.alarm(AUTO_REPORT_SECONDS)
+        if not market.is_open():   # тик пуст и при закрытом рынке, и когда все прогоны окончены: открытость спрашиваем у рынка
+            return
         day = ny_day(market.now())
         for exp in _experiments():
             try:
                 if report_due(exp, day):
                     _build(exp, market, env, wiki)
+            except TimeoutError:
+                raise
             except Exception as e:
                 print(f"отчёт {exp.name} не собран: {type(e).__name__}: {e}", file=sys.stderr)
     except Exception as e:
         print(f"отчёты не собраны: {type(e).__name__}: {e}", file=sys.stderr)
+    finally:
+        if prev is not None:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, prev)
+            if pending:
+                signal.alarm(pending)
 
 
 def _report(args) -> int:
@@ -150,20 +188,25 @@ def _report(args) -> int:
         if not exps:
             print(f"нет эксперимента {args.experiment} в {RUNS}", file=sys.stderr)
             return 2
+    elif not exps:
+        print(f"в {RUNS} нет экспериментов", file=sys.stderr)
+        return 0
     env = load_env()
     if missing := [k for k in KEYS[:2] if not env.get(k)]:
         print(f"в .env нет: {', '.join(missing)}", file=sys.stderr)
         return 1
     market = AlpacaMarket(env["ALPACA_API_KEY"], env["ALPACA_SECRET_KEY"])
+    failed = False
     for exp in exps:
         try:
             _build(exp, market, env, args.wiki)
-        except Exception as e:   # рынок, файлы прогона или вики
+        except Exception as e:   # рынок, файлы прогона или вики; остальные эксперименты всё равно строятся
             print(f"отчёт {exp.name} не собран: {type(e).__name__}: {e}", file=sys.stderr)
-            return 1
+            failed = True
+            continue
         print(exp / "report.json")
         print(exp / "dashboard.html")
-    return 0
+    return 1 if failed else 0
 
 
 def _status_line(run: Path) -> str:

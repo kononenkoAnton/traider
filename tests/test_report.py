@@ -50,7 +50,7 @@ def test_report_of_a_small_experiment(played):            # фикстура: т
         assert r["verdict"]["by_participant"][pid] == "no_data"
     assert r["verdict"]["opus"] == "no_data" and r["sessions"]["haiku"][0]["looked"]
     assert r["tokens"]["opus-analyst"]["analyst"]["searches"] >= 0 and r["tokens"]["haiku"]["analyst"] is None
-    assert any(i["kind"] == "good" for i in r["incidents"])
+    assert any(i["kind"] == "warning" and i["participant"] is None for i in r["incidents"])   # opus-a на брокере, ids не переданы
     again = build_report(exp, market)
     assert {k: v for k, v in again.items() if k != "meta"} == {k: v for k, v in r.items() if k != "meta"}
 
@@ -439,3 +439,21 @@ def test_death_incident_does_not_repeat_its_title(played_with_death):
 def test_no_forecast_while_the_month_spend_is_unknown():
     m = _money_of([("2026-11-27", "ok", 1.0), ("2026-11-30", "ok", 1.0), ("2026-12-01", "failed", None)])
     assert m["month"] == "2026-12" and m["month_spend_usd"] is None and m["month_forecast_usd"] is None
+
+
+def test_a_broker_participant_without_ids_gets_a_warning_and_no_clean_bill(played):
+    exp, market = played
+    r = build_report(exp, market)
+    mine = [i for i in r["incidents"] if i["participant"] == "opus-a" and i["day"] is None]
+    total = [i for i in r["incidents"] if i["participant"] is None and i["day"] is None]
+    assert [i["kind"] for i in mine] == ["warning"] and "не проведена" in mine[0]["title"]
+    assert [i["kind"] for i in total] == ["warning"] and "opus-a" in total[0]["text"]
+    assert not any(i["kind"] == "good" for i in r["incidents"])
+
+
+def test_the_overall_integrity_is_good_only_when_every_check_was_made_and_is_clean(played):
+    exp, market = played
+    clean = build_report(exp, market, {"opus-a": []})
+    assert [i["kind"] for i in clean["incidents"] if i["day"] is None] == ["good", "good"]
+    dirty = build_report(exp, market, {"opus-a": ["zz"]})
+    assert [i["kind"] for i in dirty["incidents"] if i["participant"] is None and i["day"] is None] == ["critical"]

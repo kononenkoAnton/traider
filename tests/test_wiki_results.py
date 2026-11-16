@@ -1,9 +1,11 @@
 import copy
 import json
+import os
 import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import frontmatter
 import pytest
@@ -135,7 +137,7 @@ def test_a_run_that_just_started_gives_an_article_with_plain_empty_sections(tmp_
     market = FakeMarket.with_history(list(load_run(exp / "haiku")[0].universe), days=70, clock=ny(2026, 12, 1, 16, 30))
     write_report(exp, market, wiki)
     article = frontmatter.load(wiki / "articles" / "results-pilot-1.md").content
-    assert "None" not in article and "nan" not in article.lower() and "целостность в порядке" in article
+    assert "None" not in article and "nan" not in article.lower() and "проверка по брокеру не проведена" in article
     assert "Происшествий нет" in results_article({**build_report(exp, market), "incidents": []})
     assert subprocess.run([sys.executable, "tools/check_wiki.py", str(wiki)]).returncode == 0
 
@@ -208,3 +210,123 @@ def test_article_is_deterministic(played):
     exp, market = played
     r = build_report(exp, market)
     assert results_article(copy.deepcopy(r)) == results_article(r)
+
+
+# --- раунд исправлений 1 ---
+
+def test_the_final_report_is_built_once_on_the_first_open_day_after_the_runs_finish(played):
+    from traider.brokers import SimBroker
+    from traider.tick import tick
+    exp, market = played
+    make_broker = lambda cfg, store: SimBroker(cfg, store, market)
+    for d in (4, 7, 8, 9, 10):                                   # пять торговых дней после finish_day 03.12
+        market.clock, market.open = ny(2026, 12, d, 10, 5), True
+        tick(exp.parent, market, make_broker, lambda: None)
+        assert report_due(exp, f"2026-12-{d:02d}") in (True, False)
+    assert {RunStore(exp / n).state()["status"] for n in ("haiku", "sonnet", "opus-a", "opus-b", "opus-analyst")} == {"finished"}
+    assert report_due(exp, "2026-12-10") is False                # день последнего тика: отчёт ещё не итоговый
+    market.clock = ny(2026, 12, 11, 10, 0)
+    assert report_due(exp, "2026-12-11") is True
+    report = write_report(exp, market, None)
+    assert {p["status"] for p in report["participants"]} == {"finished"}
+    assert [report_due(exp, d) for d in ("2026-12-11", "2026-12-14", "2026-12-15")] == [False] * 3
+
+
+def test_a_report_that_already_shows_the_final_statuses_is_never_due_again(played):
+    exp, market = played
+    for n in ("haiku", "sonnet", "opus-a", "opus-b", "opus-analyst"):
+        set_status(exp, n, "finished")
+    write_report(exp, market, None)
+    assert report_due(exp, "2026-12-20") is False
+    set_status(exp, "haiku", "dead")                              # статус сменился: отчёт устарел
+    assert report_due(exp, "2026-12-20") is True
+
+
+def test_a_category_without_ai_markers_refuses_and_nothing_is_written(played, wiki):
+    exp, market = played
+    path = wiki / "categories" / "results.md"
+    path.write_text(path.read_text().replace("<!-- ai:start -->", ""))
+    before = tree(wiki)
+    with pytest.raises(ValueError):
+        upsert_results(wiki, build_report(exp, market), datetime(2026, 12, 3, 16, tzinfo=timezone.utc))
+    assert tree(wiki) == before
+
+
+def test_a_directory_that_is_not_a_wiki_refuses_and_nothing_is_written(played, tmp_path):
+    exp, market = played
+    empty = tmp_path / "nowiki"
+    empty.mkdir()
+    with pytest.raises(OSError):
+        upsert_results(empty, build_report(exp, market), datetime(2026, 12, 3, 16, tzinfo=timezone.utc))
+    assert list(empty.rglob("*")) == []
+
+
+def failing_write(monkeypatch, nth):
+    from traider import wiki_results
+    real, n = wiki_results._write, []
+
+    def write(path, text):
+        n.append(path)
+        if len(n) == nth:
+            raise OSError("диск")
+        real(path, text)
+    monkeypatch.setattr(wiki_results, "_write", write)
+
+
+def check(wiki):
+    return subprocess.run([sys.executable, "tools/check_wiki.py", str(wiki)], capture_output=True).returncode == 0
+
+
+@pytest.mark.parametrize("nth", [1, 2, 3])
+def test_an_update_interrupted_at_any_write_leaves_a_wiki_the_checker_accepts(played, wiki, monkeypatch, nth):
+    exp, market = played
+    upsert_results(wiki, build_report(exp, market), datetime(2026, 12, 3, 16, tzinfo=timezone.utc))
+    failing_write(monkeypatch, nth)
+    with pytest.raises(OSError):
+        upsert_results(wiki, build_report(exp, market), datetime(2026, 12, 4, 16, tzinfo=timezone.utc))
+    assert check(wiki)
+
+
+def test_a_first_creation_interrupted_after_the_root_category_is_still_accepted(played, wiki, monkeypatch):
+    exp, market = played
+    failing_write(monkeypatch, 2)
+    with pytest.raises(OSError):
+        upsert_results(wiki, build_report(exp, market), datetime(2026, 12, 3, 16, tzinfo=timezone.utc))
+    assert check(wiki)
+
+
+def test_every_write_goes_through_its_own_temporary_file(tmp_path, monkeypatch):
+    from traider import wiki_results
+    seen = []
+    real = os.replace
+    monkeypatch.setattr(os, "replace", lambda src, dst: (seen.append(Path(src).name), real(src, dst)))
+    wiki_results._write(tmp_path / "a.md", "1")
+    wiki_results._write(tmp_path / "a.md", "2")
+    assert len(set(seen)) == 2 and all(n.startswith(".a.md.") and n.endswith(".tmp") for n in seen) and not list(tmp_path.glob(".*"))
+
+
+def test_article_modified_never_goes_back_and_is_never_before_created(played, wiki):
+    exp, market = played
+    report = build_report(exp, market)
+    path = wiki / "articles" / "results-pilot-1.md"
+    upsert_results(wiki, report, datetime(2030, 1, 1, tzinfo=timezone.utc))
+    upsert_results(wiki, report, datetime(2026, 12, 3, tzinfo=timezone.utc))
+    a = frontmatter.load(path)
+    assert a["modified"] == datetime(2030, 1, 1, tzinfo=timezone.utc) and a["created"] == a["modified"]
+    path.write_text(path.read_text().replace("created: 2030-01-01", "created: 2031-01-01"))
+    upsert_results(wiki, report, datetime(2026, 12, 4, tzinfo=timezone.utc))
+    a = frontmatter.load(path)
+    assert a["modified"] >= a["created"] and a["created"].year == 2031
+    assert check(wiki)
+
+
+def test_the_column_reads_beat_the_random_bots(played):
+    exp, market = played
+    article = results_article(build_report(exp, market))
+    assert "Обогнал случайных, %" in article and "Место среди случайных" not in article
+
+
+def test_the_article_says_when_the_broker_check_was_not_made(played):
+    exp, market = played
+    assert "проверка по брокеру не проведена" in results_article(build_report(exp, market))
+    assert "проверка по брокеру не проведена" not in results_article(build_report(exp, market, {"opus-a": []}))
