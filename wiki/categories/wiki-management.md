@@ -5,7 +5,7 @@ type: category
 tags: ['wiki', 'meta', 'rules']
 categories: ['traider']
 created: 2026-11-14T14:58:35+00:00
-modified: 2026-11-14T15:07:28+00:00
+modified: 2026-11-16T02:30:00+00:00
 ---
 
 # Ведение вики

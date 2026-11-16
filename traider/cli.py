@@ -1,4 +1,4 @@
-"""Командная строка: `traider start`, `traider tick`, `traider status`.
+"""Командная строка: `traider start`, `traider tick`, `traider status`, `traider report`.
 
 :wk-id: cli-module
 :wk-tags: cli, schedule, status
@@ -18,13 +18,21 @@
 5xx, так что тишина в одном запросе стоит не больше трёх таймаутов. Срок всей сессии держит
 `max_session_seconds` в цикле агента. `status` работает без сети, по файлам прогонов: статус, сессий записано из цели,
 последняя сессия, суммарная стоимость; расхождение контрольной суммы помечается.
-Планировщик (`ops/com.traider.tick.plist`) вручную ставит владелец.
+`report [эксперимент] [--wiki DIR]` собирает отчёт сразу (без имени: каждый каталог эксперимента в `runs/`), печатает пути
+записанных файлов; ключи рынка из `.env` нужны, как у `tick`; нет ключа или ошибка рынка: одна строка и код 1, неизвестный
+эксперимент: одна строка и код 2. Без `--wiki` ни один файл вики не читается и не пишется. Для участника с брокером `alpaca`
+команда спрашивает у API (`make_alpaca_api`, больше ничего у брокера) исполненные заявки с первого обращения прогона и передаёт
+отчёту id тех, что несут префикс этого прогона; только для прогона, у которого `started_with` совпал с режимом и брокером
+конфига, как у тика. Иначе, и при сбое запроса, проверка брокера пропускается одной строкой в stderr, отчёт строится.
+`tick [--wiki DIR]` после обхода, когда замок уже снят и рынок был открыт, для каждого эксперимента с `report_due` на сегодняшний день
+рынка собирает отчёт тем же путём; любое исключение там это одна строка в stderr, строки тика и код выхода не меняются.
+Планировщик (`ops/com.traider.tick.plist`) вручную ставит владелец, без `--wiki`.
 """
 import argparse
 import sys
 import tomllib
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from anthropic import Anthropic
@@ -33,9 +41,10 @@ from traider.alpaca import AlpacaBroker, make_alpaca_api
 from traider.brokers import SimBroker
 from traider.config import load_run, start_experiment
 from traider.env import load_env
-from traider.market import NY, AlpacaMarket
+from traider.market import NY, AlpacaMarket, ny_day
 from traider.store import RunStore
 from traider.tick import tick
+from traider.wiki_results import report_due, write_report
 
 RUNS = Path("runs")
 KEYS = ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ANTHROPIC_API_KEY")
@@ -63,7 +72,7 @@ def _start(args) -> int:
     return 0
 
 
-def _tick(_args) -> int:
+def _tick(args) -> int:
     env = load_env()
     if missing := [k for k in KEYS if not env.get(k)]:
         print(f"в .env нет: {', '.join(missing)}", file=sys.stderr)
@@ -84,6 +93,76 @@ def _tick(_args) -> int:
         extra = f" {r['status']} ${r['cost']:.2f}" if r["action"] == "session" else f" {r['error']}" if "error" in r else ""
         when = datetime.fromisoformat(r["ts"]).astimezone(NY).strftime("%Y-%m-%d %H:%M")
         print(f"{when} {r['experiment']}/{r['participant']}: {r['action']}{extra}")
+    if results:   # рынок был открыт; замок тика уже снят
+        _auto_report(market, env, args.wiki)
+    return 0
+
+
+def _experiments() -> list[Path]:
+    return sorted(p for p in RUNS.glob("*") if p.is_dir() and any(p.glob("*/config.json")))
+
+
+def _broker_ids(exp: Path, env) -> dict[str, list[str]]:
+    """Исполненные заявки брокера с префиксом прогона, по участникам со счётом Alpaca. Прогон, не прошедший проверку режима
+    и брокера, или запрос, который не удался, даёт строку в stderr и ничего в ответ; к брокеру ходит только API."""
+    out = {}
+    for run in sorted(c.parent for c in exp.glob("*/config.json")):
+        cfg, _ = load_run(run)
+        if cfg.broker != "alpaca":
+            continue
+        state, who = RunStore(run).state(), f"{cfg.experiment}/{cfg.participant}"
+        try:
+            if state.get("started_with") != {"mode": cfg.mode, "broker": cfg.broker}:
+                raise ValueError("конфиг не совпадает с режимом и брокером, записанными при старте")
+            if "run_uid" not in state:
+                raise ValueError("прогон ещё не обращался к брокеру")
+            prefix = f"{cfg.experiment}/{cfg.participant}/{state['run_uid']}/"
+            since = datetime.fromisoformat(state["broker_since"]) - timedelta(days=1)   # запас на часы, как у sync
+            out[cfg.participant] = [o["id"] for o in make_alpaca_api(cfg, env).filled_orders_since(since)
+                                    if (o["client_order_id"] or "").startswith(prefix)]
+        except Exception as e:
+            print(f"{who}: проверка брокера пропущена ({type(e).__name__}: {e})", file=sys.stderr)
+    return out
+
+
+def _build(exp: Path, market, env, wiki: Path | None) -> None:
+    write_report(exp, market, wiki, _broker_ids(exp, env))
+
+
+def _auto_report(market, env, wiki: Path | None) -> None:
+    """Ничего не печатает в stdout и не бросает: отчёт не должен менять ни строки тика, ни код выхода."""
+    try:
+        day = ny_day(market.now())
+        for exp in _experiments():
+            try:
+                if report_due(exp, day):
+                    _build(exp, market, env, wiki)
+            except Exception as e:
+                print(f"отчёт {exp.name} не собран: {type(e).__name__}: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"отчёты не собраны: {type(e).__name__}: {e}", file=sys.stderr)
+
+
+def _report(args) -> int:
+    exps = _experiments()
+    if args.experiment is not None:
+        exps = [e for e in exps if e.name == args.experiment]
+        if not exps:
+            print(f"нет эксперимента {args.experiment} в {RUNS}", file=sys.stderr)
+            return 2
+    env = load_env()
+    if missing := [k for k in KEYS[:2] if not env.get(k)]:
+        print(f"в .env нет: {', '.join(missing)}", file=sys.stderr)
+        return 1
+    market = AlpacaMarket(env["ALPACA_API_KEY"], env["ALPACA_SECRET_KEY"])
+    for exp in exps:
+        try:
+            _build(exp, market, env, args.wiki)
+        except Exception as e:   # рынок, файлы прогона или вики
+            print(f"отчёт {exp.name} не собран: {type(e).__name__}: {e}", file=sys.stderr)
+            return 1
+        print(exp / "report.json")
+        print(exp / "dashboard.html")
     return 0
 
 
@@ -116,7 +195,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     start.add_argument("toml", type=Path)
     start.add_argument("--live", action="store_true", help="разрешить конфиг с mode = live")
     start.set_defaults(run=_start)
-    sub.add_parser("tick", help="один обход прогонов").set_defaults(run=_tick)
+    tk = sub.add_parser("tick", help="один обход прогонов")
+    tk.add_argument("--wiki", type=Path, help="каталог вики: отчёт после тика обновит там статью результатов")
+    tk.set_defaults(run=_tick)
+    rep = sub.add_parser("report", help="собрать отчёт и страницу сразу")
+    rep.add_argument("experiment", nargs="?", help="имя эксперимента; без него все из runs/")
+    rep.add_argument("--wiki", type=Path, help="каталог вики: обновить там статью результатов")
+    rep.set_defaults(run=_report)
     sub.add_parser("status", help="состояние прогонов, без сети").set_defaults(run=_status)
     args = parser.parse_args(argv)
     return args.run(args)

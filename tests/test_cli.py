@@ -1,5 +1,9 @@
+import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from traider import cli
 from traider.brokers import SimBroker
@@ -95,3 +99,181 @@ def test_start_prints_the_worst_case_spend(tmp_path, example, capsys, monkeypatc
     assert main(["start", str(example)]) == 0
     out = capsys.readouterr().out
     assert "$7.55 в торговый день" in out and "$158.55 за 21 торговый день" in out and "Console" in out
+
+
+# --- команда report и отчёт после тика (задача 4) ---
+
+ENV = "ALPACA_API_KEY=a\nALPACA_SECRET_KEY=b\nANTHROPIC_API_KEY=c\n"
+TS = "2026-12-01T15:05:00+00:00"
+
+
+class Api:
+    """Подделка AlpacaApi: помнит, о чём её спросили."""
+    def __init__(self, orders=(), error=None):
+        self.orders, self.error, self.asked = list(orders), error, []
+
+    def filled_orders_since(self, since):
+        self.asked.append(since)
+        if self.error:
+            raise self.error
+        return self.orders
+
+
+@pytest.fixture
+def world(tmp_path, example, monkeypatch):
+    """Каталог с прогонами и .env; рынок, API и write_report заменены; `calls` копит вызовы write_report."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(ENV)
+    start_experiment(example, tmp_path / "runs")
+    w = SimpleNamespace(market=SimpleNamespace(now=lambda: datetime(2026, 12, 1, 15, 5, tzinfo=timezone.utc)),
+                        calls=[], api=Api(), apis=[], root=tmp_path)
+
+    def write(exp, market, wiki, ids=None):
+        w.calls.append((exp.name, market, wiki, ids))
+        if isinstance(getattr(w, "boom", None), Exception):
+            raise w.boom
+        return {}
+
+    def make_api(cfg, env):
+        w.apis.append(cfg.participant)
+        return w.api
+    monkeypatch.setattr(cli, "AlpacaMarket", lambda key, secret: w.market)
+    monkeypatch.setattr(cli, "write_report", write)
+    monkeypatch.setattr(cli, "make_alpaca_api", make_api)
+    return w
+
+
+def started(w):
+    """opus-a «обращался к брокеру»: run_uid и время первого обращения, как их пишет AlpacaBroker."""
+    RunStore(w.root / "runs" / "pilot-1" / "opus-a").update_state(run_uid="u1", broker_since="2026-12-01T14:00:00+00:00")
+
+
+def test_report_prints_the_paths_and_passes_no_wiki_by_default(world, capsys):
+    assert main(["report", "pilot-1"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out == ["runs/pilot-1/report.json", "runs/pilot-1/dashboard.html"]
+    assert [(c[0], c[1], c[2]) for c in world.calls] == [("pilot-1", world.market, None)]
+
+
+def test_report_passes_the_wiki_directory(world, tmp_path):
+    assert main(["report", "pilot-1", "--wiki", str(tmp_path / "w")]) == 0
+    assert world.calls[0][2] == tmp_path / "w"
+
+
+def test_report_without_a_name_covers_every_experiment_in_runs(world, example, tmp_path, capsys):
+    other = tmp_path / "other"; other.mkdir()
+    shutil.copytree(example.parent, other / "exp")
+    toml = other / "exp" / "experiment.toml"
+    toml.write_text(toml.read_text().replace('experiment = "pilot-1"', 'experiment = "second"').replace('broker = "alpaca"', 'broker = "sim"'))
+    start_experiment(toml, tmp_path / "runs")
+    (tmp_path / "runs" / ".tick.lock").write_text("{}")
+    assert main(["report"]) == 0
+    assert [c[0] for c in world.calls] == ["pilot-1", "second"]
+    assert capsys.readouterr().out.count("report.json") == 2
+
+
+def test_unknown_experiment_is_one_line_and_code_2(world, capsys):
+    assert main(["report", "nope"]) == 2
+    assert len(capsys.readouterr().err.strip().splitlines()) == 1 and not world.calls
+
+
+def test_report_without_market_keys_is_one_line_and_code_1(world, capsys):
+    (world.root / ".env").write_text("ANTHROPIC_API_KEY=c\n")
+    assert main(["report", "pilot-1"]) == 1
+    assert len(capsys.readouterr().err.strip().splitlines()) == 1 and not world.calls
+
+
+def test_a_market_error_is_one_line_and_code_1(world, capsys):
+    started(world)
+    world.boom = RuntimeError("рынок недоступен")
+    assert main(["report", "pilot-1"]) == 1
+    err = capsys.readouterr().err.strip().splitlines()
+    assert len(err) == 1 and "рынок недоступен" in err[0]
+
+
+def test_broker_ids_are_the_filled_orders_with_this_runs_prefix(world, capsys):
+    started(world)
+    world.api.orders = [{"id": "mine-1", "client_order_id": "pilot-1/opus-a/u1/buy/1"},
+                        {"id": "other-run", "client_order_id": "pilot-1/opus-a/zzzz/buy/1"},
+                        {"id": "by-hand", "client_order_id": None}]
+    assert main(["report", "pilot-1"]) == 0
+    assert world.calls[0][3] == {"opus-a": ["mine-1"]}
+    assert world.apis == ["opus-a"] and world.api.asked == [datetime(2026, 11, 30, 14, 0, tzinfo=timezone.utc)]
+
+
+def test_the_api_is_not_asked_for_a_run_that_fails_the_mode_and_broker_check(world, capsys):
+    started(world)
+    RunStore(world.root / "runs" / "pilot-1" / "opus-a").update_state(started_with={"mode": "live", "broker": "alpaca"})
+    assert main(["report", "pilot-1"]) == 0
+    assert world.apis == [] and world.calls[0][3] == {}
+    err = capsys.readouterr().err.strip().splitlines()
+    assert len(err) == 1 and "pilot-1/opus-a" in err[0] and "пропущена" in err[0]
+
+
+def test_a_run_that_never_touched_the_broker_is_skipped_without_asking(world, capsys):
+    assert main(["report", "pilot-1"]) == 0
+    assert world.apis == [] and world.calls[0][3] == {} and "пропущена" in capsys.readouterr().err
+
+
+def test_a_failing_broker_request_skips_the_check_and_still_builds(world, capsys):
+    started(world)
+    world.api.error = ConnectionError("нет связи")
+    assert main(["report", "pilot-1"]) == 0
+    assert world.calls[0][3] == {} and len(world.calls) == 1
+    err = capsys.readouterr().err.strip().splitlines()
+    assert len(err) == 1 and "пропущена" in err[0] and "нет связи" in err[0]
+
+
+def test_sim_participants_are_never_sent_to_the_broker(world):
+    assert main(["report", "pilot-1"]) == 0
+    assert "haiku" not in world.apis and "opus-b" not in world.apis
+
+
+def tick_returning(results):
+    return lambda runs_dir, mkt, make_broker, make_client: results
+
+
+def test_a_failing_auto_report_changes_neither_the_tick_lines_nor_the_exit_code(world, capsys, monkeypatch):
+    started(world)
+    world.boom = RuntimeError("отчёт упал")
+    monkeypatch.setattr(cli, "Anthropic", lambda **kw: None)
+    monkeypatch.setattr(cli, "report_due", lambda exp, day: True)
+    monkeypatch.setattr(cli, "tick", tick_returning([{"experiment": "pilot-1", "participant": "haiku", "action": "safety", "ts": TS}]))
+    assert main(["tick"]) == 0
+    cap = capsys.readouterr()
+    assert cap.out.splitlines() == ["2026-12-01 10:05 pilot-1/haiku: safety"]
+    assert len(cap.err.strip().splitlines()) == 1 and "отчёт упал" in cap.err and world.calls
+
+
+def test_auto_report_is_built_for_each_due_experiment_for_todays_market_day(world, capsys, monkeypatch):
+    asked = []
+    monkeypatch.setattr(cli, "Anthropic", lambda **kw: None)
+    monkeypatch.setattr(cli, "report_due", lambda exp, day: asked.append((exp.name, day)) or True)
+    monkeypatch.setattr(cli, "tick", tick_returning([{"experiment": "pilot-1", "participant": "haiku", "action": "safety", "ts": TS}]))
+    assert main(["tick", "--wiki", "w"]) == 0
+    assert asked == [("pilot-1", "2026-12-01")] and world.calls[0][2] == Path("w")
+    assert capsys.readouterr().out.splitlines() == ["2026-12-01 10:05 pilot-1/haiku: safety"]
+
+
+def test_auto_report_without_the_option_touches_no_wiki(world, monkeypatch):
+    monkeypatch.setattr(cli, "Anthropic", lambda **kw: None)
+    monkeypatch.setattr(cli, "report_due", lambda exp, day: True)
+    monkeypatch.setattr(cli, "tick", tick_returning([{"experiment": "pilot-1", "participant": "haiku", "action": "safety", "ts": TS}]))
+    main(["tick"])
+    assert world.calls[0][2] is None
+
+
+def test_auto_report_is_skipped_when_the_market_was_closed(world, monkeypatch):
+    monkeypatch.setattr(cli, "Anthropic", lambda **kw: None)
+    monkeypatch.setattr(cli, "report_due", lambda exp, day: pytest.fail("не должен вызываться"))
+    monkeypatch.setattr(cli, "tick", tick_returning([]))
+    assert main(["tick"]) == 0 and not world.calls
+
+
+def test_a_failing_report_due_is_one_stderr_line_too(world, capsys, monkeypatch):
+    def boom(exp, day):
+        raise ValueError("битый json")
+    monkeypatch.setattr(cli, "Anthropic", lambda **kw: None)
+    monkeypatch.setattr(cli, "report_due", boom)
+    monkeypatch.setattr(cli, "tick", tick_returning([{"experiment": "pilot-1", "participant": "haiku", "action": "safety", "ts": TS}]))
+    assert main(["tick"]) == 0 and len(capsys.readouterr().err.strip().splitlines()) == 1

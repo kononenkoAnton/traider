@@ -1,4 +1,4 @@
-"""Проверка вики: uv run --with python-frontmatter python tools/check_wiki.py
+"""Проверка вики: uv run --with python-frontmatter python tools/check_wiki.py [каталог вики]
 
 Разбирает статьи той же библиотекой, что и WikiKnowledge, и падает на первой ошибке.
 """
@@ -8,7 +8,7 @@ import sys
 
 import frontmatter
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent / "wiki"
+ROOT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parent.parent / "wiki")
 MARKERS = ("<!-- human:start -->", "<!-- human:end -->", "<!-- ai:start -->", "<!-- ai:end -->")
 
 
