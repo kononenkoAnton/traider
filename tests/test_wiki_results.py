@@ -340,3 +340,114 @@ def test_a_category_whose_modified_has_no_timezone_refuses_and_nothing_is_writte
     with pytest.raises(ValueError):
         upsert_results(wiki, build_report(exp, market), datetime(2026, 12, 3, 16, tzinfo=timezone.utc))
     assert tree(wiki) == before
+
+
+# --- волна после проверки всей ветки ---
+
+def _idle_client():
+    from tests.fakes import FakeAnthropic, use
+    return FakeAnthropic([use("get_account"), use("finish_session", journal="ок")])
+
+
+def test_a_run_stuck_in_error_does_not_hold_the_report_back(tmp_path, example):
+    from traider.brokers import SimBroker
+    from traider.tick import tick
+    runs = tmp_path / "runs"
+    exp = start_experiment(example, runs)
+    market = FakeMarket.with_history(list(load_run(exp / "haiku")[0].universe), days=70, clock=ny(2026, 12, 1, 9, 35))
+    market.open = True
+
+    def make_broker(cfg, store):
+        if cfg.participant == "opus-a":
+            raise RuntimeError("счёт Alpaca не готов к прогону")
+        return SimBroker(cfg, store, market)
+    tick(runs, market, make_broker, _idle_client)                       # до окна: остальные ещё без сессий
+    assert report_due(exp, "2026-12-01") is False
+    market.clock = ny(2026, 12, 1, 10, 5)
+    tick(runs, market, make_broker, _idle_client)
+    assert RunStore(exp / "opus-a").session("2026-12-01") is None
+    assert report_due(exp, "2026-12-01") is True
+    write_report(exp, market, None)
+    market.clock = ny(2026, 12, 1, 10, 20)
+    tick(runs, market, make_broker, _idle_client)
+    assert report_due(exp, "2026-12-01") is False                      # собран: не на каждом тике
+
+
+def _tick_at(exp, market, when):
+    from traider.brokers import SimBroker
+    from traider.tick import tick
+    market.clock, market.open = when, True
+    return tick(exp.parent, market, lambda cfg, store: SimBroker(cfg, store, market), _idle_client)
+
+
+def test_a_death_later_in_the_day_reopens_the_days_report(moving):
+    exp, market = moving
+    market.clock, market.open = ny(2026, 12, 4, 10, 30), True
+    write_report(exp, market, None)
+    assert report_due(exp, "2026-12-04") is False
+    from traider.brokers import SimBroker
+    run = exp / "opus-b"
+    SimBroker(load_run(run)[0], RunStore(run), market).buy("2026-12-04", "AAPL", 190.0, 1.0, "т", "seed/1")
+    market.prices["AAPL"] *= 0.01                                        # к 14:00 бумага обвалилась
+    got = {r["participant"]: r["action"] for r in _tick_at(exp, market, ny(2026, 12, 4, 14, 0))}
+    assert got["opus-b"] == "died"
+    assert report_due(exp, "2026-12-04") is True
+    report = write_report(exp, market, None)
+    assert {p["id"]: p["status"] for p in report["participants"]}["opus-b"] == "dead"
+    _tick_at(exp, market, ny(2026, 12, 4, 14, 15))
+    assert report_due(exp, "2026-12-04") is False                      # и не на каждом тике после этого
+
+
+def test_an_owner_stop_later_in_the_day_reopens_the_days_report(moving):
+    from traider.control import request_stop
+    exp, market = moving
+    market.clock, market.open = ny(2026, 12, 4, 10, 30), True
+    write_report(exp, market, None)
+    request_stop(exp, "2026-12-04", ny(2026, 12, 4, 12, 50))
+    _tick_at(exp, market, ny(2026, 12, 4, 13, 0))
+    assert report_due(exp, "2026-12-04") is True
+    write_report(exp, market, None)
+    _tick_at(exp, market, ny(2026, 12, 4, 13, 15))
+    assert report_due(exp, "2026-12-04") is False
+
+
+def test_a_failed_page_leaves_the_old_report_json(moving, monkeypatch):
+    import traider.wiki_results as wr
+    exp, market = moving
+    (exp / "report.json").write_text("старый")
+    monkeypatch.setattr(wr, "render", lambda report, path: (_ for _ in ()).throw(OSError("диск полон")))
+    with pytest.raises(OSError):
+        write_report(exp, market, None)
+    assert (exp / "report.json").read_text() == "старый"              # новый отчёт рядом со старой страницей не лежит
+
+
+def test_a_verdict_is_marked_preliminary_until_the_run_is_finished_or_dead(played):
+    exp, market = played                                               # все прогоны finishing: прогнозы ещё зреют
+    rows = [l for l in results_article(build_report(exp, market)).splitlines() if l.startswith("| haiku")]
+    assert rows and rows[0].rstrip(" |").endswith("(предварительный)")
+    set_status(exp, "haiku", "finished"); set_status(exp, "sonnet", "dead")
+    art = results_article(build_report(exp, market))
+    for pid in ("haiku", "sonnet"):
+        assert "предварительный" not in next(l for l in art.splitlines() if l.startswith(f"| {pid} "))
+    assert "предварительный" in next(l for l in art.splitlines() if l.startswith("| opus-b "))
+
+
+def test_the_article_never_shows_unknown_spend_as_a_number(played):
+    from tests.test_report import _drop_cost
+    exp, market = played
+    _drop_cost(exp, "opus-b", "2026-12-02")
+    _drop_cost(exp, "haiku", "2026-12-01", "2026-12-02", "2026-12-03")
+    art = results_article(build_report(exp, market))
+    run = next(l for l in art.splitlines() if "Расход прогона" in l)
+    assert "не всё записано: у 4 сессий стоимость неизвестна" in run
+    cells = {l.split("|")[1].strip(): l.split("|")[6].strip() for l in art.splitlines() if l.startswith("| ") and "$" in l}
+    assert cells["haiku"] == "—" and "у 1 сессии стоимость неизвестна" in cells["opus-b"] and cells["sonnet"].startswith("$")
+
+
+def test_a_run_spend_with_no_recorded_cost_is_a_dash(played):
+    from tests.test_report import _drop_cost
+    exp, market = played
+    for pid in ("haiku", "sonnet", "opus-a", "opus-b", "opus-analyst"):
+        _drop_cost(exp, pid, "2026-12-01", "2026-12-02", "2026-12-03")
+    run = next(l for l in results_article(build_report(exp, market)).splitlines() if "Расход прогона" in l)
+    assert run.startswith("- Расход прогона —, не всё записано: у 15 сессий стоимость неизвестна")

@@ -5,11 +5,14 @@
 :wk-categories: system-architecture
 
 Как это работает. `write_report` строит отчёт (`build_report`, только чтение) и пишет в каталог
-эксперимента `report.json` и `dashboard.html`, каждый через временный файл и переименование. Вики
+эксперимента сначала `dashboard.html`, потом `report.json` (оборванная запись не оставит новый отчёт при старой странице),
+каждый через временный файл и переименование. Вики
 пишется, только если `wiki_dir` задан; при `None` не меняется ни один файл вне каталога эксперимента.
 `results_article` даёт тело статьи из чисел отчёта и фиксированных формулировок: ни журналов, ни тезисов,
 ни текстов отказов и ошибок, ни диалогов в неё не попадает (происшествие это вид, день, участник и
-готовое название); число, которого в отчёте нет (None), показано как «—». `upsert_results` создаёт статью или
+готовое название); число, которого в отчёте нет (None), показано как «—». Сумма, в которую вошли не все сессии (расход
+участника и прогона), несёт «не всё записано: у N сессий стоимость неизвестна»; расход прогона без единой записанной
+стоимости это «—». Вердикт участника вне `finished` и `dead` помечен «(предварительный)». `upsert_results` создаёт статью или
 обновляет её (`created` сохраняется), вписывает её в блок `ai` категории `results`, если её там нет, и ставит `modified`
 у статьи, категории `results` и корня `traider` (категория не уходит назад, если часы отстают от записи).
 Файлы вики пишутся через временный файл с уникальным именем и переименование, frontmatter пишется здесь же в формате
@@ -21,11 +24,12 @@
 `report_due(exp_dir, day)`: когда все прогоны `finished` или `dead`, истинно один раз, в первый день `day` позже последней строки
 `ticks.jsonl` любого прогона, если `report.json` нет или статусы его `participants` не равны текущим (дальше они равны, отчёт больше не нужен).
 Иначе истинно, когда за `day` отчёта ещё нет и: у каждого прогона со статусом `active` есть запись
-сессии за `day`; а если активных нет, хотя бы у одного прогона вне `finished` и `dead` есть строка тика за `day`
+сессии за `day` или его последняя строка тика за `day` это `error` (прогон, на котором тик падает, не держит отчёт
+остальных); а если активных нет, хотя бы у одного прогона вне `finished` и `dead` есть строка тика за `day`
 (прогон ждёт конца: `finishing` или `invalid` идут тиками каждый день, без тика за день отчёту нечего добавить).
-Отчёт «собран за `day`», когда в существующем `report.json` день `meta.generated_at` (по Нью-Йорку) равен `day` и
-статусы записей сессий за `day` в нём (`sessions[участник][].status`) те же, что в файлах прогонов: отчёт,
-собранный до конца сессий дня, день не закрывает. Нечитаемый или неполный `report.json` значит «не собран».
+Отчёт «собран за `day`», когда в существующем `report.json` день `meta.generated_at` (по Нью-Йорку) равен `day`,
+статусы записей сессий за `day` в нём (`sessions[участник][].status`) те же, что в файлах прогонов, и статусы его
+`participants` равны текущим: отчёт, собранный до конца сессий дня или до гибели и остановки днём, день не закрывает. Нечитаемый или неполный `report.json` значит «не собран».
 """
 import json
 import os
@@ -46,6 +50,7 @@ SLUG = re.compile(r"[A-Za-z0-9_-]+")
 VERDICTS = {"red": "красный", "yellow": "жёлтый", "green": "зелёный", "no_data": "мало данных"}
 KINDS = {"critical": "критично", "serious": "серьёзно", "warning": "предупреждение", "good": "в порядке"}
 AI = ("<!-- ai:start -->", "<!-- ai:end -->")
+FINAL = ("finished", "dead")   # вердикт окончательный: прогон закончен (прогнозы созрели) или участник погиб
 
 
 def _write(path: Path, text: str) -> None:
@@ -70,6 +75,11 @@ def _yes(x) -> str:
     return "пока не определить" if x is None else "да" if x else "нет"
 
 
+def _unknown(n, sep: str) -> str:
+    """Пометка у суммы, в которую вошли не все сессии: неизвестная стоимость не ноль."""
+    return f"{sep}не всё записано: у {n} {'сессии' if n % 10 == 1 and n % 100 != 11 else 'сессий'} стоимость неизвестна" if n else ""
+
+
 def results_article(report: Mapping) -> str:
     """Тело статьи (markdown без frontmatter): числа отчёта и фиксированные фразы, ни одного текста модели."""
     meta, summary, cmp_, money = report["meta"], report["summary"], report["compare"], report["money"]
@@ -78,7 +88,8 @@ def results_article(report: Mapping) -> str:
     rows = [f"| {_cell(p['id'])} | {_f(s.get('equity'), ',.2f', '$')} | {_f(s.get('return_pct'), '+.2f', '', '%')} | "
             f"{_f(s.get('percentile'), '.0f')} | "
             f"{DASH if s.get('brier') is None else _f(s['brier'], '.3f') + ' (эталон ' + _f(s.get('reference'), '.3f') + ')'} | "
-            f"{_f(s.get('cost'), '.2f', '$')} | {VERDICTS.get(p['verdict'], DASH)} |"
+            f"{_f(s.get('cost'), '.2f', '$')}{_unknown(s.get('sessions_without_cost'), ', ') if s.get('cost') is not None else ''} | "
+            f"{VERDICTS.get(p['verdict'], DASH)}{'' if p.get('status') in FINAL else ' (предварительный)'} |"
             for p in report["participants"] for s in [summary.get(p["id"], {})]]
     twins, ladder, analyst = cmp_["twins"], cmp_["ladder"], cmp_["analyst"]
     pct = lambda x: DASH if x is None else f"{x * 100:.0f}%"   # noqa: E731
@@ -94,7 +105,7 @@ def results_article(report: Mapping) -> str:
         f"- Эксперимент {exp}: {'пилот, в вердикт не входит' if meta['pilot'] else 'официальный прогон'}.",
         f"- День {meta['sessions_done']} из {_f(meta['sessions_target'], '.0f')}.",
         f"- Дни сессий: {days[0] + ' – ' + days[-1] if days else 'сессий ещё не было'}.",
-        f"- Расход прогона {_f(money['run_spend_usd'], '.2f', '$')}; за месяц {money['month'] or DASH}: "
+        f"- Расход прогона {DASH if money.get('sessions_without_cost') and not money['run_spend_usd'] else _f(money['run_spend_usd'], '.2f', '$')}{_unknown(money.get('sessions_without_cost'), ', ')}; за месяц {money['month'] or DASH}: "
         f"{_f(money['month_spend_usd'], '.2f', '$')} из ${meta['credits_month_usd']} кредитов.",
         f"- Отчёт собран {meta['generated_at']}.", "",
         "## Участники", "",
@@ -185,12 +196,19 @@ def _day_status(store: RunStore, day: str) -> str | None:
     return rec and rec.get("status")
 
 
-def _built(exp_dir: Path, day: str, stores: Mapping[str, RunStore]) -> bool:
+def _erred(store: RunStore, day: str) -> bool:
+    """Последняя строка тика за день это ошибка: такой прогон не держит отчёт остальных."""
+    rows = [t for t in store.ticks() if t.get("day") == day]
+    return bool(rows) and rows[-1].get("action") == "error"
+
+
+def _built(exp_dir: Path, day: str, stores: Mapping[str, RunStore], status: Mapping[str, str]) -> bool:
     try:
         rep = json.loads((exp_dir / "report.json").read_text(encoding="utf-8"))
         theirs = {pid: r.get("status") for pid, rs in rep["sessions"].items() for r in rs if r["day"] == day}
         mine = {pid: s for pid, st in stores.items() if (s := _day_status(st, day))}
-        return ny_day(datetime.fromisoformat(rep["meta"]["generated_at"])) == day and theirs == mine
+        return (ny_day(datetime.fromisoformat(rep["meta"]["generated_at"])) == day and theirs == mine
+                and {p["id"]: p["status"] for p in rep["participants"]} == dict(status))
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return False
 
@@ -214,18 +232,18 @@ def report_due(exp_dir: Path, day: str) -> bool:
     if stores and all(s in TERMINAL_STATUSES for s in status.values()):
         return _final_due(exp_dir, day, stores, status)
     active = [pid for pid, s in status.items() if s == "active"]
-    ready = (all(_day_status(stores[pid], day) for pid in active) if active else
+    ready = (all(_day_status(stores[pid], day) or _erred(stores[pid], day) for pid in active) if active else
              any(s not in TERMINAL_STATUSES and any(t.get("day") == day for t in stores[pid].ticks())
                  for pid, s in status.items()))
-    return bool(stores) and ready and not _built(exp_dir, day, stores)
+    return bool(stores) and ready and not _built(exp_dir, day, stores, status)
 
 
 def write_report(exp_dir: Path, market: Market, wiki_dir: Path | None,
                  broker_order_ids: Mapping[str, Iterable[str]] | None = None) -> dict:
     exp_dir = Path(exp_dir)
     report = build_report(exp_dir, market, broker_order_ids)
+    render(report, exp_dir / "dashboard.html")   # страница первой: оборванная запись не оставит новый отчёт при старой странице
     _write(exp_dir / "report.json", json.dumps(report, ensure_ascii=False, indent=1))
-    render(report, exp_dir / "dashboard.html")
     if wiki_dir is not None:
         upsert_results(wiki_dir, report, market.now())
     return report
