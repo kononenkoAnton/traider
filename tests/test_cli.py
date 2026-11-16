@@ -445,7 +445,7 @@ def test_a_real_socket_hang_in_the_build_ends_the_section_and_the_second_experim
     old = signal.getsignal(signal.SIGALRM)
     arm_tick(world, monkeypatch)
     started_builds = []
-    monkeypatch.setattr(cli, "write_report", lambda exp, *a, **k: (started_builds.append(exp.name), requests.get(silent_server)))
+    monkeypatch.setattr(cli, "write_report", lambda exp, *a, **k: (started_builds.append(exp.name), requests.get(silent_server, timeout=10)))
     t0 = time.monotonic()
     assert main(["tick"]) == 0
     assert started_builds == ["pilot-1"]
@@ -460,7 +460,7 @@ def test_a_hang_in_the_broker_request_does_not_let_the_build_run_on(world, capsy
 
     class Hanging(Api):
         def filled_orders_since(self, since):
-            return requests.get(silent_server)
+            return requests.get(silent_server, timeout=10)
     monkeypatch.setattr(cli, "make_alpaca_api", lambda cfg, env: Hanging())
     t0 = time.monotonic()
     assert main(["tick"]) == 0
@@ -530,4 +530,4 @@ def test_a_terminal_run_has_no_cutoff_so_a_late_missing_fill_is_flagged(played, 
 def test_an_active_run_with_the_same_late_fill_is_still_not_flagged(played, tmp_path, monkeypatch):
     exp, api = make_terminal_world(played, tmp_path, monkeypatch, "active")
     assert main(["report", "pilot-1"]) == 0
-    assert not integrity_incidents(exp)
+    assert api.asked and not integrity_incidents(exp)       # брокер спрошен: проверка не пропущена по другой причине

@@ -192,6 +192,7 @@ def _auto_report(market, env, wiki: Path | None) -> None:
                 check()   # сбой после срока это срок
                 print(f"отчёт {exp.name} не собран: {type(e).__name__}: {e}", file=sys.stderr)
     except AutoReportTimeout as e:
+        signal.signal(signal.SIGALRM, signal.SIG_IGN)   # повторный сигнал не должен вырваться из обработчика
         signal.alarm(0)
         print(f"отчёты не собраны: {type(e).__name__}: {e}", file=sys.stderr)
     except Exception as e:
@@ -202,6 +203,7 @@ def _auto_report(market, env, wiki: Path | None) -> None:
             print(f"отчёты не собраны: {type(t).__name__}: {t}", file=sys.stderr)
     finally:
         if prev is not None:
+            signal.signal(signal.SIGALRM, signal.SIG_IGN)   # сначала игнор: сигнал между этими строками ничего не бросит
             signal.alarm(0)
             signal.signal(signal.SIGALRM, prev)
             if pending:
