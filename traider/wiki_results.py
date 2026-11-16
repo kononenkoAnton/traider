@@ -144,8 +144,9 @@ def _touch(path: Path, text: str, modified: datetime, entry: tuple[str, str] | N
 def _category(path: Path, ai: bool) -> str:
     """Текст категории, годный к правке; иначе исключение до любой записи."""
     text = path.read_text(encoding="utf-8")
-    if not text.startswith("---\n") or _time(_field(text, "modified")) is None:
-        raise ValueError(f"{path}: нет frontmatter с полем modified")
+    when = _time(_field(text, "modified"))
+    if not text.startswith("---\n") or when is None or when.tzinfo is None:
+        raise ValueError(f"{path}: нет frontmatter с полем modified и часовым поясом в нём")
     if ai and not (text.count(AI[0]) == 1 and text.count(AI[1]) == 1 and text.index(AI[0]) < text.index(AI[1])):
         raise ValueError(f"{path}: нет блока ai (по одному маркеру начала и конца)")
     return text

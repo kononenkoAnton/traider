@@ -27,13 +27,16 @@
 `tick [--wiki DIR]` после обхода, когда замок уже снят и рынок открыт (его спрашивает команда у рынка: тик пуст и без активных
 прогонов), для каждого эксперимента с `report_due` на сегодняшний день рынка собирает отчёт тем же путём; любое исключение там
 это одна строка в stderr, строки тика и код выхода не меняются. Весь раздел ограничен `AUTO_REPORT_SECONDS` (`signal.alarm`, прежние
-обработчик и будильник возвращаются), ручной `report` не ограничен. Брокера проверяют по записанному при старте `started_with["broker"]`.
-Сверка идёт по заявкам с `filled_at` не позже последней сверки (`last_sync`, без него последняя строка тика) минус две минуты.
+обработчик и будильник возвращаются, последний с остатком времени), ручной `report` не ограничен. Брокера проверяют по записанному при старте `started_with["broker"]`.
+Сверка идёт по заявкам с `filled_at` не позже последней сверки (`last_sync`, без него последняя строка тика) минус две минуты;
+у окончённого прогона (`finished`, `dead`) отсечки нет. Срок раздела держит исключение `AutoReportTimeout` (`BaseException`, будильник взводится
+заново перед броском) и монотонный срок, проверяемый перед каждым шагом.
 Планировщик (`ops/com.traider.tick.plist`) вручную ставит владелец, без `--wiki`.
 """
 import argparse
 import signal
 import sys
+import time
 import tomllib
 from collections.abc import Sequence
 from datetime import datetime, timedelta
@@ -43,7 +46,7 @@ from anthropic import Anthropic
 
 from traider.alpaca import AlpacaBroker, make_alpaca_api
 from traider.brokers import SimBroker
-from traider.config import load_run, start_experiment
+from traider.config import TERMINAL_STATUSES, load_run, start_experiment
 from traider.env import load_env
 from traider.market import NY, AlpacaMarket, ny_day
 from traider.store import RunStore
@@ -116,10 +119,11 @@ def _synced(state: dict, run: Path) -> datetime:
     return datetime.fromisoformat(when)
 
 
-def _broker_ids(exp: Path, env) -> dict[str, list[str]]:
+def _broker_ids(exp: Path, env, check=lambda: None) -> dict[str, list[str]]:
     """Исполненные заявки брокера с префиксом прогона, по участникам, чей записанный при старте брокер `alpaca`. Берутся
     заявки с `filled_at` (время исполнения из `filled_orders_since`) не позже последней сверки минус SYNC_MARGIN: позже
-    журнал мог ещё не успеть записать, это не нарушение. Прогон, не прошедший проверку режима и брокера, без времени
+    журнал мог ещё не успеть записать, это не нарушение; у прогона в `TERMINAL_STATUSES` отсечки нет (его больше не сверят, берутся все
+    заявки с префиксом). Прогон, не прошедший проверку режима и брокера, без времени
     сверки или с неудавшимся запросом даёт строку в stderr и ничего в ответ; к брокеру ходит только API."""
     out = {}
     for run in sorted(c.parent for c in exp.glob("*/config.json")):
@@ -133,30 +137,46 @@ def _broker_ids(exp: Path, env) -> dict[str, list[str]]:
                 raise ValueError("конфиг не совпадает с режимом и брокером, записанными при старте")
             if "run_uid" not in state:
                 raise ValueError("прогон ещё не обращался к брокеру")
-            cutoff = _synced(state, run) - SYNC_MARGIN
+            check()
+            # у окончённого прогона сверки больше не будет: его журнал полон настолько, насколько будет, отсечки нет
+            cutoff = None if state["status"] in TERMINAL_STATUSES else _synced(state, run) - SYNC_MARGIN
             prefix = f"{cfg.experiment}/{cfg.participant}/{state['run_uid']}/"
             since = datetime.fromisoformat(state["broker_since"]) - timedelta(days=1)   # запас на часы, как у sync
             out[cfg.participant] = [o["id"] for o in make_alpaca_api(cfg, env).filled_orders_since(since)
                                     if (o["client_order_id"] or "").startswith(prefix)
-                                    and o.get("filled_at") is not None and o["filled_at"] <= cutoff]
+                                    and (cutoff is None or (o.get("filled_at") is not None and o["filled_at"] <= cutoff))]
         except Exception as e:
             print(f"{who}: проверка брокера пропущена ({type(e).__name__}: {e})", file=sys.stderr)
     return out
 
 
-def _build(exp: Path, market, env, wiki: Path | None) -> None:
-    write_report(exp, market, wiki, _broker_ids(exp, env))
+def _build(exp: Path, market, env, wiki: Path | None, check=lambda: None) -> None:
+    check()
+    ids = _broker_ids(exp, env, check)
+    check()
+    write_report(exp, market, wiki, ids)
+
+
+class AutoReportTimeout(BaseException):
+    """Вышел срок отчёта после тика. Не `Exception`: ни `except Exception` в запросах, ни обёртка HTTP-библиотеки над
+    таймаутами сокета не превратят его в другую ошибку, ловит его только `_auto_report`."""
 
 
 def _on_alarm(signum, frame):
-    raise TimeoutError(f"не уложился в {AUTO_REPORT_SECONDS} с")
+    signal.alarm(1)   # если что-то всё же съест исключение, оно сработает снова; обёртка снимет будильник
+    raise AutoReportTimeout(f"не уложился в {AUTO_REPORT_SECONDS} с")
 
 
 def _auto_report(market, env, wiki: Path | None) -> None:
-    """Ничего не печатает в stdout и не бросает: отчёт не должен менять ни строки тика, ни код выхода. Весь раздел, с
-    запросами к рынку и брокеру, ограничен будильником: зависший запрос не должен держать задание launchd, а с ним
-    проверку HP и стопы следующих тиков."""
-    prev = None
+    """Ничего не печатает в stdout и не бросает: отчёт не должен менять ни строки тика, ни код выхода. Он читает файлы
+    прогонов и рынок и может идти, пока другой тик держит замок. Весь раздел, с запросами к рынку и брокеру, ограничен
+    будильником и монотонным сроком, который проверяется перед каждым экспериментом и каждым шагом (id брокера, сборка):
+    зависший запрос не должен держать задание launchd, а с ним проверку HP и стопы следующих тиков."""
+    prev, pending, start = None, 0, time.monotonic()
+
+    def check():
+        if time.monotonic() - start > AUTO_REPORT_SECONDS:
+            raise AutoReportTimeout(f"не уложился в {AUTO_REPORT_SECONDS} с")
     try:
         prev = signal.signal(signal.SIGALRM, _on_alarm)
         pending = signal.alarm(AUTO_REPORT_SECONDS)
@@ -164,21 +184,28 @@ def _auto_report(market, env, wiki: Path | None) -> None:
             return
         day = ny_day(market.now())
         for exp in _experiments():
+            check()
             try:
                 if report_due(exp, day):
-                    _build(exp, market, env, wiki)
-            except TimeoutError:
-                raise
+                    _build(exp, market, env, wiki, check)
             except Exception as e:
+                check()   # сбой после срока это срок
                 print(f"отчёт {exp.name} не собран: {type(e).__name__}: {e}", file=sys.stderr)
-    except Exception as e:
+    except AutoReportTimeout as e:
+        signal.alarm(0)
         print(f"отчёты не собраны: {type(e).__name__}: {e}", file=sys.stderr)
+    except Exception as e:
+        try:
+            check()
+            print(f"отчёты не собраны: {type(e).__name__}: {e}", file=sys.stderr)
+        except AutoReportTimeout as t:
+            print(f"отчёты не собраны: {type(t).__name__}: {t}", file=sys.stderr)
     finally:
         if prev is not None:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, prev)
             if pending:
-                signal.alarm(pending)
+                signal.alarm(max(1, pending - int(time.monotonic() - start)))
 
 
 def _report(args) -> int:

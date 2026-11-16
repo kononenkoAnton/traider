@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -222,7 +223,6 @@ def test_the_final_report_is_built_once_on_the_first_open_day_after_the_runs_fin
     for d in (4, 7, 8, 9, 10):                                   # пять торговых дней после finish_day 03.12
         market.clock, market.open = ny(2026, 12, d, 10, 5), True
         tick(exp.parent, market, make_broker, lambda: None)
-        assert report_due(exp, f"2026-12-{d:02d}") in (True, False)
     assert {RunStore(exp / n).state()["status"] for n in ("haiku", "sonnet", "opus-a", "opus-b", "opus-analyst")} == {"finished"}
     assert report_due(exp, "2026-12-10") is False                # день последнего тика: отчёт ещё не итоговый
     market.clock = ny(2026, 12, 11, 10, 0)
@@ -330,3 +330,13 @@ def test_the_article_says_when_the_broker_check_was_not_made(played):
     exp, market = played
     assert "проверка по брокеру не проведена" in results_article(build_report(exp, market))
     assert "проверка по брокеру не проведена" not in results_article(build_report(exp, market, {"opus-a": []}))
+
+
+def test_a_category_whose_modified_has_no_timezone_refuses_and_nothing_is_written(played, wiki):
+    exp, market = played
+    path = wiki / "categories" / "traider.md"
+    path.write_text(re.sub(r"^(modified: .*)\+00:00$", r"\1", path.read_text(), count=1, flags=re.M))
+    before = tree(wiki)
+    with pytest.raises(ValueError):
+        upsert_results(wiki, build_report(exp, market), datetime(2026, 12, 3, 16, tzinfo=timezone.utc))
+    assert tree(wiki) == before

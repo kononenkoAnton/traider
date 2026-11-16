@@ -1,5 +1,9 @@
 import json
 import shutil
+import signal
+import socket
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -372,7 +376,7 @@ def test_a_blocked_auto_report_is_cut_off_by_the_alarm(world, capsys, monkeypatc
     assert main(["tick"]) == 0
     cap = capsys.readouterr()
     assert time.monotonic() - t0 < 5 and cap.out.splitlines() == ["2026-12-01 10:05 pilot-1/haiku: safety"]
-    assert len(cap.err.strip().splitlines()) == 1 and "TimeoutError" in cap.err
+    assert len(cap.err.strip().splitlines()) == 1 and "не уложился" in cap.err
     assert signal.alarm(0) == 0 and signal.getsignal(signal.SIGALRM) is old
 
 
@@ -383,3 +387,147 @@ def test_a_failing_report_due_is_one_stderr_line_too(world, capsys, monkeypatch)
     monkeypatch.setattr(cli, "report_due", boom)
     monkeypatch.setattr(cli, "tick", tick_returning([{"experiment": "pilot-1", "participant": "haiku", "action": "safety", "ts": TS}]))
     assert main(["tick"]) == 0 and len(capsys.readouterr().err.strip().splitlines()) == 1
+
+
+# --- раунд исправлений 2 ---
+
+@pytest.fixture
+def silent_server():
+    """Локальный сокет, который принимает соединения и никогда не отвечает: настоящее зависание чтения HTTP."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen()
+    conns = []
+
+    def accept():
+        while True:
+            try:
+                conns.append(srv.accept()[0])
+            except OSError:
+                return
+    t = threading.Thread(target=accept, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{srv.getsockname()[1]}/"
+    srv.close()
+    t.join(timeout=5)
+    for c in conns:
+        c.close()
+    assert not t.is_alive()
+
+
+def second_experiment(example, tmp_path):
+    other = tmp_path / "other"; other.mkdir()
+    shutil.copytree(example.parent, other / "exp")
+    toml = other / "exp" / "experiment.toml"
+    toml.write_text(toml.read_text().replace('experiment = "pilot-1"', 'experiment = "second"').replace('broker = "alpaca"', 'broker = "sim"'))
+    start_experiment(toml, tmp_path / "runs")
+
+
+def arm_tick(world, monkeypatch, seconds=1):
+    monkeypatch.setattr(cli, "AUTO_REPORT_SECONDS", seconds)
+    monkeypatch.setattr(cli, "Anthropic", lambda **kw: None)
+    monkeypatch.setattr(cli, "report_due", lambda exp, day: True)
+    monkeypatch.setattr(cli, "tick", tick_returning([{"experiment": "pilot-1", "participant": "haiku", "action": "safety", "ts": TS}]))
+
+
+def assert_section_closed(capsys, t0, old, limit=3.5):
+    cap = capsys.readouterr()
+    assert time.monotonic() - t0 < limit and cap.out.splitlines() == ["2026-12-01 10:05 pilot-1/haiku: safety"]
+    assert len(cap.err.strip().splitlines()) == 1 and "не уложился" in cap.err
+    assert signal.alarm(0) == 0 and signal.getsignal(signal.SIGALRM) is old
+
+
+def test_a_real_socket_hang_in_the_build_ends_the_section_and_the_second_experiment_never_starts(
+        world, example, tmp_path, capsys, monkeypatch, silent_server):
+    import requests
+    second_experiment(example, tmp_path)
+    started(world)
+    old = signal.getsignal(signal.SIGALRM)
+    arm_tick(world, monkeypatch)
+    started_builds = []
+    monkeypatch.setattr(cli, "write_report", lambda exp, *a, **k: (started_builds.append(exp.name), requests.get(silent_server)))
+    t0 = time.monotonic()
+    assert main(["tick"]) == 0
+    assert started_builds == ["pilot-1"]
+    assert_section_closed(capsys, t0, old)
+
+
+def test_a_hang_in_the_broker_request_does_not_let_the_build_run_on(world, capsys, monkeypatch, silent_server):
+    import requests
+    old = signal.getsignal(signal.SIGALRM)
+    arm_tick(world, monkeypatch)
+    started(world)
+
+    class Hanging(Api):
+        def filled_orders_since(self, since):
+            return requests.get(silent_server)
+    monkeypatch.setattr(cli, "make_alpaca_api", lambda cfg, env: Hanging())
+    t0 = time.monotonic()
+    assert main(["tick"]) == 0
+    assert world.calls == []                       # сборка не началась
+    assert_section_closed(capsys, t0, old)
+
+
+def test_a_timeout_swallowed_by_the_broker_check_is_not_swallowed_for_good(world, capsys, monkeypatch):
+    """Даже если что-то съест первое срабатывание, будильник взводится снова и срабатывает ещё раз."""
+    old = signal.getsignal(signal.SIGALRM)
+    arm_tick(world, monkeypatch)
+    started(world)
+
+    def swallow(since):
+        try:
+            time.sleep(10)
+        except BaseException:      # самое плохое: съедено всё
+            time.sleep(10)
+    monkeypatch.setattr(cli, "make_alpaca_api", lambda cfg, env: SimpleNamespace(filled_orders_since=swallow))
+    t0 = time.monotonic()
+    assert main(["tick"]) == 0
+    assert world.calls == []
+    assert_section_closed(capsys, t0, old, limit=4.5)
+
+
+def test_a_previously_pending_alarm_is_restored_with_the_time_left(world, monkeypatch):
+    arm_tick(world, monkeypatch)
+    monkeypatch.setattr(cli, "write_report", lambda *a, **k: time.sleep(1.2))
+    started(world)
+    signal.alarm(100)
+    try:
+        assert main(["tick"]) == 0
+        assert 90 <= signal.alarm(0) <= 99
+    finally:
+        signal.alarm(0)
+
+
+def make_terminal_world(played, tmp_path, monkeypatch, status):
+    exp, market = played
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(ENV)
+    api = Api()
+    monkeypatch.setattr(cli, "AlpacaMarket", lambda k, s: market)
+    monkeypatch.setattr(cli, "make_alpaca_api", lambda cfg, env: api)
+    RunStore(exp / "opus-a").update_state(run_uid="u1", broker_since="2026-12-01T14:00:00+00:00",
+                                          last_sync="2026-12-03T20:00:00+00:00", status=status)
+    api.orders = [{"id": "late", "client_order_id": "pilot-1/opus-a/u1/liquidate/2026-12-03/XLE",
+                   "filled_at": datetime(2026, 12, 3, 21, 0, tzinfo=timezone.utc)}]
+    return exp, api
+
+
+def integrity_incidents(exp):
+    rep = json.loads((exp / "report.json").read_text())
+    return [i for i in rep["incidents"] if i["title"] == "целостность записей нарушена"]
+
+
+@pytest.mark.parametrize("status", ["dead", "finished"])
+def test_a_terminal_run_has_no_cutoff_so_a_late_missing_fill_is_flagged(played, tmp_path, monkeypatch, status):
+    exp, api = make_terminal_world(played, tmp_path, monkeypatch, status)
+    assert main(["report", "pilot-1"]) == 0
+    assert any("late" in i["text"] for i in integrity_incidents(exp))
+    RunStore(exp / "opus-a").append_order({"day": "2026-12-03", "kind": "liquidate", "symbol": "XLE", "broker_order_id": "late"})
+    assert main(["report", "pilot-1"]) == 0
+    assert not integrity_incidents(exp)
+
+
+def test_an_active_run_with_the_same_late_fill_is_still_not_flagged(played, tmp_path, monkeypatch):
+    exp, api = make_terminal_world(played, tmp_path, monkeypatch, "active")
+    assert main(["report", "pilot-1"]) == 0
+    assert not integrity_incidents(exp)
