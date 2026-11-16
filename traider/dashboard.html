@@ -72,7 +72,7 @@ td.l,th.l{text-align:left}
 .mini{display:inline-flex;align-items:center;gap:8px;justify-content:flex-end}
 .mini .bar{width:64px}
 .verdict{display:inline-flex;align-items:center;gap:7px;text-align:left}
-.verdict small{display:block;color:var(--ink2);font-size:11.5px}
+.verdict small,small.sub2{display:block;color:var(--ink2);font-size:11.5px}
 svg{display:block;width:100%;height:auto;overflow:visible}
 .ax{font-size:11.5px;fill:var(--muted);font-variant-numeric:tabular-nums}
 .legend{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:12.5px;color:var(--ink2);margin:0 0 10px}
@@ -254,7 +254,7 @@ dialog .btn.out{margin-left:0}
 <div id="tip" role="status"></div>
 <dialog id="stop-dialog" aria-labelledby="stop-title">
   <h2 id="stop-title">Остановить эксперимент <span id="stop-name"></span>?</h2>
-  <p>Следующий тик при открытом рынке продаст все позиции всех участников, и прогоны перейдут к завершению: новых сессий не будет, через пять торговых дней эксперимент будет завершён. Отменить остановку нельзя.</p>
+  <p>Следующий тик при открытом рынке продаст все позиции всех участников, и прогоны перейдут к завершению: новых сессий не будет, через пять торговых дней эксперимент будет завершён. Сессия, которая уже идёт, закончится; её позиции продаст следующий тик. Прогон, который бот отказался вести (статус invalid), остановка не трогает: его позиции закрываются вручную. Отменить остановку нельзя.</p>
   <label for="stop-input">Чтобы подтвердить, введите имя эксперимента</label>
   <input id="stop-input" autocomplete="off" autocapitalize="off" spellcheck="false">
   <div class="acts"><button type="button" class="btn" id="stop-cancel">Отмена</button><button type="button" class="btn out" id="stop-ok" disabled>Остановить всё</button></div>
@@ -303,7 +303,9 @@ const P = (DATA.participants || []).map(p => ({
 const SESS = Object.fromEntries(P.map(p => [p.id, new Map(((DATA.sessions || {})[p.id] || []).map(x => [x.day, x]))]));
 const START = num(((DATA.equity || {})[P[0] && P[0].id] || [])[0]) ? DATA.equity[P[0].id][0] : null;
 const REJECT_LABEL = Object.fromEntries((DATA.rejects || []).map(r => [r.reason, r.label]));
-const PRELIM = num(META.sessions_target) && (META.sessions_done || 0) < META.sessions_target;
+/* Вердикт окончательный, когда прогон участника закончен (finished: прогнозы последних сессий созрели) или участник погиб. */
+const FINAL = p => p.status === "finished" || p.status === "dead";
+const PRELIM = P.some(p => !FINAL(p));
 
 /* ---------- состояние и форматы ---------- */
 const RANGES = [["all", "Весь прогон", N], ["last5", "Последние 5 дней", 5], ["last10", "Последние 10 дней", 10]];
@@ -373,7 +375,7 @@ function renderHeader() {
   document.title = `Traider — ${$("title").textContent}`;
   const at = when(META.generated_at);
   $("sub").textContent = [META.experiment ? `Эксперимент ${META.experiment}.` : null, at ? `Обновлено ${at}.` : null,
-    !num(target) ? null : PRELIM ? `Вердикт выносится один раз, после ${target}-й сессии; до этого он предварительный.` : `Все ${target} ${plural(target, "сессия", "сессии", "сессий")} пройдены, вердикт вынесен.`]
+    !P.length ? null : PRELIM ? "Вердикт участника окончательный, когда его прогон закончен: после последней сессии ещё пять торговых дней созревают прогнозы. У погибшего он окончательный сразу. До этого вердикт предварительный." : "Все прогоны закончены, вердикт вынесен."]
     .filter(Boolean).join(" ");
   if (num(target) && target > 0) {
     const share = Math.min(100, Math.round(100 * done / target));
@@ -407,10 +409,10 @@ function verdictMark(v) {
 function verdictCell(p) {
   const word = own(VERDICT, p.verdict) || String(p.verdict ?? DASH);
   return h("span", { class: "verdict" }, verdictMark(p.verdict), h("span", {}, word,
-    p.dead ? h("small", {}, "погиб, вердикт окончательный") : PRELIM ? h("small", {}, "предварительный") : null));
+    p.dead ? h("small", {}, "погиб, вердикт окончательный") : !FINAL(p) ? h("small", {}, "предварительный") : null));
 }
 function renderSummary() {
-  $("summary-note").textContent = `${START != null ? `Все участники начали с ${usd(START)} и работают по одним правилам. ` : ""}«Среди случайных» показывает, какую долю ботов со случайным выбором бумаг участник обошёл: 50 значит «как монетка». Сводка всегда за весь прогон, фильтр периода её не меняет.`;
+  $("summary-note").textContent = `${START != null ? `Все участники начали с ${usd(START)} и работают по одним правилам. ` : ""}«Среди случайных» показывает, какую долю ботов со случайным выбором бумаг участник обошёл: 50 значит «как монетка». Капитал считается повтором сделок участника по ценам дня, а «по счёту» это капитал на счёте при последнем тике дня: они расходятся, потому что тик видит цены в другую минуту, чем повтор, а сделки по стопу счёт исполняет внутри дня. Сводка всегда за весь прогон, фильтр периода её не меняет.`;
   const head = ["Участник", "Капитал", "Доход", "Против SPY", "Среди случайных", "Просадка", "Остаток HP", "Сделок", "Брайер", "Расход", "Вердикт"];
   const rows = shown().map(p => {
     const t = (DATA.summary || {})[p.id] || {};
@@ -423,10 +425,13 @@ function renderSummary() {
       mark.style.width = "72px";
       place = h("span", { class: "mini" }, mark, nf0.format(t.percentile));
     }
+    const acct = curve("account_equity", p.id), real = acct.length > 1 ? acct[acct.length - 1] : null;
+    const unknown = num(t.sessions_without_cost) && t.sessions_without_cost > 0
+      ? h("small", { class: "sub2" }, `не всё записано: у ${t.sessions_without_cost} ${plural(t.sessions_without_cost, "сессии", "сессий", "сессий")} стоимость неизвестна`) : null;
     const hp = !num(t.hp) ? DASH : h("span", { class: "mini" }, num(t.hp_share) ? h("span", { class: "bar" }, h("i", { style: `width:${Math.round(100 * Math.max(0, Math.min(1, t.hp_share)))}%` })) : null, usd(t.hp));
     return h("tr", {},
       h("td", {}, who(p)),
-      h("td", {}, usd(t.equity)),
+      h("td", {}, usd(t.equity), h("small", { class: "sub2" }, `по счёту ${usd(real)}`)),
       h("td", { class: tone(t.return_pct) }, signed(t.return_pct, "%")),
       h("td", { class: tone(t.vs_spy_pp) }, signed(t.vs_spy_pp, " п.п.")),
       h("td", {}, place),
@@ -434,7 +439,7 @@ function renderSummary() {
       h("td", {}, hp),
       h("td", {}, num(t.trades) ? nf0.format(t.trades) : DASH),
       h("td", {}, dec3(t.brier)),
-      h("td", {}, usd2(t.cost)),
+      h("td", {}, num(t.cost) ? usd2(t.cost) : unknown ? "неизвестно" : DASH, num(t.cost) ? unknown : null),
       h("td", { class: "l" }, verdictCell(p)));
   });
   put("summary", h("table", {}, h("thead", {}, h("tr", {}, head.map((x, i) => h("th", { class: i === head.length - 1 ? "l" : null }, x)))), h("tbody", {}, rows)));
@@ -524,8 +529,9 @@ function renderEquity() {
     DATA.spy ? h("span", {}, h("i", { class: "key", style: "background:var(--muted)" }), "SPY, купил и держал") : h("span", {}, "SPY: дневных свечей нет, линии нет"),
     band ? h("span", {}, h("i", { class: "sw", style: "background:var(--band-mid);box-shadow:0 0 0 3px var(--band-wide)" }), `случайные боты ${bp.id}: половина и 90% из них`) : null);
   const cellOf = v => h("td", {}, v == null ? DASH : usd(v));
-  put("eq-table", h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "День"), ...lined.map(p => h("th", {}, p.id)), h("th", {}, "SPY"), band ? h("th", {}, `Боты ${bp.id}, середина`) : null)),
-    h("tbody", {}, idx.map(i => h("tr", {}, h("td", {}, xLabel(i)), ...lined.map(p => cellOf(eqAt(p.id, i))), cellOf(S(i)), band ? cellOf(B("p50", i)) : null)))));
+  const acctAt = (pid, i) => val(curve("account_equity", pid), pid, i);
+  put("eq-table", h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "День"), ...lined.flatMap(p => [h("th", {}, p.id), h("th", {}, `${p.id}, по счёту`)]), h("th", {}, "SPY"), band ? h("th", {}, `Боты ${bp.id}, середина`) : null)),
+    h("tbody", {}, idx.map(i => h("tr", {}, h("td", {}, xLabel(i)), ...lined.flatMap(p => [cellOf(eqAt(p.id, i)), cellOf(acctAt(p.id, i))]), cellOf(S(i)), band ? cellOf(B("p50", i)) : null)))));
 }
 
 /* ---------- деньги и токены ---------- */
@@ -675,7 +681,7 @@ function renderDetail() {
   if (!sel) return box.replaceChildren(h("p", { class: "note", style: "margin:0" }, N ? "В выбранном периоде у этих участников сессий нет." : "Сессий пока не было. Здесь появится разбор сессии: что агент смотрел, что решил и сколько это стоило."));
   const p = P.find(q => q.id === sel.p), x = SESS[p.id].get(sel.d), st = x.status;
   const title = `${p.id}, ${dayLabel(sel.d)}: ${own(STATUS_NAME, st) || String(st ?? "неизвестно")}`;
-  if (st === "missed") return box.replaceChildren(h("h3", {}, title), h("p", { class: "note", style: "margin:0" }, "Сессии не было: машина не работала в часы торгов. Проверка HP и стопы в этот день не работали."));
+  if (st === "missed") return box.replaceChildren(h("h3", {}, title), h("p", { class: "note", style: "margin:0" }, "Сессии не было: к концу окна сессии ни один тик её не начал. Запись не говорит почему: машина могла не работать, у удерживаемой бумаги могло не быть котировки, тик мог падать с ошибкой. Шли ли в этот день проверка HP и стопы, видно по происшествиям этого дня."));
   if (st === "paused") return box.replaceChildren(h("h3", {}, title), h("p", { class: "note", style: "margin:0" }, "День паузы: владелец приостановил эксперимент, сессии не было. Позиции остались, проверка HP и стопы работали. Этот день не входит ни в число сессий, ни в долю пропусков."));
   const looked = (x.looked || []).map(l => [`${own(LOOKED, l.name) || l.name}: ${l.calls} ${plural(l.calls, "раз", "раза", "раз")}`, l.example && Object.keys(l.example).length ? cut(json(l.example).replace(/\s+/g, " "), 140) : null]);
   if (!looked.length) looked.push(["Ничего не смотрел", null]);
@@ -720,7 +726,7 @@ function renderPositions() {
   put("positions", ...(rows.length ? [] : [empty("Открытых позиций нет.")]), !any ? null :
     h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Бумага"), ...ps.map(p => h("th", {}, h("span", { class: "mini" }, h("i", { class: "dot", style: `background:${p.color}` }), p.id))))), h("tbody", {}, rows, money)));
 }
-const HOW = { agent: "решение агента", stop: "стоп", liquidation: "ликвидация: конец прогона или гибель" };
+const HOW = { agent: "решение агента", stop: "стоп", liquidation: "ликвидация: конец прогона, остановка владельцем или гибель" };
 function renderTrades() {
   const from = DAYS[i0()];
   const list = (DATA.trades || []).filter(t => state.on.has(t.participant) && (!from || !t.day || t.day >= from)).slice().reverse();
@@ -852,8 +858,11 @@ function showControl(st, err) {
   ctl.state = st;
   if (!st) { $("control-state").textContent = "нет связи с сервером управления"; return put("control-acts"); }
   const word = st.state === "paused" ? `на паузе с ${dayLabel(st.paused_since)}` : own(CONTROL_STATES, st.state) || String(st.state);
-  const stopNote = st.state === "stopping" && st.stop ? `Заявка от ${dayLabel(st.stop.day)}. Позиции продаст ближайший тик при открытом рынке.` : null;
-  put("control-state", h("b", {}, `Эксперимент ${st.experiment}: ${word}`), stopNote ? h("small", {}, stopNote) : null,
+  const stopNote = st.state === "stopping" && st.stop ? `Заявка от ${dayLabel(st.stop.day)}. Позиции продаст ближайший тик при открытом рынке; сессия, которая уже идёт, закончится, её позиции продаст следующий тик.` : null;
+  const resumed = st.state === "running" && st.pause_day ? "Пауза снята: сегодня ещё день паузы, сессии со следующего торгового дня." : null;
+  const lastTick = when(st.last_tick);
+  put("control-state", h("b", {}, `Эксперимент ${st.experiment}: ${word}`), stopNote ? h("small", {}, stopNote) : null, resumed ? h("small", {}, resumed) : null,
+    st.state === "damaged" ? null : h("small", {}, lastTick ? `Последний тик: ${lastTick}.` : "Тиков ещё не было."),
     st.state === "damaged" ? h("small", {}, String(st.error ?? "")) : null, err ? h("small", {}, err) : null);
   const btn = (label, click, cls) => h("button", { type: "button", class: cls ? `btn ${cls}` : "btn", disabled: ctl.busy, onclick: click }, label);
   put("control-acts", st.state === "running" ? btn("Пауза", () => act("pause")) : null, st.state === "paused" ? btn("Продолжить", () => act("resume")) : null,

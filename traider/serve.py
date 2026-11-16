@@ -7,7 +7,7 @@
 Как это работает. `make_server` слушает только `127.0.0.1` (другого адреса задать нельзя), порт 0 берёт свободный.
 Маршруты сверяются с сырым путём запроса, строка запроса отбрасывается: `GET /` (один незавершённый эксперимент:
 переход на его страницу, иначе список), `GET /e/<имя>/` (файл `dashboard.html` эксперимента или, пока его нет, тот же
-шаблон с `meta.not_built`), `GET /e/<имя>/control` (`control.summary` плюс токен; повреждённый `control.json` даёт
+шаблон с `meta.not_built`), `GET /e/<имя>/control` (`control.summary` за сегодня по `market.today` плюс токен; повреждённый `control.json` даёт
 состояние `damaged` с текстом ошибки), `POST /e/<имя>/pause|resume|stop` (действие модуля control, ответ новый
 `summary`). Сегмент имени раскодируется из %-записи (ссылки списка кодируют имя целиком) и годен, только если в
 `runs_dir` есть такой каталог (не символическая ссылка) хотя бы с одним `*/config.json`; имя служит лишь ключом
@@ -102,7 +102,7 @@ def make_server(runs_dir: Path, port: int = 8787, token: str | None = None) -> T
                 body = built.read_bytes() if built.exists() else page({"meta": {"experiment": exp.name, "not_built": True}})
                 return self.reply(200, body, "text/html")
             try:
-                state = summary(exp)
+                state = summary(exp, today())
             except ValueError as e:
                 state = {"experiment": exp.name, "state": "damaged", "error": str(e)}
             self.reply(200, state | {"token": token})
@@ -140,7 +140,7 @@ def make_server(runs_dir: Path, port: int = 8787, token: str | None = None) -> T
                         resume(exp, today())
                     else:
                         request_stop(exp, today(), datetime.now(NY))
-                    state = summary(exp)
+                    state = summary(exp, today())
                 except ValueError as e:   # пауза после остановки, повреждённый control.json: файл не перезаписан
                     return self.reply(409, {"error": str(e)})
             self.reply(200, state)

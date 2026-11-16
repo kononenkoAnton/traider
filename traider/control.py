@@ -18,7 +18,9 @@
 остановки). `pause` открывает интервал, если открытого нет; `resume` закрывает открытый днём `day`, без открытого
 ничего не меняет; оба после запроса остановки дают `ValueError`. `request_stop` необратим, повтор ничего не
 меняет. `is_paused`: день внутри любого интервала, концы включены, у открытого конца нет (день снятия паузы ещё
-пауза, сессии идут со следующего торгового дня). `summary` читает состояния прогонов и ничего не пишет; `state`:
+пауза, сессии идут со следующего торгового дня). `summary(exp_dir, day)` читает состояния прогонов и ничего не пишет;
+`last_tick` это самое позднее время строки `ticks.jsonl` среди прогонов (ISO по Нью-Йорку, None, если тиков не было или файл не
+читается), `pause_day` это `is_paused` для `day` (False без `day`): после снятия паузы сегодня он ещё True; `state`:
 `finished` (все прогоны `finished` или `dead`), `stopping` (остановка запрошена), `finishing` (ни одного `active`:
 естественный конец, пока созревают прогнозы), `paused` (открыт интервал паузы), иначе `running`.
 """
@@ -31,6 +33,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from traider.config import TERMINAL_STATUSES
+from traider.market import NY
 from traider.store import RunStore
 
 FILE = "control.json"
@@ -131,9 +134,18 @@ def _status(run: Path) -> str:
         return "не читается"
 
 
-def summary(exp_dir: Path) -> dict:
+def _last_tick(run: Path) -> datetime | None:
+    try:
+        return max((datetime.fromisoformat(t["ts"]) for t in RunStore(run).ticks()), default=None)
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def summary(exp_dir: Path, day: str | None = None) -> dict:
     c = read_control(exp_dir)
-    runs = [{"participant": r.name, "status": _status(r)} for r in sorted(p.parent for p in Path(exp_dir).glob("*/config.json"))]
+    dirs = sorted(p.parent for p in Path(exp_dir).glob("*/config.json"))
+    runs = [{"participant": r.name, "status": _status(r)} for r in dirs]
+    last = max((t for r in dirs if (t := _last_tick(r))), default=None)
     statuses = [r["status"] for r in runs]
     opened = _open(c)
     if all(s in TERMINAL_STATUSES for s in statuses):
@@ -147,4 +159,5 @@ def summary(exp_dir: Path) -> dict:
     else:
         state = "running"
     return {"experiment": Path(exp_dir).name, "state": state, "paused_since": opened and opened["from"],
-            "stop": c["stop"], "runs": runs}
+            "stop": c["stop"], "runs": runs, "last_tick": last and last.astimezone(NY).isoformat(),
+            "pause_day": day is not None and is_paused(c, day)}

@@ -1,8 +1,6 @@
 import json
 import shutil
 import signal
-import socket
-import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -391,30 +389,6 @@ def test_a_failing_report_due_is_one_stderr_line_too(world, capsys, monkeypatch)
 
 # --- раунд исправлений 2 ---
 
-@pytest.fixture
-def silent_server():
-    """Локальный сокет, который принимает соединения и никогда не отвечает: настоящее зависание чтения HTTP."""
-    srv = socket.socket()
-    srv.bind(("127.0.0.1", 0))
-    srv.listen()
-    conns = []
-
-    def accept():
-        while True:
-            try:
-                conns.append(srv.accept()[0])
-            except OSError:
-                return
-    t = threading.Thread(target=accept, daemon=True)
-    t.start()
-    yield f"http://127.0.0.1:{srv.getsockname()[1]}/"
-    srv.close()
-    t.join(timeout=5)
-    for c in conns:
-        c.close()
-    assert not t.is_alive()
-
-
 def second_experiment(example, tmp_path):
     other = tmp_path / "other"; other.mkdir()
     shutil.copytree(example.parent, other / "exp")
@@ -633,3 +607,37 @@ def test_tick_line_mentions_a_damaged_control_file(tmp_path, example, capsys, mo
                                                   "ts": "2026-12-01T15:05:00+00:00",
                                                   "control_error": "ValueError: runs/pilot-1/control.json не читается"}])
     assert main(["tick"]) == 0 and "control.json" in capsys.readouterr().out
+
+
+# --- волна после проверки всей ветки ---
+
+def test_a_real_tick_through_main_builds_the_report_once_and_again_after_a_stop(tmp_path, example, capsys, monkeypatch):
+    """Настоящий тик на подделках, настоящий report_due и настоящая сборка: opus-a на Alpaca падает каждый тик
+    (счёт не готов), остальные торгуют; отчёт собирается после их сессий, не на каждом тике и снова после остановки."""
+    from tests.fakes import FakeAnthropic, FakeMarket, ny, use
+    from traider.control import request_stop
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(ENV)
+    exp = start_experiment(example, tmp_path / "runs")
+    market = FakeMarket.with_history(list(load_run(exp / "haiku")[0].universe), days=70, clock=ny(2026, 12, 1, 10, 5))
+    market.open = True
+
+    def not_ready(cfg, env):
+        raise RuntimeError("счёт Alpaca не на 1000 долларов")
+    monkeypatch.setattr(cli, "AlpacaMarket", lambda key, secret: market)
+    monkeypatch.setattr(cli, "make_alpaca_api", not_ready)
+    monkeypatch.setattr(cli, "Anthropic", lambda **kw: FakeAnthropic([use("get_account"), use("finish_session", journal="ок")]))
+    report = exp / "report.json"
+    assert main(["tick"]) == 0
+    assert "pilot-1/opus-a: error" in capsys.readouterr().out
+    first = json.loads(report.read_text())
+    assert {p["id"]: p["status"] for p in first["participants"]}["haiku"] == "active" and (exp / "dashboard.html").exists()
+    market.clock = ny(2026, 12, 1, 10, 20)
+    assert main(["tick"]) == 0
+    assert json.loads(report.read_text())["meta"]["generated_at"] == first["meta"]["generated_at"]    # не на каждом тике
+    request_stop(exp, "2026-12-01", ny(2026, 12, 1, 12, 55))
+    market.clock = ny(2026, 12, 1, 13, 0)
+    assert main(["tick"]) == 0
+    after = json.loads(report.read_text())
+    assert after["meta"]["generated_at"] == ny(2026, 12, 1, 13, 0).isoformat()
+    assert {p["id"]: p["status"] for p in after["participants"]}["haiku"] == "finishing"

@@ -37,7 +37,7 @@ from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, Replac
 from traider.brokers import BrokerRejected, NoPrice
 from traider.cage import Account, Position
 from traider.config import RunConfig
-from traider.market import Market, ny_day
+from traider.market import Market, bounded, ny_day
 from traider.nums import usable
 from traider.sim import Fill, mark_peak
 from traider.store import RunStore
@@ -100,7 +100,7 @@ class AlpacaApi(Protocol):
 
 class AlpacaSdkApi:
     def __init__(self, api_key: str, secret_key: str, paper: bool):
-        self._trading = TradingClient(api_key, secret_key, paper=paper)
+        self._trading = bounded(TradingClient(api_key, secret_key, paper=paper))
 
     def cash_and_positions(self):
         cash = float(self._trading.get_account().cash)

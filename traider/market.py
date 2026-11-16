@@ -23,6 +23,9 @@
 скорректированы на сплиты (`adjustment=Adjustment.SPLIT`), минутные для стопов нет.
 Преобразования без сети (свеча SDK в `Bar`, пары (минимум, открытие), день по
 Нью-Йорку) вынесены в чистые функции. Бесплатный счёт не видит свежих данных SIP, потому IEX.
+`bounded` ставит на сессию клиента alpaca-py срок запроса 5 секунд на соединение и 30 на чтение (SDK сам срока не
+задаёт, и зависшее чтение держало бы тик вечно) и не повторяет запросов: истёкший срок это обычное исключение, которое
+тик пишет как `error`. Через `bounded` создаются все клиенты здесь и в `traider.alpaca`.
 """
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -38,6 +41,7 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetStatus
 from alpaca.trading.requests import GetAssetsRequest, GetCalendarRequest
+from requests.adapters import HTTPAdapter
 
 from traider.nums import usable
 
@@ -101,11 +105,32 @@ def low_open_pairs(bars) -> list[tuple[float, float]]:
     return [(float(b.low), float(b.open)) for b in bars]
 
 
+TIMEOUT = (5, 30)   # секунд на соединение и на чтение
+
+
+class _Timeout(HTTPAdapter):
+    """Срок запроса, если вызов его не задал (alpaca-py не задаёт): зависший ответ становится ошибкой, а не вечным
+    тиком. Повторов нет: заявку, чей ответ не пришёл, найдёт следующая сверка, а не второй запрос."""
+    def __init__(self, timeout):
+        super().__init__(max_retries=0)
+        self.timeout = timeout
+
+    def send(self, request, timeout=None, **kw):
+        return super().send(request, timeout=self.timeout if timeout is None else timeout, **kw)
+
+
+def bounded(client, timeout=TIMEOUT):
+    """Клиент alpaca-py с этим сроком на каждом запросе его сессии (`_session`: requests.Session SDK)."""
+    for prefix in ("https://", "http://"):
+        client._session.mount(prefix, _Timeout(timeout))
+    return client
+
+
 class AlpacaMarket:
     def __init__(self, api_key: str, secret_key: str):
-        self._data = StockHistoricalDataClient(api_key, secret_key)
-        self._news = NewsClient(api_key, secret_key)
-        self._trading = TradingClient(api_key, secret_key, paper=True)  # календарь, часы и список бумаг
+        self._data = bounded(StockHistoricalDataClient(api_key, secret_key))
+        self._news = bounded(NewsClient(api_key, secret_key))
+        self._trading = bounded(TradingClient(api_key, secret_key, paper=True))  # календарь, часы и список бумаг
 
     def is_open(self) -> bool:
         return bool(self._trading.get_clock().is_open)

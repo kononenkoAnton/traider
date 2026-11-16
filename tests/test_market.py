@@ -123,3 +123,30 @@ def test_alpaca_market_asks_for_split_adjusted_days_and_one_minute_lows():   # M
     assert days.adjustment == Adjustment.SPLIT
     assert lows.timeframe.amount == 1 and lows.timeframe.unit.value == "Min"
     assert lows.start == datetime(2026, 12, 1, 15, 15)                     # SDK хранит начало в UTC без пояса
+
+
+# --- волна после проверки всей ветки ---
+
+def test_every_alpaca_client_gets_a_5_and_30_second_timeout_and_no_retry():
+    from traider.alpaca import AlpacaSdkApi
+    from traider.market import AlpacaMarket
+    m, api = AlpacaMarket("k", "s"), AlpacaSdkApi("k", "s", paper=True)
+    for client in (m._data, m._news, m._trading, api._trading):           # клиенты создаются без сети
+        for url in ("https://api.alpaca.markets/", "https://data.alpaca.markets/", "http://127.0.0.1/"):
+            adapter = client._session.get_adapter(url)
+            assert adapter.timeout == (5, 30) and adapter.max_retries.total == 0
+
+
+def test_a_server_that_never_answers_ends_the_call_with_a_timeout(silent_server):
+    import time
+
+    import pytest
+    import requests
+    from alpaca.trading.client import TradingClient
+    from traider.market import bounded
+    client = bounded(TradingClient("k", "s", url_override=silent_server.rstrip("/")), timeout=(1, 0.5))
+    t0 = time.monotonic()
+    with pytest.raises(requests.exceptions.Timeout):
+        client.get_clock()
+    assert time.monotonic() - t0 < 3
+    client._session.close()

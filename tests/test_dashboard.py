@@ -63,7 +63,7 @@ def test_template_is_self_contained_and_safe():
         assert f'id="{section}"' in t, section
     for colour in ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#3987e5", "#d95926", "#199e70", "#c98500", "#d55181"]:
         assert colour in t, colour
-    for bad in ["outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "javascript:"]:
+    for bad in ["outerHTML", "insertAdjacentHTML", "document.write", "srcdoc", "eval(", "new Function", "javascript:"]:
         assert bad not in t, bad
     assert not re.search(r"\son[a-z]+\s*=", t)                                  # обработчики только через addEventListener
     assert t.count("const DATA = /*DATA*/null;\n") == 1
@@ -176,3 +176,18 @@ def test_report_with_a_late_starter_renders(tmp_path):
 def test_template_names_the_paused_status():
     t = pathlib.Path("traider/dashboard.html").read_text()
     assert 'paused: "пауза"' in t and 'st === "paused"' in t
+
+
+# --- волна после проверки всей ветки ---
+
+def test_template_shows_the_account_unknown_spend_and_the_last_tick():
+    t = pathlib.Path("traider/dashboard.html").read_text()
+    for phrase in ["по счёту", "Последний тик: ", "Тиков ещё не было.", "остановка владельцем",
+                   "Сессия, которая уже идёт, закончится; её позиции продаст следующий тик.", "статус invalid",
+                   "закрываются вручную", "сессии со следующего торгового дня", "стоимость неизвестна", "неизвестно",
+                   "Все прогоны закончены, вердикт вынесен."]:
+        assert phrase in t, phrase
+    for key in ['curve("account_equity"', "st.last_tick", "st.pause_day", "t.sessions_without_cost", "const FINAL = p =>"]:
+        assert key in t, key
+    assert "машина не работала в часы торгов. Проверка HP" not in t            # пропуск бывает и без выключенной машины
+    assert "sessions_done || 0) < META.sessions_target" not in t                # вердикт не по числу сессий

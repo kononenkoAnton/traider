@@ -1,5 +1,7 @@
 import pathlib
 import re
+import socket
+import threading
 from dataclasses import replace
 
 import pytest
@@ -208,3 +210,27 @@ def example_live(tmp_path):
 @pytest.fixture
 def example_bad_broker(tmp_path):
     return _make(tmp_path, lambda t: re.sub(r'broker = "sim"', 'broker = "nope"', t, count=1))
+
+
+@pytest.fixture
+def silent_server():
+    """Локальный сокет, который принимает соединения и никогда не отвечает: настоящее зависание чтения HTTP."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen()
+    conns = []
+
+    def accept():
+        while True:
+            try:
+                conns.append(srv.accept()[0])
+            except OSError:
+                return
+    t = threading.Thread(target=accept, daemon=True)
+    t.start()
+    yield f"http://127.0.0.1:{srv.getsockname()[1]}/"
+    srv.close()
+    t.join(timeout=5)
+    for c in conns:
+        c.close()
+    assert not t.is_alive()

@@ -108,3 +108,23 @@ def test_finishing_while_an_old_pause_is_closed_is_finishing_not_paused(tmp_path
     pause(exp, "2026-12-02")
     assert _states(exp, haiku="invalid", sonnet="dead", **{"opus-a": "finishing", "opus-b": "finished",
                                                           "opus-analyst": "finishing"})["state"] == "finishing"
+
+
+# --- волна после проверки всей ветки ---
+
+def test_summary_carries_the_newest_tick_time_across_runs(tmp_path, example):
+    exp = start_experiment(example, tmp_path / "runs")
+    assert summary(exp)["last_tick"] is None
+    RunStore(exp / "haiku").append_tick({"ts": "2026-12-01T10:05:00-05:00", "day": "2026-12-01", "action": "session"})
+    RunStore(exp / "sonnet").append_tick({"ts": "2026-12-01T10:20:00-05:00", "day": "2026-12-01", "action": "safety"})
+    RunStore(exp / "haiku").append_tick({"ts": "2026-12-01T15:10:00+00:00", "day": "2026-12-01", "action": "safety"})
+    assert summary(exp)["last_tick"] == "2026-12-01T10:20:00-05:00"      # 15:10 UTC это 10:10 в Нью-Йорке
+
+
+def test_summary_says_when_today_is_still_a_pause_day_after_resume(tmp_path, example):
+    exp = start_experiment(example, tmp_path / "runs")
+    assert summary(exp, "2026-12-02")["pause_day"] is False
+    pause(exp, "2026-12-02"); resume(exp, "2026-12-02")
+    s = summary(exp, "2026-12-02")
+    assert s["state"] == "running" and s["pause_day"] is True               # сессии со следующего торгового дня
+    assert summary(exp, "2026-12-03")["pause_day"] is False and summary(exp)["pause_day"] is False
