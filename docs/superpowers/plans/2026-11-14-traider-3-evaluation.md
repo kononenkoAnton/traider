@@ -525,6 +525,217 @@ git commit -m "feat: report command, wiki results article, daily auto-report"
 
 ---
 
+### Task 6: Пауза и остановка
+
+Добавлена 15.11.2026 по просьбе владельца: «хочу видеть UI со статистикой и возможность сделать паузу или стоп». Исполняется после задачи 4 и до задачи 5.
+
+**Files:**
+- Create: `traider/control.py`, `tests/test_control.py`
+- Modify: `traider/tick.py`, `traider/session.py`, `traider/report.py`, `traider/dashboard.html`, `traider/cli.py`, `tests/test_tick.py`, `tests/test_session.py`, `tests/test_report.py`, `tests/test_cli.py`
+
+**Interfaces:**
+- Produces:
+
+```python
+# traider/control.py: единственное место, где владелец меняет ход эксперимента
+def read_control(exp_dir: Path) -> dict                      # {"pauses": [{"from": day, "to": day | None}], "stop": {"day": day, "ts": iso} | None}
+def pause(exp_dir: Path, day: str) -> dict                   # открывает интервал паузы; повтор ничего не меняет
+def resume(exp_dir: Path, day: str) -> dict                  # закрывает открытый интервал
+def request_stop(exp_dir: Path, day: str, now: datetime) -> dict   # необратимо; повтор ничего не меняет
+def is_paused(control: Mapping, day: str) -> bool            # day внутри любого интервала, концы включены
+def summary(exp_dir: Path) -> dict                           # {"experiment", "state", "paused_since", "stop", "runs": [{"participant", "status"}]}
+```
+
+Команды: `traider pause [experiment]`, `traider resume [experiment]`, `traider stop <experiment> --yes`. Без имени `pause` и `resume` действуют на единственный незавершённый эксперимент; если их несколько, команда печатает их список и возвращает 2. `stop` без `--yes` печатает, что произойдёт, и возвращает 2.
+
+Файл `runs/<experiment>/control.json` пишут только эти функции (через временный файл и переименование). Тик его только читает. Состояние прогонов и журналы эти функции не трогают: так действие владельца не может столкнуться с идущим тиком.
+
+`summary()["state"]`: `running`, `paused`, `stopping` (остановка запрошена, а не все прогоны завершены), `finished` (все прогоны `finished` или `dead`).
+
+Правила:
+- **Пауза.** Для прогона на паузе тик выполняет проверку HP и стопы как обычно, сессию не запускает. За торговый день на паузе тик создаёт запись сессии со статусом `paused` (один раз, тем же исключительным созданием, что и остальные записи) и возвращает действие `paused`. Дни без записи заполняются задним числом: день внутри интервала паузы получает `paused`, остальные `missed`.
+- **Дни паузы не считаются.** Запись `paused` не входит ни в число сессий (цель `sessions_target`, номер последней сессии), ни в долю пропусков. В отчёте `sessions_done` и `missed_share` считаются без неё; расход за такой день равен 0 и считается записанным; каждый интервал паузы даёт одно происшествие `warning` «пауза владельца» с датами. Кривые капитала идут через дни паузы без разрыва: позиции остаются, стопы работают.
+- **Остановка.** Тик, встретив запрос остановки у активного прогона, переводит его в `finishing` с `finish_day` равным дню тика и полем `stopped_by: "owner"`, после чего работает существующая ветка `finishing`: продажа всего при открытом рынке, ежедневный снимок цен, через пять торговых дней `finished`. Остановка сильнее паузы. Прогоны `invalid`, `dead`, `finished` запрос не меняет. В отчёте остановка даёт происшествие `warning` «остановлен владельцем».
+- На странице аналитики день паузы показан в сетке сессий своим знаком и словом «пауза».
+- `traider status` печатает состояние эксперимента: на паузе с какого дня, запрошена ли остановка.
+
+- [ ] **Step 1: Написать падающие тесты**
+
+```python
+# tests/test_control.py
+def test_pause_resume_and_stop_are_recorded_and_idempotent(tmp_path):
+    exp = tmp_path / "runs" / "pilot-1"; exp.mkdir(parents=True)
+    assert read_control(exp) == {"pauses": [], "stop": None}
+    pause(exp, "2026-12-02"); pause(exp, "2026-12-03")                       # повтор не открывает второй интервал
+    assert read_control(exp)["pauses"] == [{"from": "2026-12-02", "to": None}]
+    assert is_paused(read_control(exp), "2026-12-05") and not is_paused(read_control(exp), "2026-12-01")
+    resume(exp, "2026-12-04")
+    c = read_control(exp)
+    assert c["pauses"] == [{"from": "2026-12-02", "to": "2026-12-04"}] and is_paused(c, "2026-12-04") and not is_paused(c, "2026-12-07")
+    first = request_stop(exp, "2026-12-08", NOW); assert request_stop(exp, "2026-12-09", NOW)["stop"] == first["stop"]
+
+# tests/test_tick.py
+def test_paused_experiment_keeps_safety_and_runs_no_session(world):
+    runs, market, mb, mc, clients = world
+    pause(runs / "pilot-1", "2026-12-01")
+    assert set(actions(tick(runs, market, mb, mc)).values()) == {"paused"} and clients == []
+    assert RunStore(runs / "pilot-1" / "haiku").session("2026-12-01")["status"] == "paused"
+
+def test_days_inside_a_pause_are_backfilled_as_paused_not_missed(world):
+    runs, market, mb, mc, _ = world
+    tick(runs, market, mb, mc)                                                # 01.12 прошла
+    pause(runs / "pilot-1", "2026-12-02"); resume(runs / "pilot-1", "2026-12-03")
+    market.clock = ny(2026, 12, 4, 10, 5)                                     # машина была выключена 02.12 и 03.12
+    tick(runs, market, mb, mc)
+    store = RunStore(runs / "pilot-1" / "haiku")
+    assert [store.session(d)["status"] for d in ("2026-12-02", "2026-12-03", "2026-12-04")] == ["paused", "paused", "ok"]
+
+def test_paused_days_do_not_use_up_the_session_target(world):                 # в примере sessions_target = 3
+    runs, market, mb, mc, _ = world
+    for day in (1, 2):
+        market.clock = ny(2026, 12, day, 10, 5); tick(runs, market, mb, mc)
+    pause(runs / "pilot-1", "2026-12-03"); market.clock = ny(2026, 12, 3, 10, 5); tick(runs, market, mb, mc)
+    resume(runs / "pilot-1", "2026-12-03"); market.clock = ny(2026, 12, 4, 10, 5); tick(runs, market, mb, mc)
+    store = RunStore(runs / "pilot-1" / "haiku")
+    assert store.session("2026-12-04")["status"] == "ok" and store.state()["status"] == "finishing"   # третья сессия, а не четвёртая
+
+def test_stop_request_sells_everything_and_ends_the_runs(world):
+    runs, market, mb, mc, _ = world
+    run = runs / "pilot-1" / "opus-b"; cfg, _ = load_run(run)
+    SimBroker(cfg, RunStore(run), market).buy("2026-11-30", "AAPL", 100.0, market.prices["AAPL"] * 0.9, "т", "seed/1")
+    request_stop(runs / "pilot-1", "2026-12-01", market.clock)
+    assert set(actions(tick(runs, market, mb, mc)).values()) == {"finishing"}
+    state = RunStore(run).state()
+    assert state["status"] == "finishing" and state["stopped_by"] == "owner" and SimBroker(cfg, RunStore(run), market).account().positions == ()
+```
+
+Плюс тесты: `sessions_done` и `missed_share` отчёта не считают дни паузы; происшествие о паузе одно на интервал; команды `pause`, `resume`, `stop` (коды возврата, отказ `stop` без `--yes`, отказ при нескольких экспериментах без имени).
+
+- [ ] **Step 2: Убедиться, что тесты падают**
+
+Run: `uv run pytest tests/test_control.py tests/test_tick.py -q`
+Expected: FAIL, `ModuleNotFoundError: traider.control`.
+
+- [ ] **Step 3: Реализовать**
+
+Минимальные правки в тике (чтение `control.json` один раз на тик для каждого эксперимента), в счёте сессий, в отчёте и в шаблоне страницы.
+
+- [ ] **Step 4: Убедиться, что тесты проходят**
+
+Run: `uv run pytest -q`
+Expected: все тесты проходят.
+
+- [ ] **Step 5: Вики и коммит**
+
+Статьи `tick-and-session` (пауза, остановка, действие `paused`), `run-files` (`control.json`, статус `paused`, поле `stopped_by`), `report-contents`, `verdict-criteria` (дни паузы не входят в долю пропусков), `runbook` (команды паузы и остановки вместо ручной аварийной остановки), `decision-log` (решение владельца от 15.11.2026). Запустить проверку вики.
+
+```bash
+git add -A
+git commit -m "feat: owner pause and stop, paused days outside the session count"
+```
+
+---
+
+### Task 7: Страница управления
+
+Добавлена 15.11.2026 по просьбе владельца. Владелец выбрал: страница открывается только с его MacBook. Это отменяет прежнее «сервера для страницы аналитики нет» (спецификация, раздел 2), запись об этом идёт в `decision-log`.
+
+**Files:**
+- Create: `traider/serve.py`, `ops/com.traider.serve.plist`, `tests/test_serve.py`
+- Modify: `traider/cli.py` (команда `serve`), `traider/dashboard.html` (полоса управления)
+
+**Interfaces:**
+- Consumes: `control.summary`, `control.pause`, `control.resume`, `control.request_stop`.
+- Produces:
+
+```python
+def make_server(runs_dir: Path, port: int = 8787, token: str | None = None) -> ThreadingHTTPServer   # всегда 127.0.0.1
+def main_serve(runs_dir: Path, port: int) -> int                                                     # команда `traider serve [--port N]`
+```
+
+Маршруты (других нет):
+
+| Запрос | Ответ |
+|---|---|
+| `GET /` | один незавершённый эксперимент: переход на `/e/<имя>/`; иначе простой список экспериментов со ссылками |
+| `GET /e/<имя>/` | файл `runs/<имя>/dashboard.html`; если его ещё нет, короткая страница «отчёт ещё не собран» с той же полосой управления |
+| `GET /e/<имя>/control` | JSON: `summary(exp_dir)` плюс поле `token` |
+| `POST /e/<имя>/pause`, `/resume`, `/stop` | выполняет действие, отвечает новым `summary` |
+
+Правила защиты (все проверяются сервером, каждая своим тестом):
+- сервер слушает только `127.0.0.1`; другого адреса задать нельзя;
+- заголовок `Host` должен быть `127.0.0.1:<порт>` или `localhost:<порт>`, иначе 403 (защита от подмены DNS);
+- `POST` принимается только с заголовком `X-Traider-Token`, равным случайному токену этого запуска сервера, и без заголовка `Origin` либо с `Origin`, равным собственному адресу; иначе 403. Заголовков CORS сервер не отдаёт;
+- `stop` требует в теле JSON поле `confirm`, равное имени эксперимента, иначе 400;
+- имя эксперимента сверяется со списком каталогов в `runs/`; по пути из запроса файлы не читаются;
+- сервер не строит брокера, не читает `.env` и ничего не отправляет: он пишет только `control.json`. Остальное делает тик.
+
+Полоса управления в `traider/dashboard.html`: скрыта, когда страница открыта с диска; когда страница отдана сервером, она запрашивает `control` и показывает состояние («работает», «на паузе с …», «останавливается», «завершён») и кнопки «Пауза», «Продолжить», «Остановить всё». «Остановить всё» просит ввести имя эксперимента. Текст из ответа вставляется через `textContent`. Страница по-прежнему не содержит внешних адресов и открывается с диска без сервера.
+
+`ops/com.traider.serve.plist`: шаблон задания launchd, которое держит `uv run traider serve` запущенным; ставит его владелец, как и задание тика. С MacBook страница открывается через туннель: `ssh -N -L 8787:127.0.0.1:8787 <пользователь>@<mac-mini>` и адрес `http://localhost:8787`.
+
+- [ ] **Step 1: Написать падающие тесты**
+
+```python
+# tests/test_serve.py: сервер поднимается на свободном порту в потоке, запросы идут через http.client
+def test_page_and_state_are_served_on_localhost_only(served):                 # served: (base_url, port, token, runs)
+    base, port, token, runs = served
+    assert get(base, "/e/pilot-1/control", host=f"127.0.0.1:{port}").json["state"] == "running"
+    assert get(base, "/e/pilot-1/", host=f"localhost:{port}").status == 200
+
+def test_foreign_host_header_is_refused(served):
+    base, port, _, _ = served
+    assert get(base, "/e/pilot-1/control", host="evil.example").status == 403
+
+def test_actions_need_the_token_and_no_foreign_origin(served):
+    base, port, token, runs = served
+    assert post(base, "/e/pilot-1/pause", host=f"127.0.0.1:{port}").status == 403                      # без токена
+    assert post(base, "/e/pilot-1/pause", host=f"127.0.0.1:{port}", token=token, origin="https://evil.example").status == 403
+    assert post(base, "/e/pilot-1/pause", host=f"127.0.0.1:{port}", token=token).json["state"] == "paused"
+    assert read_control(runs / "pilot-1")["pauses"][0]["to"] is None
+
+def test_stop_needs_the_experiment_name_typed(served):
+    base, port, token, runs = served
+    assert post(base, "/e/pilot-1/stop", host=f"127.0.0.1:{port}", token=token, body={}).status == 400
+    assert post(base, "/e/pilot-1/stop", host=f"127.0.0.1:{port}", token=token, body={"confirm": "pilot-1"}).json["state"] == "stopping"
+
+def test_unknown_experiment_and_traversal_are_404(served):
+    base, port, token, _ = served
+    for path in ("/e/nope/", "/e/../../etc/passwd", "/e/pilot-1/../../.env", "/secret"):
+        assert get(base, path, host=f"127.0.0.1:{port}").status == 404
+```
+
+Плюс тесты: сервер не отдаёт заголовков `Access-Control-*`; ответ `control` не кэшируется; шаблон страницы содержит полосу управления, слова состояний и не содержит внешних адресов; фикстура останавливает сервер и поток после теста.
+
+- [ ] **Step 2: Убедиться, что тесты падают**
+
+Run: `uv run pytest tests/test_serve.py -q`
+Expected: FAIL, `ModuleNotFoundError: traider.serve`.
+
+- [ ] **Step 3: Реализовать `serve.py`, команду и полосу управления**
+
+Только стандартная библиотека (`http.server`). Один модуль.
+
+- [ ] **Step 4: Убедиться, что тесты проходят**
+
+Run: `uv run pytest -q`
+Expected: все тесты проходят, ни один поток или порт не остаётся после тестов.
+
+- [ ] **Step 5: Посмотреть страницу глазами**
+
+Контролёр поднимает сервер на тестовых данных, открывает страницу в панели браузера, нажимает «Пауза» и «Продолжить», проверяет запрос подтверждения у «Остановить всё», затем останавливает сервер и проверяет, что процесс не остался.
+
+- [ ] **Step 6: Вики и коммит**
+
+Статьи `analytics-page` (полоса управления), `schedule-and-hosting` (сервер страницы, туннель, шаблон задания), `runbook` (как открыть страницу с MacBook, что делают кнопки), `decision-log` (сервер только на 127.0.0.1, почему без пароля). Запустить проверку вики.
+
+```bash
+git add -A
+git commit -m "feat: local control page with pause, resume and stop"
+```
+
+---
+
 ### Task 5: Пилот и официальный старт
 
 Задача выполняется вместе с владельцем. Каждый запуск, который тратит кредиты, начинается с его согласия.
