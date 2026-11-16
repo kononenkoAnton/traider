@@ -602,7 +602,7 @@ def test_tick_line_mentions_a_damaged_control_file(tmp_path, example, capsys, mo
     (tmp_path / ".env").write_text("ALPACA_API_KEY=a\nALPACA_SECRET_KEY=b\nANTHROPIC_API_KEY=c\n")
     start_experiment(example, tmp_path / "runs")
     monkeypatch.setattr(cli, "AlpacaMarket", lambda key, secret: object())
-    monkeypatch.setattr(cli, "_auto_report", lambda *a: None)
+    monkeypatch.setattr(cli, "_auto_report", lambda *a: (False, True))
     monkeypatch.setattr(cli, "tick", lambda *a: [{"experiment": "pilot-1", "participant": "haiku", "action": "safety",
                                                   "ts": "2026-12-01T15:05:00+00:00",
                                                   "control_error": "ValueError: runs/pilot-1/control.json не читается"}])
@@ -647,7 +647,7 @@ def test_tick_line_shows_the_error_of_a_session_row(tmp_path, capsys, monkeypatc
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(ENV)
     monkeypatch.setattr(cli, "AlpacaMarket", lambda key, secret: object())
-    monkeypatch.setattr(cli, "_auto_report", lambda *a: False)
+    monkeypatch.setattr(cli, "_auto_report", lambda *a: (False, True))
     monkeypatch.setattr(cli, "tick", lambda *a: [{"experiment": "pilot-1", "participant": "opus-a", "action": "session",
                                                   "status": "ok", "cost": 0.5, "ts": TS,
                                                   "error": "счёт после сделок тика не обновлён"}])

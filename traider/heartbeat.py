@@ -35,7 +35,7 @@ def beat(url: str | None, ok: bool, text: str, timeout: float = 5.0) -> str | No
         if parts.scheme not in ("http", "https") or not parts.netloc:
             return "адрес сторожа не http(s), ничего не отправлено"
         target = url if ok else urlunsplit(parts._replace(path=parts.path.rstrip("/") + "/fail"))
-        req = urllib.request.Request(target, data=text[:LIMIT].encode("utf-8"), method="POST")
+        req = urllib.request.Request(target, data=text[:LIMIT].encode("utf-8", "replace"), method="POST")
     except Exception as e:
         return _error(e)
     box: list[str | None] = []

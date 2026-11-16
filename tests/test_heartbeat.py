@@ -1,4 +1,7 @@
 import json
+import os
+import pathlib
+import signal
 import socket
 import threading
 import time
@@ -98,12 +101,12 @@ def test_a_refused_connection_is_an_error_text_without_the_url(refused):
 
 # --- через команду tick ---
 
-def _world(base, monkeypatch, url=None, alpaca=False, client=None):
+def _world(base, monkeypatch, url=None, alpaca=False, client=None, env=ENV):
     """Настоящий тик на подделках в каталоге base. Без alpaca все участники на sim; с alpaca opus-a на Alpaca,
     и его API не готов (брокер падает каждый тик)."""
     base.mkdir(exist_ok=True)
     monkeypatch.chdir(base)
-    (base / ".env").write_text(ENV + (f"HEALTHCHECK_URL={url}\n" if url else ""))
+    (base / ".env").write_text(env + (f"HEALTHCHECK_URL={url}\n" if url else ""))
     toml = _make(base, (lambda t: t) if alpaca else (lambda t: t.replace('broker = "alpaca"', 'broker = "sim"')))
     exp = start_experiment(toml, base / "runs")
     market = FakeMarket.with_history(list(load_run(exp / "haiku")[0].universe), days=70, clock=ny(2026, 12, 1, 10, 5))
@@ -131,7 +134,7 @@ def test_closed_market_sends_one_ok_beat(tmp_path, watchdog, capsys, monkeypatch
     _, market = _world(tmp_path, monkeypatch, watchdog.url)
     market.open = False
     assert main(["tick"]) == 0
-    assert watchdog.got == [("POST", SECRET, "рынок закрыт, тик пуст")]
+    assert watchdog.got == [("POST", SECRET, "тик пуст: рынок закрыт")]
     _no_secret(tmp_path, capsys.readouterr())
 
 
@@ -263,3 +266,61 @@ def test_which_rows_make_the_tick_failed(row, failed):
 def test_an_http_error_status_is_an_error_text_without_the_url(watchdog):
     err = beat(watchdog.url.replace(SECRET, "/nope-secret"), True, "x")
     assert err == "HTTPError 404" and len(watchdog.got) == 1
+
+
+def test_text_cannot_break_the_encoding(watchdog):
+    assert beat(watchdog.url, True, "a\ud800b") is None and watchdog.got == [("POST", SECRET, "a?b")]
+
+
+def test_an_empty_tick_on_an_open_market_says_so(tmp_path, watchdog, capsys, monkeypatch):
+    _, market = _world(tmp_path, monkeypatch, watchdog.url)
+    (tmp_path / "runs" / ".tick.lock").write_text(json.dumps({"pid": 1, "ts": market.clock.isoformat(), "token": "x"}))
+    assert main(["tick"]) == 0 and capsys.readouterr().out == ""
+    assert watchdog.got == [("POST", SECRET, "тик пуст: рынок открыт, обходить нечего или другой тик ещё идёт")]
+
+
+def test_env_values_and_the_home_directory_are_cut_from_the_text(tmp_path, watchdog, capsys, monkeypatch):
+    key = "AKTEST1234567890"
+    _world(tmp_path, monkeypatch, watchdog.url, alpaca=True, env=f"ALPACA_API_KEY={key}\nALPACA_SECRET_KEY=b\nANTHROPIC_API_KEY=c\n")
+    def leaky(cfg, env):
+        raise RuntimeError(f"ключ {env['ALPACA_API_KEY']} отклонён, файл {pathlib.Path.home() / 'x.txt'}")
+    monkeypatch.setattr(cli, "make_alpaca_api", leaky)
+    assert main(["tick"]) == 0
+    [(_, _, body)] = watchdog.got
+    assert key not in body and "ключ *** отклонён" in body
+    assert str(pathlib.Path.home()) not in body and "файл ~/x.txt" in body
+
+
+def test_a_failure_inside_the_heartbeat_changes_neither_the_exit_code_nor_the_exception(tmp_path, watchdog, capsys, monkeypatch):
+    _world(tmp_path, monkeypatch, watchdog.url)
+    def no_home():
+        raise RuntimeError("нет домашнего каталога")
+    monkeypatch.setattr(cli.Path, "home", staticmethod(no_home))
+    assert main(["tick"]) == 0
+    assert [l for l in capsys.readouterr().err.splitlines() if l.startswith("сторож недоступен")] != []
+    boom = KeyboardInterrupt()
+    monkeypatch.setattr(cli, "tick", lambda *a: (_ for _ in ()).throw(boom))
+    with pytest.raises(KeyboardInterrupt) as e:
+        main(["tick"])
+    assert e.value is boom
+
+
+def test_sigterm_during_a_tick_exits_143_releases_the_lock_and_sends_one_fail_beat(tmp_path, watchdog, capsys, monkeypatch):
+    """launchd останавливает задание сигналом SIGTERM посреди сессии."""
+    _world(tmp_path, monkeypatch, watchdog.url)
+    def killed(**kw):
+        os.kill(os.getpid(), signal.SIGTERM)
+        return FakeAnthropic([use("finish_session", journal="ок")])
+    monkeypatch.setattr(cli, "Anthropic", killed)
+    caught = []
+    def before(signum, frame):
+        caught.append(signum)   # прежний обработчик теста: без него SIGTERM убил бы сам pytest
+    prev = signal.signal(signal.SIGTERM, before)
+    try:
+        with pytest.raises(SystemExit) as e:
+            main(["tick"])
+        assert signal.getsignal(signal.SIGTERM) is before and caught == []
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+    assert e.value.code == 143 and not (tmp_path / "runs" / ".tick.lock").exists()
+    assert [p for _, p, _ in watchdog.got] == [SECRET + "/fail"]
