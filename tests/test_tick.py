@@ -480,13 +480,47 @@ def test_the_tick_never_writes_the_control_file(world, monkeypatch):
     market.clock = ny(2026, 12, 3, 10, 5); tick(runs, market, mb, mc)
     assert (exp / "control.json").read_bytes() == before
 
-def test_the_control_file_is_read_once_per_experiment_per_tick(world, monkeypatch):
+def test_the_control_file_is_read_again_before_each_run(world, monkeypatch):
     runs, market, mb, mc, _ = world
     seen = []
     real = tick_module.read_control
     monkeypatch.setattr(tick_module, "read_control", lambda exp: seen.append(exp.name) or real(exp))
     tick(runs, market, mb, mc)
-    assert seen == ["pilot-1"]
+    assert seen == ["pilot-1"] * 5
+
+
+def _pressing(world, press):
+    """Клиент, который в первой сессии тика зовёт `press`: владелец нажал кнопку, пока сессия идёт."""
+    runs, market, mb, mc, clients = world
+    def make_client():
+        if not clients:
+            press()
+        return mc()
+    return make_client
+
+
+def test_a_stop_pressed_during_a_session_applies_to_the_runs_not_yet_processed(world):
+    runs, market, mb, mc, clients = world
+    got = tick(runs, market, mb, _pressing(world, lambda: request_stop(runs / "pilot-1", "2026-12-01", market.clock)))
+    first, rest = got[0], got[1:]
+    assert first["action"] == "session" and {r["action"] for r in rest} == {"finishing"}
+    assert RunStore(runs / "pilot-1" / first["participant"]).state()["status"] == "active"   # её продаст следующий тик
+    market.clock = ny(2026, 12, 1, 10, 20)
+    assert actions(tick(runs, market, mb, mc))[first["participant"]] == "finishing"
+
+
+def test_a_pause_pressed_during_a_tick_waits_for_the_next_tick(world):
+    runs, market, mb, mc, _ = world
+    got = tick(runs, market, mb, _pressing(world, lambda: pause(runs / "pilot-1", "2026-12-01")))
+    assert {r["action"] for r in got} == {"session"}                      # день один для всех участников
+
+
+def test_a_control_file_broken_during_a_tick_leaves_the_first_read_and_is_reported(world):
+    runs, market, mb, mc, _ = world
+    exp = runs / "pilot-1"
+    got = tick(runs, market, mb, _pressing(world, lambda: (exp / "control.json").write_text("не json")))
+    assert {r["action"] for r in got} == {"session"}
+    assert "control_error" not in got[0] and all("control.json" in r["control_error"] for r in got[1:])
 
 def test_a_paused_day_between_sessions_does_not_bring_the_last_session_closer(world):
     runs, market, mb, mc, _ = world
@@ -494,3 +528,40 @@ def test_a_paused_day_between_sessions_does_not_bring_the_last_session_closer(wo
     pause(runs / "pilot-1", "2026-12-02"); market.clock = ny(2026, 12, 2, 10, 5); tick(runs, market, mb, mc)
     resume(runs / "pilot-1", "2026-12-02"); market.clock = ny(2026, 12, 3, 10, 5); tick(runs, market, mb, mc)
     assert RunStore(runs / "pilot-1" / "haiku").state()["status"] == "active"           # две сессии из трёх
+
+
+# --- волна после проверки всей ветки ---
+
+def test_a_stop_waits_while_a_holding_has_no_quote_and_applies_on_the_next_priced_tick(world):
+    runs, market, mb, mc, clients = world
+    run = runs / "pilot-1" / "opus-b"; cfg, _ = load_run(run)
+    SimBroker(cfg, RunStore(run), market).buy("2026-11-30", "AAPL", 100.0, market.prices["AAPL"] * 0.9, "т", "seed/1")
+    request_stop(runs / "pilot-1", "2026-12-01", ny(2026, 12, 1, 9, 0))
+    quote = market.prices.pop("AAPL")                                        # бумага сегодня ещё не торговалась
+    market.clock = ny(2026, 12, 1, 9, 31)
+    got = {r["participant"]: r for r in tick(runs, market, mb, mc)}
+    assert got["opus-b"]["action"] == "unpriced" and got["opus-b"]["unpriced"] == ["AAPL"]
+    state = RunStore(run).state()
+    assert state["status"] == "active" and "stopped_by" not in state and "finish_day" not in state
+    assert not any(e["kind"] == "liquidate" for e in RunStore(run).orders())
+    assert {got[p]["action"] for p in got if p != "opus-b"} == {"finishing"} and clients == []
+    market.prices["AAPL"] = quote * 0.8
+    market.clock = ny(2026, 12, 1, 9, 46)
+    assert actions(tick(runs, market, mb, mc))["opus-b"] == "finishing"
+    sold = [e for e in RunStore(run).orders() if e["kind"] == "liquidate"]
+    assert [(e["reason"], round(e["price"], 6)) for e in sold] == [("liquidate", round(quote * 0.8 * 0.9995, 6))]
+    assert RunStore(run).state()["stopped_by"] == "owner" and RunStore(run).state()["finish_day"] == "2026-12-01"
+
+
+def test_a_sale_at_the_entry_price_is_a_serious_incident(world):
+    from traider.report import build_report
+    runs, market, mb, mc, _ = world
+    run = runs / "pilot-1" / "haiku"; cfg, _ = load_run(run); store = RunStore(run)
+    SimBroker(cfg, store, market).buy("2026-11-30", "AAPL", 100.0, 1.0, "т", "seed/1")
+    store.update_state(status="finishing", finish_day="2026-11-30")
+    del market.prices["AAPL"]
+    tick(runs, market, mb, mc)                                                 # остаток продаётся по цене входа
+    assert [e["reason"] for e in store.orders() if e["kind"] == "liquidate"] == ["no_quote_entry_price"]
+    inc = [i for i in build_report(runs / "pilot-1", market)["incidents"] if i["participant"] == "haiku"
+           and i["title"] == "продано по цене входа: котировки не было"]
+    assert [(i["kind"], i["day"]) for i in inc] == [("serious", "2026-12-01")] and "AAPL" in inc[0]["text"]

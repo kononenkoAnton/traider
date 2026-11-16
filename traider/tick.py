@@ -33,12 +33,15 @@
 создаются до записи `started`, чтобы сбой создания не оставил зависшую запись; когда
 сессии нет, `make_client` не вызывается.
 
-Пауза и остановка владельца (модуль control). `control.json` эксперимента тик читает один раз за тик, только читает;
-нечитаемый файл значит «ни паузы, ни остановки», а его текст идёт в отдельное поле `control_error` каждого элемента
-этого эксперимента и его строки `ticks.jsonl` (`error` остаётся своей ошибке прогона).
-После шага 4: остановка запрошена и статус `active`, значит статус `finishing`, `finish_day` день тика,
-`stopped_by: "owner"`, и в этом же тике шаг 5; прогоны в других статусах запрос не меняет. На шаге 6 день без записи
-внутри интервала паузы пишется `paused`, а не `missed`. Если сегодня день паузы: нет записи за сегодня, значит запись
+Пауза и остановка владельца (модуль control). `control.json` эксперимента тик только читает, заново перед каждым
+прогоном: остановка, запрошенная во время тика, действует на прогоны, до которых тик ещё не дошёл (идущую сессию она не
+прерывает), а паузы берутся из первого чтения за тик, чтобы день был один для всех участников. Нечитаемый файл значит
+«ни паузы, ни остановки» (а если он сломался между прогонами, остальные прогоны берут первое чтение), его текст идёт в
+отдельное поле `control_error` элемента и его строки `ticks.jsonl` (`error` остаётся своей ошибке прогона).
+После шага 4: остановка запрошена и статус `active`: при непустом `unpriced` действие `unpriced` и ничего не меняется
+(ликвидация продала бы бумагу без котировки по цене входа; следующий тик попробует снова), иначе статус `finishing`,
+`finish_day` день тика, `stopped_by: "owner"`, и в этом же тике шаг 5; прогоны в других статусах запрос не меняет.
+На шаге 6 день без записи внутри интервала паузы пишется `paused`, а не `missed`. Если сегодня день паузы: нет записи за сегодня, значит запись
 `paused` (тем же исключительным созданием) и действие `paused`; запись уже есть, значит `safety` (`stale_failed`, если
 сегодняшний старт завис); шаги 7 и 8 не идут, клиент не создаётся. Без `control.json` тик работает как прежде.
 """
@@ -169,6 +172,8 @@ def _one(run: Path, market: Market, make_broker, make_client, control: dict | No
     if status == "invalid":
         return out | {"action": "invalid"}
     if control["stop"] and status == "active":   # остановку владельца применяет тик: пишет состояние только он
+        if report.unpriced:
+            return out | {"action": "unpriced"}   # без котировки продали бы по цене входа: ждём следующего тика
         store.update_state(status="finishing", finish_day=day, stopped_by="owner")
         status = "finishing"
     if status == "finishing":
@@ -209,9 +214,10 @@ def tick(runs_dir: Path, market: Market, make_broker: Callable[[RunConfig, RunSt
         for run in _rotated(active_runs(runs_dir), ny_day(market.now())):
             if not _refresh(lock, market.now(), token):
                 break   # замок забрал другой тик: не трогаем ни его, ни прогоны
-            if run.parent not in controls:
-                controls[run.parent] = _control(run.parent)
-            control, broken = controls[run.parent]
+            fresh, err = _control(run.parent)   # перед каждым прогоном: остановка, нажатая во время тика, ждёт не до завтра
+            first, first_err = controls.setdefault(run.parent, (fresh, err))
+            control = first if err else {**first, "stop": fresh["stop"]}   # пауза из первого чтения: день один для всех
+            broken = err or first_err
             try:
                 r = ({"participant": run.name, "action": "error", "error": shared[run]} if run in shared
                      else _one(run, market, make_broker, make_client, control))
