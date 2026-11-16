@@ -171,3 +171,8 @@ def test_report_with_a_late_starter_renders(tmp_path):
     report = late_starter()
     render(report, tmp_path / "l.html")
     assert embedded((tmp_path / "l.html").read_text()) == report
+
+
+def test_template_names_the_paused_status():
+    t = pathlib.Path("traider/dashboard.html").read_text()
+    assert 'paused: "пауза"' in t and 'st === "paused"' in t

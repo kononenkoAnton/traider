@@ -1,4 +1,4 @@
-"""Командная строка: `traider start`, `traider tick`, `traider status`, `traider report`.
+"""Командная строка: `traider start`, `traider tick`, `traider status`, `traider report`, `pause`, `resume`, `stop`.
 
 :wk-id: cli-module
 :wk-tags: cli, schedule, status
@@ -32,6 +32,13 @@
 у окончённого прогона (`finished`, `dead`) отсечки нет. Срок раздела держит исключение `AutoReportTimeout` (`BaseException`, будильник взводится
 заново перед броском) и монотонный срок, проверяемый перед каждым шагом.
 Планировщик (`ops/com.traider.tick.plist`) вручную ставит владелец, без `--wiki`.
+`pause [эксперимент]`, `resume [эксперимент]`, `stop <эксперимент> --yes` работают без сети и `.env`, через модуль
+control (пишут только `control.json`); день это сегодняшняя дата в Нью-Йорке по часам системы (`_today`). Без имени `pause`
+и `resume` берут единственный незавершённый эксперимент (`summary` не `finished`); нет такого или их несколько:
+список и код 2. Неизвестный эксперимент: код 2. `stop` без `--yes` печатает, что произойдёт, и даёт код 2. Отказ модуля
+control (пауза после остановки, повреждённый `control.json`): одна строка в stderr и код 1. `status` перед строками
+прогонов печатает по строке на эксперимент: состояние, с какого дня пауза, запрошена ли остановка; число сессий в
+строке прогона без дней паузы.
 """
 import argparse
 import signal
@@ -47,6 +54,7 @@ from anthropic import Anthropic
 from traider.alpaca import AlpacaBroker, make_alpaca_api
 from traider.brokers import SimBroker
 from traider.config import TERMINAL_STATUSES, load_run, start_experiment
+from traider.control import pause, request_stop, resume, summary
 from traider.env import load_env
 from traider.market import NY, AlpacaMarket, ny_day
 from traider.store import RunStore
@@ -245,18 +253,101 @@ def _status_line(run: Path) -> str:
         sessions = store.sessions()
         last = f"{sessions[-1]['day']} {sessions[-1]['status']}" if sessions else "нет"
         cost = sum(s.get("cost", 0.0) for s in sessions)
-        return (f"{cfg.experiment}/{cfg.participant}: {store.state()['status']}, сессий {len(sessions)}/{cfg.sessions_target}, "
+        done = sum(s.get("status") != "paused" for s in sessions)   # день паузы не сессия
+        return (f"{cfg.experiment}/{cfg.participant}: {store.state()['status']}, сессий {done}/{cfg.sessions_target}, "
                 f"последняя {last}, расход ${cost:.2f}" + ("" if valid else ", контрольная сумма не сходится"))
     except (OSError, ValueError, KeyError, TypeError) as e:
         return f"{run.parent.name}/{run.name}: не читается ({type(e).__name__}: {e})"
 
 
+STATES = {"running": "идёт", "paused": "пауза", "stopping": "останавливается, позиции продаются при открытом рынке",
+          "finishing": "сессии окончены, ждёт конца", "finished": "окончен"}
+
+
+def _experiment_line(exp: Path) -> str:
+    try:
+        s = summary(exp)
+    except ValueError as e:
+        return f"{exp.name}: {e}"
+    since, stop = s["paused_since"], s["stop"] and s["stop"]["day"]
+    return ", ".join([f"{exp.name}: {STATES[s['state']]}", *([f"на паузе с {since}"] if since else []),
+                      *([f"остановка запрошена {stop}"] if stop else [])])
+
+
 def _status(_args) -> int:
+    for exp in _experiments():
+        print(_experiment_line(exp))
     runs = sorted(p.parent for p in RUNS.glob("*/*/config.json"))
     for run in runs:
         print(_status_line(run))
     if not runs:
         print("нет прогонов")
+    return 0
+
+
+def _today() -> str:
+    return ny_day(datetime.now(NY))
+
+
+def _pick(name: str | None) -> Path | None:
+    """Эксперимент по имени; без имени единственный незавершённый. Не нашёлся: строка в stderr и None."""
+    exps = _experiments()
+    if name is not None:
+        found = [e for e in exps if e.name == name]
+        if not found:
+            print(f"нет эксперимента {name} в {RUNS}", file=sys.stderr)
+        return found[0] if found else None
+    live = [e for e in exps if _unfinished(e)]
+    if len(live) == 1:
+        return live[0]
+    print("укажите эксперимент: " + (", ".join(e.name for e in live) if live else f"незавершённых в {RUNS} нет"),
+          file=sys.stderr)
+    return None
+
+
+def _unfinished(exp: Path) -> bool:
+    try:
+        return summary(exp)["state"] != "finished"
+    except ValueError:
+        return True   # повреждённый control.json не прячет эксперимент
+
+
+def _owner(act):
+    def run(args) -> int:
+        exp = _pick(args.experiment)
+        if exp is None:
+            return 2
+        try:
+            return act(exp, args)
+        except ValueError as e:   # пауза после остановки, повреждённый control.json
+            print(f"{exp.name}: {e}", file=sys.stderr)
+            return 1
+    return run
+
+
+def _pause(exp: Path, _args) -> int:
+    c = pause(exp, _today())
+    print(f"{exp.name}: на паузе с {c['pauses'][-1]['from']}; проверка HP и стопы работают, сессий нет")
+    return 0
+
+
+def _resume(exp: Path, _args) -> int:
+    before = summary(exp)["paused_since"]
+    resume(exp, day := _today())
+    print(f"{exp.name}: пауза снята ({before}–{day}), сессии со следующего торгового дня" if before
+          else f"{exp.name}: паузы нет, ничего не изменилось")
+    return 0
+
+
+def _stop(exp: Path, args) -> int:
+    if not args.yes:
+        print(f"Остановка эксперимента {exp.name}: следующий тик при открытом рынке продаст все позиции всех участников, "
+              "прогоны закончатся (через пять торговых дней статус finished). Отменить это нельзя. "
+              f"Чтобы подтвердить: traider stop {exp.name} --yes")
+        return 2
+    c = request_stop(exp, _today(), datetime.now(NY))
+    print(f"{exp.name}: остановка запрошена {c['stop']['day']}. Следующий тик при открытом рынке продаст все позиции "
+          "и переведёт прогоны в finishing; отменить нельзя")
     return 0
 
 
@@ -275,5 +366,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     rep.add_argument("--wiki", type=Path, help="каталог вики: обновить там статью результатов")
     rep.set_defaults(run=_report)
     sub.add_parser("status", help="состояние прогонов, без сети").set_defaults(run=_status)
+    for name, act, text in (("pause", _pause, "поставить эксперимент на паузу"), ("resume", _resume, "снять паузу")):
+        cmd = sub.add_parser(name, help=f"{text}, без сети")
+        cmd.add_argument("experiment", nargs="?", help="имя эксперимента; без него единственный незавершённый")
+        cmd.set_defaults(run=_owner(act))
+    stop = sub.add_parser("stop", help="остановить эксперимент навсегда: продать всё и закончить прогоны")
+    stop.add_argument("experiment")
+    stop.add_argument("--yes", action="store_true", help="подтвердить: отменить остановку нельзя")
+    stop.set_defaults(run=_owner(_stop))
     args = parser.parse_args(argv)
     return args.run(args)

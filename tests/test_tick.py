@@ -321,3 +321,153 @@ def test_tick_line_writes_non_finite_numbers_as_null(tmp_path):
     store = RunStore(tmp_path)
     store.append_tick({"ts": "t", "equity": float("nan"), "hp": float("inf"), "floor": 850.0})
     assert store.ticks() == [{"ts": "t", "equity": None, "hp": None, "floor": 850.0}]
+
+
+# --- задача 6: пауза и остановка ---
+
+from traider.control import pause, request_stop, resume  # noqa: E402
+
+
+def test_paused_experiment_keeps_safety_and_runs_no_session(world):
+    runs, market, mb, mc, clients = world
+    pause(runs / "pilot-1", "2026-12-01")
+    assert set(actions(tick(runs, market, mb, mc)).values()) == {"paused"} and clients == []
+    assert RunStore(runs / "pilot-1" / "haiku").session("2026-12-01")["status"] == "paused"
+
+def test_days_inside_a_pause_are_backfilled_as_paused_not_missed(world):
+    runs, market, mb, mc, _ = world
+    tick(runs, market, mb, mc)                                                # 01.12 прошла
+    pause(runs / "pilot-1", "2026-12-02"); resume(runs / "pilot-1", "2026-12-03")
+    market.clock = ny(2026, 12, 4, 10, 5)                                     # машина была выключена 02.12 и 03.12
+    tick(runs, market, mb, mc)
+    store = RunStore(runs / "pilot-1" / "haiku")
+    assert [store.session(d)["status"] for d in ("2026-12-02", "2026-12-03", "2026-12-04")] == ["paused", "paused", "ok"]
+
+def test_paused_days_do_not_use_up_the_session_target(world):                 # в примере sessions_target = 3
+    runs, market, mb, mc, _ = world
+    for day in (1, 2):
+        market.clock = ny(2026, 12, day, 10, 5); tick(runs, market, mb, mc)
+    pause(runs / "pilot-1", "2026-12-03"); market.clock = ny(2026, 12, 3, 10, 5); tick(runs, market, mb, mc)
+    resume(runs / "pilot-1", "2026-12-03"); market.clock = ny(2026, 12, 4, 10, 5); tick(runs, market, mb, mc)
+    store = RunStore(runs / "pilot-1" / "haiku")
+    assert store.session("2026-12-04")["status"] == "ok" and store.state()["status"] == "finishing"   # третья сессия, а не четвёртая
+
+def test_stop_request_sells_everything_and_ends_the_runs(world):
+    runs, market, mb, mc, _ = world
+    run = runs / "pilot-1" / "opus-b"; cfg, _ = load_run(run)
+    SimBroker(cfg, RunStore(run), market).buy("2026-11-30", "AAPL", 100.0, market.prices["AAPL"] * 0.9, "т", "seed/1")
+    request_stop(runs / "pilot-1", "2026-12-01", market.clock)
+    assert set(actions(tick(runs, market, mb, mc)).values()) == {"finishing"}
+    state = RunStore(run).state()
+    assert state["status"] == "finishing" and state["stopped_by"] == "owner" and SimBroker(cfg, RunStore(run), market).account().positions == ()
+
+
+# --- задача 6, сверх задания ---
+
+def test_a_stop_below_the_market_still_fills_while_paused(world):
+    runs, market, mb, mc, _ = world
+    run = runs / "pilot-1" / "opus-b"; cfg, _ = load_run(run)
+    SimBroker(cfg, RunStore(run), market).buy("2026-11-30", "AAPL", 100.0, market.prices["AAPL"] * 0.9, "т", "seed/1")
+    pause(runs / "pilot-1", "2026-12-01")
+    low = market.prices["AAPL"] * 0.85
+    market.prices["AAPL"], market.lows["AAPL"] = low, (low, low)               # свеча ниже стопа
+    got = {r["participant"]: r for r in tick(runs, market, mb, mc)}
+    assert got["opus-b"]["action"] == "paused" and got["opus-b"]["stop_fills"] == ["AAPL"]
+    assert SimBroker(cfg, RunStore(run), market).account().positions == ()
+
+def test_a_run_below_its_floor_still_dies_while_paused(world):
+    runs, market, mb, mc, clients = world
+    run = runs / "pilot-1" / "opus-b"; cfg, _ = load_run(run)
+    SimBroker(cfg, RunStore(run), market).buy("2026-11-30", "AAPL", 1000.0, 1.0, "т", "seed/1")
+    market.prices["AAPL"] *= 0.8
+    pause(runs / "pilot-1", "2026-12-01")
+    got = actions(tick(runs, market, mb, mc))
+    assert got["opus-b"] == "died" and RunStore(run).state()["status"] == "dead" and clients == []
+
+def test_a_session_recorded_before_the_pause_is_kept_and_not_doubled(world):
+    runs, market, mb, mc, clients = world
+    tick(runs, market, mb, mc)
+    store = RunStore(runs / "pilot-1" / "haiku"); before = store.session("2026-12-01")
+    pause(runs / "pilot-1", "2026-12-01")
+    market.clock = ny(2026, 12, 1, 10, 20)
+    assert set(actions(tick(runs, market, mb, mc)).values()) == {"safety"} and len(clients) == 6
+    assert store.session("2026-12-01") == before and store.sessions() == [before]
+
+def test_a_paused_record_is_created_once_per_day(world):
+    runs, market, mb, mc, _ = world
+    pause(runs / "pilot-1", "2026-12-01"); tick(runs, market, mb, mc)
+    market.clock = ny(2026, 12, 1, 15, 45)                                     # и после окна: пауза, не пропуск
+    assert set(actions(tick(runs, market, mb, mc)).values()) == {"safety"}
+    assert [s["status"] for s in RunStore(runs / "pilot-1" / "haiku").sessions()] == ["paused"]
+
+def test_a_paused_day_after_the_window_is_paused_not_missed(world):
+    runs, market, mb, mc, _ = world
+    pause(runs / "pilot-1", "2026-12-01"); market.clock = ny(2026, 12, 1, 15, 45)
+    assert set(actions(tick(runs, market, mb, mc)).values()) == {"paused"}
+
+def test_backfill_outside_the_pause_is_still_missed(world):
+    runs, market, mb, mc, _ = world
+    tick(runs, market, mb, mc)
+    pause(runs / "pilot-1", "2026-12-03")
+    market.clock = ny(2026, 12, 4, 10, 5)
+    assert set(actions(tick(runs, market, mb, mc)).values()) == {"paused"}
+    store = RunStore(runs / "pilot-1" / "haiku")
+    assert [store.session(d)["status"] for d in ("2026-12-02", "2026-12-03", "2026-12-04")] == ["missed", "paused", "paused"]
+
+def test_a_stop_request_while_paused_ends_the_runs(world):
+    runs, market, mb, mc, clients = world
+    pause(runs / "pilot-1", "2026-12-01"); tick(runs, market, mb, mc)
+    market.clock = ny(2026, 12, 2, 10, 5); request_stop(runs / "pilot-1", "2026-12-02", market.clock)
+    assert set(actions(tick(runs, market, mb, mc)).values()) == {"finishing"} and clients == []
+    state = RunStore(runs / "pilot-1" / "haiku").state()
+    assert (state["status"], state["finish_day"], state["stopped_by"]) == ("finishing", "2026-12-02", "owner")
+    assert RunStore(runs / "pilot-1" / "haiku").session("2026-12-02") is None
+
+def test_a_stop_request_leaves_invalid_dead_finished_and_finishing_runs_alone(world):
+    runs, market, mb, mc, _ = world
+    _edit_config(runs, "haiku", '"seed": 20261114', '"seed": 1')                          # invalid
+    RunStore(runs / "pilot-1" / "sonnet").update_state(status="dead", died_on="2026-11-30")
+    RunStore(runs / "pilot-1" / "opus-a").update_state(status="finished")
+    RunStore(runs / "pilot-1" / "opus-b").update_state(status="finishing", finish_day="2026-11-27")
+    request_stop(runs / "pilot-1", "2026-12-01", market.clock)
+    got = actions(tick(runs, market, mb, mc))
+    assert got == {"haiku": "invalid", "opus-b": "finishing", "opus-analyst": "finishing"}
+    states = {p: RunStore(runs / "pilot-1" / p).state() for p in ("haiku", "sonnet", "opus-a", "opus-b")}
+    assert [states[p]["status"] for p in states] == ["invalid", "dead", "finished", "finishing"]
+    assert not any("stopped_by" in s for s in states.values()) and states["opus-b"]["finish_day"] == "2026-11-27"
+
+@pytest.mark.parametrize("text", ["не json", '{"pauses": "x", "stop": null}'])
+def test_a_damaged_control_file_means_no_pause_no_stop_and_is_reported(world, text):
+    runs, market, mb, mc, _ = world
+    (runs / "pilot-1" / "control.json").write_text(text)
+    got = tick(runs, market, mb, mc)
+    assert {r["action"] for r in got} == {"session"} and all("control.json" in r["error"] for r in got)
+    assert "control.json" in RunStore(runs / "pilot-1" / "haiku").ticks()[-1]["error"]
+    assert (runs / "pilot-1" / "control.json").read_text() == text
+
+def test_the_tick_never_writes_the_control_file(world, monkeypatch):
+    runs, market, mb, mc, _ = world
+    exp = runs / "pilot-1"
+    tick(runs, market, mb, mc)
+    assert not (exp / "control.json").exists()
+    pause(exp, "2026-12-02"); before = (exp / "control.json").read_bytes()
+    market.clock = ny(2026, 12, 2, 10, 5); tick(runs, market, mb, mc)
+    assert (exp / "control.json").read_bytes() == before
+    request_stop(exp, "2026-12-03", market.clock); before = (exp / "control.json").read_bytes()
+    market.clock = ny(2026, 12, 3, 10, 5); tick(runs, market, mb, mc)
+    assert (exp / "control.json").read_bytes() == before
+
+def test_the_control_file_is_read_once_per_experiment_per_tick(world, monkeypatch):
+    runs, market, mb, mc, _ = world
+    seen = []
+    real = tick_module.read_control
+    monkeypatch.setattr(tick_module, "read_control", lambda exp: seen.append(exp.name) or real(exp))
+    tick(runs, market, mb, mc)
+    assert seen == ["pilot-1"]
+
+def test_a_paused_day_between_sessions_does_not_bring_the_last_session_closer(world):
+    runs, market, mb, mc, _ = world
+    tick(runs, market, mb, mc)
+    pause(runs / "pilot-1", "2026-12-02"); market.clock = ny(2026, 12, 2, 10, 5); tick(runs, market, mb, mc)
+    resume(runs / "pilot-1", "2026-12-02"); market.clock = ny(2026, 12, 3, 10, 5); tick(runs, market, mb, mc)
+    assert RunStore(runs / "pilot-1" / "haiku").state()["status"] == "active"           # две сессии из трёх

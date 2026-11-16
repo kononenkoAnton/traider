@@ -457,3 +457,72 @@ def test_the_overall_integrity_is_good_only_when_every_check_was_made_and_is_cle
     assert [i["kind"] for i in clean["incidents"] if i["day"] is None] == ["good", "good"]
     dirty = build_report(exp, market, {"opus-a": ["zz"]})
     assert [i["kind"] for i in dirty["incidents"] if i["participant"] is None and i["day"] is None] == ["critical"]
+
+
+# --- задача 6: дни паузы и действия владельца ---
+
+def _paused(exp, *days, status="paused"):
+    for pid in ("haiku", "sonnet", "opus-a", "opus-b", "opus-analyst"):
+        for d in days:
+            (exp / pid / "sessions" / f"{d}.json").write_text(f'{{"day": "{d}", "status": "{status}"}}')
+
+
+def test_paused_days_are_outside_sessions_done_and_the_missed_share(moving, monkeypatch):
+    from traider import report as report_module
+    exp, market = moving
+    _paused(exp, "2026-12-07", "2026-12-08")
+    (exp / "haiku" / "sessions" / "2026-12-04.json").write_text('{"day": "2026-12-04", "status": "missed"}')
+    seen = {}
+    real = report_module.verdict
+    monkeypatch.setattr(report_module, "verdict", lambda m, c: seen.setdefault(len(seen), m) and real(m, c))
+    r = build_report(exp, market)
+    assert r["meta"]["sessions_done"] == 4
+    by = {r["participants"][i]["id"]: m for i, m in seen.items()}
+    assert by["haiku"]["sessions_done"] == 4 and by["haiku"]["missed_share"] == 0.25 and by["sonnet"]["missed_share"] == 0.0
+    assert r["days"][-2:] == ["2026-12-07", "2026-12-08"] and all(len(e) == 7 for e in r["equity"].values())
+    assert all(None not in e for e in r["equity"].values())                  # кривые идут через паузу без разрыва
+    rows = [s for s in r["sessions"]["haiku"] if s["status"] == "paused"]
+    assert [s["day"] for s in rows] == ["2026-12-07", "2026-12-08"] and all(s["cost"] == 0.0 for s in rows)
+    assert r["costs"]["haiku"][-2:] == [0.0, 0.0] and r["money"]["sessions_without_cost"] == 0
+    assert not any(i["title"] == "пропущенный день" and i["day"] in ("2026-12-07", "2026-12-08") for i in r["incidents"])
+
+
+def test_paused_days_are_not_scored_as_days_without_forecasts(moving):
+    exp, market = moving
+    before = build_report(exp, market)["summary"]["haiku"]["brier"]
+    (exp / "haiku" / "sessions" / "2026-11-30.json").write_text('{"day": "2026-11-30", "status": "paused"}')
+    assert build_report(exp, market)["summary"]["haiku"]["brier"] == before
+    (exp / "haiku" / "sessions" / "2026-11-30.json").write_text('{"day": "2026-11-30", "status": "missed"}')
+    assert build_report(exp, market)["summary"]["haiku"]["brier"] != before   # пропуск, в отличие от паузы, считается
+
+
+def test_money_counts_a_paused_day_as_recorded_zero_outside_the_mean():
+    m = _money_of([("2026-12-01", "ok", 1.0), ("2026-12-02", "paused", None), ("2026-12-03", "ok", 3.0)], done=2)
+    # записано 4 за два дня сессий (пауза стоит 0 и в среднее не идёт): 4 + 2 × 20 будней после 03.12
+    assert m["month_spend_usd"] == 4.0 and m["sessions_without_cost"] == 0 and m["month_sessions_without_cost"] == 0
+    assert m["month_forecast_usd"] == pytest.approx(44.0)
+
+
+def test_a_month_of_only_paused_days_has_recorded_zero_spend():
+    m = _money_of([("2026-11-30", "ok", 1.0), ("2026-12-01", "paused", None), ("2026-12-02", "paused", None)], done=1)
+    assert m["month"] == "2026-12" and m["month_spend_usd"] == 0.0 and m["sessions_without_cost"] == 0
+
+
+def test_each_pause_interval_and_the_stop_give_one_experiment_incident(moving):
+    from traider.control import pause, request_stop, resume
+    from tests.fakes import ny
+    exp, market = moving
+    pause(exp, "2026-12-02"); resume(exp, "2026-12-03"); pause(exp, "2026-12-08")
+    request_stop(exp, "2026-12-09", ny(2026, 12, 9, 11, 0))
+    owner = [i for i in build_report(exp, market)["incidents"] if i["title"] in ("пауза владельца", "остановлен владельцем")]
+    assert [(i["kind"], i["day"], i["participant"], i["title"]) for i in owner] == [
+        ("warning", "2026-12-02", None, "пауза владельца"), ("warning", "2026-12-08", None, "пауза владельца"),
+        ("warning", "2026-12-09", None, "остановлен владельцем")]
+    assert "2026-12-03" in owner[0]["text"] and "не снята" in owner[1]["text"]
+
+
+def test_a_damaged_control_file_does_not_break_the_report(moving):
+    exp, market = moving
+    (exp / "control.json").write_text("не json")
+    r = build_report(exp, market)
+    assert [i["kind"] for i in r["incidents"] if "control.json" in i["text"]] == ["warning"]

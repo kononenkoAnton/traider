@@ -202,3 +202,14 @@ def test_context_with_an_analyst_promises_no_searches(senv):                    
     helped = build_context(cfg, store, broker, market, "2026-12-01", briefing="СВОДКА")
     assert "8 поисков" in own and "аналитика" not in own.split("## Позиции")[0]
     assert "поисков" not in helped.split("## Позиции")[0] and "research" in helped
+
+
+# --- задача 6: дни паузы не считаются ---
+
+def test_paused_days_do_not_count_toward_the_last_session(senv):
+    cfg, store, market, broker = senv                                        # в примере sessions_target = 3
+    for day, st in [("2026-11-26", "paused"), ("2026-11-27", "paused"), ("2026-11-30", "ok")]:
+        store.start_session(day, NOW); store.finish_session(day, st, {})
+    store.start_session("2026-12-01", NOW)
+    run_session(cfg, store, broker, market, FakeAnthropic([use("finish_session", journal="к")]), "2026-12-01")
+    assert store.state()["status"] == "active" and "finish_day" not in store.state()   # вторая сессия, а не четвёртая

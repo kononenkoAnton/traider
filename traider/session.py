@@ -9,7 +9,7 @@
 пик; остаток покупок и потолки сессии; последние 10 записей журнала прошлых сессий; заметки;
 до 20 последних продаж (`close`, `stop_fill`, `liquidate`) с результатом по `entry_price` и
 `price` (без годного входа или выхода результат «н/д», строка остаётся); сводку калибровки (`forecasts.summary_text` по закрытиям панели, SPY и бумаг из
-прогнозов за 90 дней, дни всех записей сессий); панель. Сводка аналитика, если передана, идёт
+прогнозов за 90 дней, дни всех записей сессий, кроме `paused`); панель. Сводка аналитика, если передана, идёт
 последней под заголовком, который помечает её как данные.
 
 `run_session` вызывается, когда тик уже создал запись `started`. Системный промпт берётся из
@@ -18,7 +18,7 @@
 Функция не поднимает исключений из шагов вокруг цикла: сбой сборки контекста даёт `failed` со
 `stop="error"` без вызова модели, сбой снимка цен или ликвидации пишется в поле `errors` записи.
 После цикла при любом исходе сохраняется снимок годных цен всей вселенной. Номер сессии это
-число записей сессий в хранилище, эта включительно, любого статуса; на номере
+число записей сессий в хранилище, эта включительно, любого статуса, кроме `paused` (день паузы владельца); на номере
 `cfg.sessions_target` и выше статус прогона становится `finishing` с `finish_day`, потом
 вызывается `broker.liquidate`. `buys`, `sells`, `rejects` считаются по событиям дня `buy`,
 `close`, `reject`. Текст ошибки самого цикла тоже идёт в `errors`. Параметр `analyst` (объект на одну
@@ -61,7 +61,8 @@ def _calibration(cfg: RunConfig, store: RunStore, market: Market) -> str:
     bars = market.daily_bars(sorted(symbols), CALIBRATION_DAYS)
     closes = {s: {b.day: b.close for b in bs} for s, bs in bars.items()}
     days = [b.day for b in bars.get("SPY", [])]
-    scored = forecasts.score(given, closes, days, [s["day"] for s in store.sessions()], cfg.panel)
+    sdays = [s["day"] for s in store.sessions() if s.get("status") != "paused"]   # день паузы не день без прогнозов
+    scored = forecasts.score(given, closes, days, sdays, cfg.panel)
     return forecasts.summary_text(scored)
 
 
@@ -144,7 +145,7 @@ def run_session(cfg: RunConfig, store: RunStore, broker: Broker, market: Market,
         rec["snapshot_symbols"] = len(snapshot)
     except Exception as e:
         errors.append(f"снимок цен: {type(e).__name__}: {e}")
-    if len(store.sessions()) >= cfg.sessions_target:
+    if sum(s.get("status") != "paused" for s in store.sessions()) >= cfg.sessions_target:
         store.update_state(status="finishing", finish_day=day)
         try:
             broker.liquidate(day)

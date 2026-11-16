@@ -33,6 +33,10 @@
 сессий эксперимента, каждая строка режется до 2000 знаков с пометкой. Порядок правил `verdict`: гибель или
 нарушение целостности, нехватка данных (в том числе нет места или интервала), красный, зелёный, жёлтый;
 пороги только из `cfg.criteria`. Всё детерминировано, кроме `meta.generated_at` (`market.now()`).
+День паузы владельца (запись `paused`) не сессия: его нет ни в `sessions_done`, ни в доле пропусков (числитель и
+знаменатель), ни в днях сессий для прогнозов и для среднего расхода в `money`; его стоимость 0 и записана. Кривые идут
+через такие дни как обычно. Решения владельца из `control.json` дают происшествия эксперимента (`participant` None):
+`warning` «пауза владельца» на каждый интервал и `warning` «остановлен владельцем»; нечитаемый файл тоже `warning`.
 """
 import calendar
 import inspect
@@ -44,6 +48,7 @@ from statistics import StatisticsError, correlation
 
 from traider import forecasts, replay
 from traider.config import load_run
+from traider.control import read_control
 from traider.market import Market, ny_day
 from traider.nums import usable
 from traider.sim import SLIPPAGE
@@ -74,7 +79,7 @@ TICK_INCIDENTS = {"unpriced": ("serious", "нет котировки у удер
                   "died": ("critical", "гибель: капитал ниже пола")}
 SESSION_INCIDENTS = {"missed": ("critical", "пропущенный день"), "failed": ("serious", "сбой сессии"),
                      "cap": ("warning", "сессия упёрлась в потолок")}
-DONE = ("ok", "cap", "failed", "missed")
+DONE = ("ok", "cap", "failed", "missed")      # `paused` (день паузы владельца) не сессия и не пропуск
 NOT_CHECKED = "проверка по брокеру не проведена"
 
 
@@ -182,7 +187,7 @@ def _curves(p: dict, bars: Mapping, closes: Mapping, tdays: Sequence[str]) -> No
     # итоги равны с точностью до микродоллара: разница в последних битах float не решает место
     p["percentile"] = (replay.percentile(round(shadow[-1], 6), [round(b[-1], 6) for b in bots])
                        if p["buys"] and days else None)
-    sdays = [r["day"] for r in p["records"]]
+    sdays = [r["day"] for r in p["records"] if r.get("status") != "paused"]   # день паузы не день без прогнозов
     scored = forecasts.score(p["forecasts"], closes, tdays, sdays, cfg.panel, benchmark=BENCHMARK)
     panel = [s for s in scored if s.symbol in cfg.panel]
     bought = {(e["day"], e["symbol"]) for e in p["buys"]}
@@ -213,7 +218,8 @@ def _money(ps: list[dict], market: Market, target: int | None, done: int) -> dic
     где записана хоть одна стоимость) на дни сессий, которые ещё ждут в этом месяце (торговые дни после последнего
     дня сессии, но не больше сессий до цели); пока траты месяца неизвестны, прогноза нет."""
     recs = [(r["day"], _session_cost(r)) for p in ps for r in p["records"]]
-    spent = [(d, c) for d, c in recs if c is not None]
+    spent = [(r["day"], c) for p in ps for r in p["records"]
+             if (c := _session_cost(r)) is not None and r.get("status") != "paused"]   # день паузы не день сессии
     sdays = sorted({d for d, _ in recs})
     out = {"month": None, "month_spend_usd": None, "run_spend_usd": float(sum(c for _, c in spent)),
            "month_forecast_usd": None, "sessions_without_cost": sum(c is None for _, c in recs), "month_sessions_without_cost": 0}
@@ -260,7 +266,7 @@ def _summary(p: dict) -> dict:
 
 
 def _session_cost(r: dict):
-    return r["cost"] if _num(r.get("cost")) else 0.0 if r.get("status") == "missed" else None
+    return r["cost"] if _num(r.get("cost")) else 0.0 if r.get("status") in ("missed", "paused") else None
 
 
 def _sessions(p: dict, recent: set[str]) -> list[dict]:
@@ -301,6 +307,22 @@ def _tokens(p: dict, cost: float) -> dict:
     return {"sessions": len(spent), "input": total(usage, "input"), "cache_read": total(usage, "cache_read"),
             "output": total(usage, "output"), "searches": total(usage, "searches"),
             "cost_per_session": cost / len(spent) if spent else None, "analyst": analyst}
+
+
+def _owner(exp_dir: Path) -> list[dict]:
+    """Происшествия эксперимента от решений владельца: по одному на интервал паузы и одно на остановку."""
+    try:
+        c = read_control(exp_dir)
+    except ValueError as e:
+        return [{"kind": "warning", "day": None, "participant": None, "title": "файл управления не читается",
+                 "text": f"{e}; тик считает, что паузы и остановки нет"}]
+    out = [{"kind": "warning", "day": x["from"], "participant": None, "title": "пауза владельца",
+            "text": f"с {x['from']} по {x['to']}" if x["to"] else f"с {x['from']}, пауза не снята"} for x in c["pauses"]]
+    if c["stop"]:
+        out.append({"kind": "warning", "day": c["stop"]["day"], "participant": None, "title": "остановлен владельцем",
+                    "text": f"остановка запрошена {c['stop']['day']}: позиции продаются при открытом рынке, прогоны "
+                            "заканчиваются"})
+    return out
 
 
 def _incidents(ps: list[dict], checked: dict[str, list[str]], with_broker: set[str], on_alpaca: set[str]) -> list[dict]:
@@ -435,7 +457,7 @@ def build_report(exp_dir: Path, market: Market, broker_order_ids: Mapping[str, I
     twins = [verdicts[x] for x in ("opus-a", "opus-b") if x in verdicts]
     first = ps[0]["cfg"] if ps else None
     on_alpaca = {p["id"] for p in ps if (p["state"].get("started_with") or {}).get("broker", p["cfg"].broker) == "alpaca"}
-    incidents = _incidents(ps, checked, {pid for pid in order if pid in ids}, on_alpaca)
+    incidents = _incidents(ps, checked, {pid for pid in order if pid in ids}, on_alpaca) + _owner(exp_dir)
     severity = ("critical", "serious", "warning", "good")
     incidents.sort(key=lambda i: (i["day"] is None, i["day"] or "", severity.index(i["kind"]),
                                   order.index(i["participant"]) if i["participant"] in order else len(order), i["title"]))

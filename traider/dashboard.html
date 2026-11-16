@@ -576,18 +576,20 @@ function costCell(pid, d) {
   const x = SESS[pid] && SESS[pid].get(DAYS[d]);
   if (!x) return DASH;
   if (x.status === "missed") return "пропуск";
+  if (x.status === "paused") return "пауза";
   const c = costOf(pid, d);
   return c == null ? "не записано" : usd2(c);
 }
 
 /* ---------- сессии ---------- */
-const STATUS_NAME = { ok: "прошла", cap: "упёрлась в потолок", failed: "сбой", missed: "пропуск" };
+const STATUS_NAME = { ok: "прошла", cap: "упёрлась в потолок", failed: "сбой", missed: "пропуск", paused: "пауза" };
 function glyph(st) {
   const g = s("svg", { viewBox: "0 0 14 14", class: "glyph", "aria-hidden": "true" });
   if (st === "ok") g.append(s("circle", { cx: 7, cy: 7, r: 4.5, style: "fill:var(--ink)" }));
   else if (st === "cap") g.append(s("path", { d: "M7 1.5 13 12.5H1Z", style: "fill:var(--warning);stroke:var(--ink);stroke-width:1;stroke-linejoin:round" }));
   else if (st === "failed") g.append(s("path", { d: "M3 3l8 8M11 3l-8 8", style: "stroke:var(--critical);stroke-width:2.2;stroke-linecap:round;fill:none" }));
   else if (st === "missed") g.append(s("circle", { cx: 7, cy: 7, r: 4, style: "fill:none;stroke:var(--muted);stroke-width:1.5" }));
+  else if (st === "paused") g.append(s("path", { d: "M5 3.5v7M9 3.5v7", style: "stroke:var(--muted);stroke-width:2;stroke-linecap:round" }));
   else g.append(s("path", { d: "M3 7h8", style: "stroke:var(--muted);stroke-width:2;stroke-linecap:round" }));
   return g;
 }
@@ -610,7 +612,7 @@ function renderGrid() {
     if (!x) return h("td", {}, h("span", { class: "nocell", "aria-label": `${p.id}, ${dayLabel(d)}: сессии нет` }, DASH));
     const on = !!sel && sel.p === p.id && sel.d === d, st = x.status, b = x.buys || 0, sl = x.sells || 0;
     return h("td", {}, h("button", { class: "cell", "aria-pressed": String(on), "aria-label": `${p.id}, ${dayLabel(d)}: ${own(STATUS_NAME, st) || String(st ?? "неизвестно")}`, "data-key": `cell:${p.id}:${d}`, onclick: () => { state.sel = { p: p.id, d }; renderGrid(); renderDetail(); refocus(`cell:${p.id}:${d}`); } },
-      glyph(st), h("small", {}, st === "missed" ? " " : `+${b} −${sl}`)));
+      glyph(st), h("small", {}, st === "missed" || st === "paused" ? " " : `+${b} −${sl}`)));
   })));
   put("grid", h("table", { class: "grid" }, h("thead", {}, h("tr", {}, h("th", {}, ""), ...days.map(d => h("th", {}, dayLabel(d))))), h("tbody", {}, body)));
   put("grid-legend", ...Object.keys(STATUS_NAME).map(k => h("span", {}, glyph(k), STATUS_NAME[k])), h("span", {}, "+2 −1: за сессию две покупки и одна продажа"), h("span", {}, "— сессии не было"));
@@ -645,6 +647,7 @@ function renderDetail() {
   const p = P.find(q => q.id === sel.p), x = SESS[p.id].get(sel.d), st = x.status;
   const title = `${p.id}, ${dayLabel(sel.d)}: ${own(STATUS_NAME, st) || String(st ?? "неизвестно")}`;
   if (st === "missed") return box.replaceChildren(h("h3", {}, title), h("p", { class: "note", style: "margin:0" }, "Сессии не было: машина не работала в часы торгов. Проверка HP и стопы в этот день не работали."));
+  if (st === "paused") return box.replaceChildren(h("h3", {}, title), h("p", { class: "note", style: "margin:0" }, "День паузы: владелец приостановил эксперимент, сессии не было. Позиции остались, проверка HP и стопы работали. Этот день не входит ни в число сессий, ни в долю пропусков."));
   const looked = (x.looked || []).map(l => [`${own(LOOKED, l.name) || l.name}: ${l.calls} ${plural(l.calls, "раз", "раза", "раз")}`, l.example && Object.keys(l.example).length ? cut(json(l.example).replace(/\s+/g, " "), 140) : null]);
   if (!looked.length) looked.push(["Ничего не смотрел", null]);
   const decided = [];

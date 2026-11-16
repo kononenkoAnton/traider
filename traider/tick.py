@@ -32,6 +32,14 @@
 `status` и `cost`) пишется строкой в `ticks.jsonl` прогона через `RunStore.append_tick`, для ошибок тоже. Сбой записи этой строки (любое исключение) тик не останавливает и результата не меняет. Клиенты
 создаются до записи `started`, чтобы сбой создания не оставил зависшую запись; когда
 сессии нет, `make_client` не вызывается.
+
+Пауза и остановка владельца (модуль control). `control.json` эксперимента тик читает один раз за тик, только читает;
+нечитаемый файл значит «ни паузы, ни остановки», а его текст идёт в `error` каждого элемента этого эксперимента.
+После шага 4: остановка запрошена и статус `active`, значит статус `finishing`, `finish_day` день тика,
+`stopped_by: "owner"`, и в этом же тике шаг 5; прогоны в других статусах запрос не меняет. На шаге 6 день без записи
+внутри интервала паузы пишется `paused`, а не `missed`. Если сегодня день паузы: нет записи за сегодня, значит запись
+`paused` (тем же исключительным созданием) и действие `paused`; запись уже есть, значит `safety` (`stale_failed`, если
+сегодняшний старт завис); шаги 7 и 8 не идут, клиент не создаётся. Без `control.json` тик работает как прежде.
 """
 import json
 import os
@@ -44,6 +52,7 @@ from typing import Any
 from traider.analyst import Analyst
 from traider.brokers import Broker
 from traider.config import MODES, RunConfig, active_runs, alpaca_runs, load_run
+from traider.control import is_paused, read_control
 from traider.market import NY, Market, ny_day
 from traider.nums import usable
 from traider.safety import run_safety
@@ -51,6 +60,7 @@ from traider.session import run_session
 from traider.store import RunStore
 
 FINISH_AFTER_DAYS = 5
+NO_CONTROL = {"pauses": [], "stop": None}
 
 
 def _write_lock(lock: Path, now: datetime, token: str, exclusive: bool) -> bool:
@@ -115,8 +125,9 @@ def _finishing(cfg: RunConfig, store: RunStore, broker: Broker, market: Market, 
     return "finishing"
 
 
-def _bookkeeping(store: RunStore, market: Market, day: str, now: datetime) -> bool:
-    """Зависшие старты становятся сбойными, пропущенные дни записываются. True, если сегодняшний старт завис."""
+def _bookkeeping(store: RunStore, market: Market, day: str, now: datetime, control: dict) -> bool:
+    """Зависшие старты становятся сбойными, пропущенные дни записываются (день паузы как `paused`). True, если
+    сегодняшний старт завис."""
     stale = store.stale_started(now)
     for d in stale:
         store.finish_session(d, "failed", {"stop": "stale", "errors": ["сессия зависла в статусе started"]})
@@ -124,11 +135,11 @@ def _bookkeeping(store: RunStore, market: Market, day: str, now: datetime) -> bo
     first = store.state()["first_day"]
     for d in market.trading_days(first, yesterday) if first <= yesterday else []:
         if store.start_session(d, now):
-            store.finish_session(d, "missed", {})
+            store.finish_session(d, "paused" if is_paused(control, d) else "missed", {})
     return day in stale
 
 
-def _one(run: Path, market: Market, make_broker, make_client) -> dict:
+def _one(run: Path, market: Market, make_broker, make_client, control: dict = NO_CONTROL) -> dict:
     cfg, valid = load_run(run)
     store, now = RunStore(run), market.now()
     day = ny_day(now)
@@ -152,11 +163,19 @@ def _one(run: Path, market: Market, make_broker, make_client) -> dict:
         return out | {"action": "died"}
     if status == "invalid":
         return out | {"action": "invalid"}
+    if control["stop"] and status == "active":   # остановку владельца применяет тик: пишет состояние только он
+        store.update_state(status="finishing", finish_day=day, stopped_by="owner")
+        status = "finishing"
     if status == "finishing":
         return out | {"action": _finishing(cfg, store, broker, market, day)}
     if status != "active":
         return out | {"action": "safety"}   # неизвестный статус: ни учёта дней, ни сессии
-    stale_today = _bookkeeping(store, market, day, now)
+    stale_today = _bookkeeping(store, market, day, now, control)
+    if is_paused(control, day):
+        if store.session(day) is None and store.start_session(day, now):
+            store.finish_session(day, "paused", {})
+            return out | {"action": "paused"}
+        return out | {"action": "stale_failed" if stale_today else "safety"}
     clock = now.astimezone(NY).strftime("%H:%M")
     if store.session(day) is None:
         if clock > cfg.window_end:
@@ -181,13 +200,18 @@ def tick(runs_dir: Path, market: Market, make_broker: Callable[[RunConfig, RunSt
         return []
     out: list[dict] = []
     try:
-        shared = _shared_alpaca(runs_dir)
+        shared, controls = _shared_alpaca(runs_dir), {}
         for run in _rotated(active_runs(runs_dir), ny_day(market.now())):
             if not _refresh(lock, market.now(), token):
                 break   # замок забрал другой тик: не трогаем ни его, ни прогоны
+            if run.parent not in controls:
+                controls[run.parent] = _control(run.parent)
+            control, broken = controls[run.parent]
             try:
                 r = ({"participant": run.name, "action": "error", "error": shared[run]} if run in shared
-                     else _one(run, market, make_broker, make_client))
+                     else _one(run, market, make_broker, make_client, control))
+                if broken and "error" not in r:
+                    r["error"] = broken
             except Exception as e:
                 r = {"participant": run.name, "action": "error", "error": f"{type(e).__name__}: {e}"}
             out.append({"experiment": run.parent.name, **r, "ts": market.now().isoformat()})
@@ -199,6 +223,15 @@ def tick(runs_dir: Path, market: Market, make_broker: Callable[[RunConfig, RunSt
     finally:
         if _owned(lock, token):
             lock.unlink(missing_ok=True)
+
+
+def _control(exp_dir: Path) -> tuple[dict, str | None]:
+    """Решения владельца для эксперимента; нечитаемый файл значит «ни паузы, ни остановки» и текст для строк тика."""
+    try:
+        return read_control(exp_dir), None
+    except Exception as e:
+        return NO_CONTROL, (f"{type(e).__name__}: {e}; пауза и остановка в этом тике не действуют, проверка HP и "
+                            "стопы идут как обычно")
 
 
 TICK_FIELDS = ("equity", "floor", "hp", "stops_placed", "stop_fills", "unpriced", "error")

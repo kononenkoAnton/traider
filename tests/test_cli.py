@@ -531,3 +531,93 @@ def test_an_active_run_with_the_same_late_fill_is_still_not_flagged(played, tmp_
     exp, api = make_terminal_world(played, tmp_path, monkeypatch, "active")
     assert main(["report", "pilot-1"]) == 0
     assert api.asked and not integrity_incidents(exp)       # брокер спрошен: проверка не пропущена по другой причине
+
+
+# --- задача 6: пауза и остановка ---
+
+from traider.control import read_control  # noqa: E402
+
+
+@pytest.fixture
+def owner(tmp_path, example, monkeypatch, capsys):
+    """Каталог с экспериментом pilot-1, сегодня в Нью-Йорке 2026-12-02; .env нет, сеть не нужна."""
+    monkeypatch.chdir(tmp_path)
+    start_experiment(example, tmp_path / "runs")
+    monkeypatch.setattr(cli, "_today", lambda: "2026-12-02")
+    for name in ("AlpacaMarket", "Anthropic", "make_alpaca_api", "load_env"):
+        monkeypatch.setattr(cli, name, lambda *a, **k: pytest.fail("команде владельца не нужны ни сеть, ни .env"))
+    return tmp_path / "runs" / "pilot-1"
+
+
+def test_pause_and_resume_record_today_in_new_york(owner, capsys):
+    assert main(["pause"]) == 0 and read_control(owner)["pauses"] == [{"from": "2026-12-02", "to": None}]
+    assert main(["pause", "pilot-1"]) == 0 and len(read_control(owner)["pauses"]) == 1
+    assert main(["resume"]) == 0 and read_control(owner)["pauses"] == [{"from": "2026-12-02", "to": "2026-12-02"}]
+    assert main(["resume"]) == 0 and "паузы нет" in capsys.readouterr().out
+
+
+def test_today_is_the_new_york_date():
+    from traider.market import NY
+    assert cli._today() == datetime.now(NY).date().isoformat()
+
+
+def test_unknown_experiment_is_code_2(owner, capsys):
+    assert main(["pause", "nope"]) == 2 and main(["resume", "nope"]) == 2 and main(["stop", "nope", "--yes"]) == 2
+    assert not (owner / "control.json").exists()
+
+
+def test_without_a_name_several_unfinished_experiments_are_listed(owner, example, capsys):
+    toml = example.parent / "official.toml"
+    toml.write_text(example.read_text().replace('experiment = "pilot-1"', 'experiment = "official"')
+                    .replace('broker = "alpaca"', 'broker = "sim"'))
+    start_experiment(toml, owner.parent); capsys.readouterr()
+    assert main(["pause"]) == 2 and main(["resume"]) == 2
+    err = capsys.readouterr().err
+    assert "pilot-1" in err and "official" in err and not (owner / "control.json").exists()
+    for run in owner.iterdir():
+        RunStore(run).update_state(status="finished")
+    assert main(["pause"]) == 0 and (owner.parent / "official" / "control.json").exists()   # pilot-1 окончен
+    assert not (owner / "control.json").exists()
+
+
+def test_no_unfinished_experiment_is_code_2(owner, capsys):
+    for run in owner.iterdir():
+        RunStore(run).update_state(status="dead")
+    assert main(["pause"]) == 2 and "незавершённых" in capsys.readouterr().err
+
+
+def test_stop_needs_the_name_and_the_confirmation(owner, capsys):
+    with pytest.raises(SystemExit) as e:
+        main(["stop"])
+    assert e.value.code == 2
+    capsys.readouterr()
+    assert main(["stop", "pilot-1"]) == 2 and not (owner / "control.json").exists()
+    out = capsys.readouterr().out
+    assert "продаст все позиции" in out and "Отменить это нельзя" in out and "--yes" in out
+    assert main(["stop", "pilot-1", "--yes"]) == 0 and read_control(owner)["stop"]["day"] == "2026-12-02"
+    first = read_control(owner)["stop"]
+    assert main(["stop", "pilot-1", "--yes"]) == 0 and read_control(owner)["stop"] == first
+    assert all(RunStore(r).state()["status"] == "active" for r in owner.iterdir() if r.is_dir())   # прогоны меняет тик
+
+
+def test_pause_after_a_stop_or_on_a_damaged_file_is_code_1(owner, capsys):
+    assert main(["stop", "pilot-1", "--yes"]) == 0
+    assert main(["pause", "pilot-1"]) == 1 and main(["resume", "pilot-1"]) == 1 and "остановка" in capsys.readouterr().err
+    (owner / "control.json").write_text("{")
+    assert main(["pause", "pilot-1"]) == 1 and main(["stop", "pilot-1", "--yes"]) == 1
+    assert (owner / "control.json").read_text() == "{"
+
+
+def test_status_shows_a_paused_and_a_stopping_experiment(owner, capsys):
+    store = RunStore(owner / "haiku")
+    for d, st in [("2026-12-01", "ok"), ("2026-12-02", "paused")]:
+        store.start_session(d, datetime(2026, 12, 1, 15, tzinfo=timezone.utc)); store.finish_session(d, st, {})
+    main(["pause"]); capsys.readouterr()
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "pilot-1: пауза, на паузе с 2026-12-02"
+    assert "сессий 1/3" in next(l for l in out if "haiku" in l)
+    main(["stop", "pilot-1", "--yes"]); capsys.readouterr(); main(["status"])
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first == ("pilot-1: останавливается, позиции продаются при открытом рынке, на паузе с 2026-12-02, "
+                     "остановка запрошена 2026-12-02")
