@@ -34,7 +34,8 @@
 сессии нет, `make_client` не вызывается.
 
 Пауза и остановка владельца (модуль control). `control.json` эксперимента тик читает один раз за тик, только читает;
-нечитаемый файл значит «ни паузы, ни остановки», а его текст идёт в `error` каждого элемента этого эксперимента.
+нечитаемый файл значит «ни паузы, ни остановки», а его текст идёт в отдельное поле `control_error` каждого элемента
+этого эксперимента и его строки `ticks.jsonl` (`error` остаётся своей ошибке прогона).
 После шага 4: остановка запрошена и статус `active`, значит статус `finishing`, `finish_day` день тика,
 `stopped_by: "owner"`, и в этом же тике шаг 5; прогоны в других статусах запрос не меняет. На шаге 6 день без записи
 внутри интервала паузы пишется `paused`, а не `missed`. Если сегодня день паузы: нет записи за сегодня, значит запись
@@ -60,7 +61,10 @@ from traider.session import run_session
 from traider.store import RunStore
 
 FINISH_AFTER_DAYS = 5
-NO_CONTROL = {"pauses": [], "stop": None}
+
+
+def _no_control() -> dict:
+    return {"pauses": [], "stop": None}   # каждый раз новый: общий словарь можно случайно изменить
 
 
 def _write_lock(lock: Path, now: datetime, token: str, exclusive: bool) -> bool:
@@ -139,7 +143,8 @@ def _bookkeeping(store: RunStore, market: Market, day: str, now: datetime, contr
     return day in stale
 
 
-def _one(run: Path, market: Market, make_broker, make_client, control: dict = NO_CONTROL) -> dict:
+def _one(run: Path, market: Market, make_broker, make_client, control: dict | None = None) -> dict:
+    control = control or _no_control()
     cfg, valid = load_run(run)
     store, now = RunStore(run), market.now()
     day = ny_day(now)
@@ -210,10 +215,10 @@ def tick(runs_dir: Path, market: Market, make_broker: Callable[[RunConfig, RunSt
             try:
                 r = ({"participant": run.name, "action": "error", "error": shared[run]} if run in shared
                      else _one(run, market, make_broker, make_client, control))
-                if broken and "error" not in r:
-                    r["error"] = broken
             except Exception as e:
                 r = {"participant": run.name, "action": "error", "error": f"{type(e).__name__}: {e}"}
+            if broken:
+                r["control_error"] = broken   # отдельно от своей ошибки прогона
             out.append({"experiment": run.parent.name, **r, "ts": market.now().isoformat()})
             try:
                 _log_tick(run, out[-1])
@@ -230,17 +235,18 @@ def _control(exp_dir: Path) -> tuple[dict, str | None]:
     try:
         return read_control(exp_dir), None
     except Exception as e:
-        return NO_CONTROL, (f"{type(e).__name__}: {e}; пауза и остановка в этом тике не действуют, проверка HP и "
+        return _no_control(), (f"{type(e).__name__}: {e}; пауза и остановка в этом тике не действуют, проверка HP и "
                             "стопы идут как обычно")
 
 
 TICK_FIELDS = ("equity", "floor", "hp", "stops_placed", "stop_fills", "unpriced", "error")
+# ponytail: control_error пишется только когда есть, чтобы строка тика без control.json не изменилась
 
 
 def _log_tick(run: Path, r: dict) -> None:
     """Строка в `ticks.jsonl` прогона; поля, до которых тик не дошёл, пишутся как null."""
     rec = {"ts": r["ts"], "day": ny_day(datetime.fromisoformat(r["ts"])), "action": r["action"],
-           **{k: r.get(k) for k in TICK_FIELDS}}
+           **{k: r.get(k) for k in TICK_FIELDS}, **({"control_error": r["control_error"]} if "control_error" in r else {})}
     if r["action"] == "session":
         rec |= {"status": r["status"], "cost": r["cost"]}
     RunStore(run).append_tick(rec)

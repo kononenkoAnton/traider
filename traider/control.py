@@ -12,7 +12,8 @@
 не читается, сети нет.
 
 `read_control`: нет файла, значит `{"pauses": [], "stop": None}`; нечитаемый файл или файл не той формы даёт
-`ValueError` с именем файла (функции записи тоже: повреждённый файл не перезаписывается, иначе потерялся бы запрос
+`ValueError` с именем файла; не той формы значит и день не `ГГГГ-ММ-ДД` (или не дата), начало интервала позже конца,
+`stop.ts` не время ISO (функции записи тоже: повреждённый файл не перезаписывается, иначе потерялся бы запрос
 остановки). `pause` открывает интервал, если открытого нет; `resume` закрывает открытый днём `day`, без открытого
 ничего не меняет; оба после запроса остановки дают `ValueError`. `request_stop` необратим, повтор ничего не
 меняет. `is_paused`: день внутри любого интервала, концы включены, у открытого конца нет (день снятия паузы ещё
@@ -22,9 +23,10 @@
 """
 import json
 import os
+import re
 import uuid
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from traider.config import TERMINAL_STATUSES
@@ -34,14 +36,26 @@ FILE = "control.json"
 
 
 def _day(x) -> bool:
-    return isinstance(x, str) and len(x) == 10
+    """Только `ГГГГ-ММ-ДД`: дни сравниваются строками, другая запись дала бы паузу или остановку не в тот день."""
+    try:
+        return isinstance(x, str) and bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", x)) and bool(date.fromisoformat(x))
+    except ValueError:
+        return False
+
+
+def _moment(x) -> bool:
+    try:
+        return isinstance(x, str) and bool(datetime.fromisoformat(x))
+    except ValueError:
+        return False
 
 
 def _valid(c) -> bool:
     return (isinstance(c, dict) and set(c) == {"pauses", "stop"} and isinstance(c["pauses"], list)
-            and all(isinstance(p, dict) and _day(p.get("from")) and (p.get("to") is None or _day(p["to"]))
-                    for p in c["pauses"])
-            and (c["stop"] is None or isinstance(c["stop"], dict) and _day(c["stop"].get("day"))))
+            and all(isinstance(p, dict) and _day(p.get("from"))
+                    and (p.get("to") is None or _day(p["to"]) and p["from"] <= p["to"]) for p in c["pauses"])
+            and (c["stop"] is None or isinstance(c["stop"], dict) and _day(c["stop"].get("day"))
+                 and _moment(c["stop"].get("ts"))))
 
 
 def read_control(exp_dir: Path) -> dict:
@@ -53,7 +67,8 @@ def read_control(exp_dir: Path) -> dict:
     except (OSError, ValueError) as e:
         raise ValueError(f"{path} не читается: {type(e).__name__}: {e}") from e
     if not _valid(c):
-        raise ValueError(f"{path} не той формы: нужно {{\"pauses\": [...], \"stop\": ... }}")
+        raise ValueError(f"{path} не той формы: нужно {{\"pauses\": [{{\"from\": ГГГГ-ММ-ДД, \"to\": ГГГГ-ММ-ДД или null}}], "
+                         f"\"stop\": {{\"day\": ГГГГ-ММ-ДД, \"ts\": время ISO}} или null}}, начало паузы не позже конца")
     return c
 
 

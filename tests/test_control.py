@@ -49,7 +49,14 @@ def test_pause_and_resume_after_a_stop_are_refused(tmp_path):
     assert json.loads(before)["stop"] == {"day": "2026-12-02", "ts": NOW.isoformat()}
 
 
-@pytest.mark.parametrize("text", ["не json", "[]", '{"pauses": {}, "stop": null}', '{"pauses": [{"from": 1}], "stop": null}',
+BAD_DATES = ['{"pauses": [{"from": "2026-12-01", "to": "2026.12.30"}], "stop": null}',
+             '{"pauses": [], "stop": {"day": "not a date", "ts": "2026-12-01T10:00:00-05:00"}}',
+             '{"pauses": [{"from": "2026/12/01", "to": null}], "stop": null}',
+             '{"pauses": [{"from": "2026-12-05", "to": "2026-12-01"}], "stop": null}',
+             '{"pauses": [], "stop": {"day": "2026-12-01", "ts": "вчера"}}']
+
+
+@pytest.mark.parametrize("text", BAD_DATES + ["не json", "[]", '{"pauses": {}, "stop": null}', '{"pauses": [{"from": 1}], "stop": null}',
                                   '{"pauses": [], "stop": {"ts": "x"}}', '{"stop": null}'])
 def test_a_damaged_control_file_is_an_error_and_is_never_overwritten(tmp_path, text):
     exp = tmp_path / "pilot-1"; exp.mkdir(); (exp / "control.json").write_text(text)

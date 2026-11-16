@@ -436,14 +436,37 @@ def test_a_stop_request_leaves_invalid_dead_finished_and_finishing_runs_alone(wo
     assert [states[p]["status"] for p in states] == ["invalid", "dead", "finished", "finishing"]
     assert not any("stopped_by" in s for s in states.values()) and states["opus-b"]["finish_day"] == "2026-11-27"
 
-@pytest.mark.parametrize("text", ["не json", '{"pauses": "x", "stop": null}'])
+from tests.test_control import BAD_DATES  # noqa: E402
+
+
+@pytest.mark.parametrize("text", BAD_DATES + ["не json", '{"pauses": "x", "stop": null}'])
 def test_a_damaged_control_file_means_no_pause_no_stop_and_is_reported(world, text):
     runs, market, mb, mc, _ = world
+    run = runs / "pilot-1" / "opus-b"; cfg, _ = load_run(run)
+    SimBroker(cfg, RunStore(run), market).buy("2026-11-30", "AAPL", 100.0, market.prices["AAPL"] * 0.9, "т", "seed/1")
     (runs / "pilot-1" / "control.json").write_text(text)
     got = tick(runs, market, mb, mc)
-    assert {r["action"] for r in got} == {"session"} and all("control.json" in r["error"] for r in got)
-    assert "control.json" in RunStore(runs / "pilot-1" / "haiku").ticks()[-1]["error"]
+    assert {r["action"] for r in got} == {"session"} and all("control.json" in r["control_error"] for r in got)
+    assert all("error" not in r for r in got)                                  # своя ошибка прогона отдельно
+    assert "control.json" in RunStore(runs / "pilot-1" / "haiku").ticks()[-1]["control_error"]
+    assert all(RunStore(runs / "pilot-1" / p).state()["status"] == "active" for p in actions(got))
+    assert [p.symbol for p in SimBroker(cfg, RunStore(run), market).account().positions] == ["AAPL"]   # ничего не продано
+    assert not any(e["kind"] == "liquidate" for e in RunStore(run).orders())
     assert (runs / "pilot-1" / "control.json").read_text() == text
+
+def test_a_death_on_a_day_with_a_damaged_control_file_keeps_its_own_text(world):
+    from traider.report import build_report
+    runs, market, mb, mc, _ = world
+    run = runs / "pilot-1" / "opus-b"; cfg, _ = load_run(run)
+    SimBroker(cfg, RunStore(run), market).buy("2026-11-30", "AAPL", 1000.0, 1.0, "т", "seed/1")
+    market.prices["AAPL"] *= 0.8
+    (runs / "pilot-1" / "control.json").write_text("не json")
+    assert actions(tick(runs, market, mb, mc))["opus-b"] == "died"
+    inc = build_report(runs / "pilot-1", market)["incidents"]
+    died = [i for i in inc if i["title"].startswith("гибель")]
+    assert died and all("control.json" not in i["text"] for i in died)
+    ctl = [i for i in inc if i["title"] == "файл управления не читается" and i["day"] == "2026-12-01"]
+    assert len(ctl) == 1 and ctl[0]["participant"] is None and "control.json" in ctl[0]["text"]
 
 def test_the_tick_never_writes_the_control_file(world, monkeypatch):
     runs, market, mb, mc, _ = world

@@ -621,3 +621,15 @@ def test_status_shows_a_paused_and_a_stopping_experiment(owner, capsys):
     first = capsys.readouterr().out.splitlines()[0]
     assert first == ("pilot-1: останавливается, позиции продаются при открытом рынке, на паузе с 2026-12-02, "
                      "остановка запрошена 2026-12-02")
+
+
+def test_tick_line_mentions_a_damaged_control_file(tmp_path, example, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ALPACA_API_KEY=a\nALPACA_SECRET_KEY=b\nANTHROPIC_API_KEY=c\n")
+    start_experiment(example, tmp_path / "runs")
+    monkeypatch.setattr(cli, "AlpacaMarket", lambda key, secret: object())
+    monkeypatch.setattr(cli, "_auto_report", lambda *a: None)
+    monkeypatch.setattr(cli, "tick", lambda *a: [{"experiment": "pilot-1", "participant": "haiku", "action": "safety",
+                                                  "ts": "2026-12-01T15:05:00+00:00",
+                                                  "control_error": "ValueError: runs/pilot-1/control.json не читается"}])
+    assert main(["tick"]) == 0 and "control.json" in capsys.readouterr().out

@@ -36,7 +36,8 @@
 День паузы владельца (запись `paused`) не сессия: его нет ни в `sessions_done`, ни в доле пропусков (числитель и
 знаменатель), ни в днях сессий для прогнозов и для среднего расхода в `money`; его стоимость 0 и записана. Кривые идут
 через такие дни как обычно. Решения владельца из `control.json` дают происшествия эксперимента (`participant` None):
-`warning` «пауза владельца» на каждый интервал и `warning` «остановлен владельцем»; нечитаемый файл тоже `warning`.
+`warning` «пауза владельца» на каждый интервал и `warning` «остановлен владельцем» (по файлу, а без него по `stopped_by`
+в состоянии прогона); `warning` на каждый день с `control_error` в строках тиков и на нечитаемый сейчас файл.
 """
 import calendar
 import inspect
@@ -309,19 +310,29 @@ def _tokens(p: dict, cost: float) -> dict:
             "cost_per_session": cost / len(spent) if spent else None, "analyst": analyst}
 
 
-def _owner(exp_dir: Path) -> list[dict]:
-    """Происшествия эксперимента от решений владельца: по одному на интервал паузы и одно на остановку."""
+def _owner(exp_dir: Path, ps: list[dict]) -> list[dict]:
+    """Происшествия эксперимента от решений владельца: по одному на интервал паузы, одно на остановку (по файлу или по
+    `stopped_by` в состоянии прогона), по одному на день, когда тик не смог прочесть файл, и одно, если он не читается сейчас."""
+    broken: dict[str, dict] = {}
+    for t in (t for p in ps for t in p["ticks"] if t.get("control_error")):
+        x = broken.setdefault(t.get("day"), {"kind": "warning", "day": t.get("day"), "participant": None,
+                                              "title": "файл управления не читается", "text": "", "n": 0})
+        x["n"] += 1
+        x["text"] = t["control_error"]
+    out = [{**{k: v for k, v in x.items() if k != "n"}, "text": f"{x['text']}; тиков: {x['n']}"} for x in broken.values()]
     try:
         c = read_control(exp_dir)
     except ValueError as e:
-        return [{"kind": "warning", "day": None, "participant": None, "title": "файл управления не читается",
-                 "text": f"{e}; тик считает, что паузы и остановки нет"}]
-    out = [{"kind": "warning", "day": x["from"], "participant": None, "title": "пауза владельца",
-            "text": f"с {x['from']} по {x['to']}" if x["to"] else f"с {x['from']}, пауза не снята"} for x in c["pauses"]]
-    if c["stop"]:
-        out.append({"kind": "warning", "day": c["stop"]["day"], "participant": None, "title": "остановлен владельцем",
-                    "text": f"остановка запрошена {c['stop']['day']}: позиции продаются при открытом рынке, прогоны "
-                            "заканчиваются"})
+        c = {"pauses": [], "stop": None}
+        out.append({"kind": "warning", "day": None, "participant": None, "title": "файл управления не читается",
+                    "text": f"{e}; тик считает, что паузы и остановки нет"})
+    out += [{"kind": "warning", "day": x["from"], "participant": None, "title": "пауза владельца",
+             "text": f"с {x['from']} по {x['to']}" if x["to"] else f"с {x['from']}, пауза не снята"} for x in c["pauses"]]
+    owner = [p["state"].get("finish_day") for p in ps if p["state"].get("stopped_by") == "owner"]
+    if c["stop"] or owner:
+        day = c["stop"]["day"] if c["stop"] else min(d for d in owner if d) if any(owner) else None
+        out.append({"kind": "warning", "day": day, "participant": None, "title": "остановлен владельцем",
+                    "text": f"остановка запрошена {day}: позиции продаются при открытом рынке, прогоны заканчиваются"})
     return out
 
 
@@ -457,7 +468,7 @@ def build_report(exp_dir: Path, market: Market, broker_order_ids: Mapping[str, I
     twins = [verdicts[x] for x in ("opus-a", "opus-b") if x in verdicts]
     first = ps[0]["cfg"] if ps else None
     on_alpaca = {p["id"] for p in ps if (p["state"].get("started_with") or {}).get("broker", p["cfg"].broker) == "alpaca"}
-    incidents = _incidents(ps, checked, {pid for pid in order if pid in ids}, on_alpaca) + _owner(exp_dir)
+    incidents = _incidents(ps, checked, {pid for pid in order if pid in ids}, on_alpaca) + _owner(exp_dir, ps)
     severity = ("critical", "serious", "warning", "good")
     incidents.sort(key=lambda i: (i["day"] is None, i["day"] or "", severity.index(i["kind"]),
                                   order.index(i["participant"]) if i["participant"] in order else len(order), i["title"]))

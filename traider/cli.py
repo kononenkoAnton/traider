@@ -108,6 +108,7 @@ def _tick(args) -> int:
         return 1
     for r in results:
         extra = f" {r['status']} ${r['cost']:.2f}" if r["action"] == "session" else f" {r['error']}" if "error" in r else ""
+        extra += f" (файл управления: {r['control_error']})" if "control_error" in r else ""
         when = datetime.fromisoformat(r["ts"]).astimezone(NY).strftime("%Y-%m-%d %H:%M")
         print(f"{when} {r['experiment']}/{r['participant']}: {r['action']}{extra}")
     _auto_report(market, env, args.wiki)   # замок тика уже снят

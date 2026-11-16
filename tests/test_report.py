@@ -526,3 +526,20 @@ def test_a_damaged_control_file_does_not_break_the_report(moving):
     (exp / "control.json").write_text("не json")
     r = build_report(exp, market)
     assert [i["kind"] for i in r["incidents"] if "control.json" in i["text"]] == ["warning"]
+
+
+def test_the_stop_incident_survives_a_deleted_control_file(moving):
+    exp, market = moving
+    for pid in ("haiku", "sonnet"):
+        RunStore(exp / pid).update_state(status="finishing", finish_day="2026-12-04", stopped_by="owner")
+    stops = [i for i in build_report(exp, market)["incidents"] if i["title"] == "остановлен владельцем"]
+    assert len(stops) == 1 and stops[0]["participant"] is None and stops[0]["day"] == "2026-12-04"
+
+
+def test_the_stop_incident_is_one_with_the_file_and_the_states(moving):
+    from traider.control import request_stop
+    from tests.fakes import ny
+    exp, market = moving
+    request_stop(exp, "2026-12-04", ny(2026, 12, 4, 11, 0))
+    RunStore(exp / "haiku").update_state(status="finishing", finish_day="2026-12-04", stopped_by="owner")
+    assert [i["title"] for i in build_report(exp, market)["incidents"]].count("остановлен владельцем") == 1
