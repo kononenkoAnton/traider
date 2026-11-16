@@ -32,6 +32,12 @@
 у окончённого прогона (`finished`, `dead`) отсечки нет. Срок раздела держит исключение `AutoReportTimeout` (`BaseException`, будильник взводится
 заново перед броском) и монотонный срок, проверяемый перед каждым шагом.
 Планировщик (`ops/com.traider.tick.plist`) вручную ставит владелец, без `--wiki`.
+В самом конце `tick`, один раз, сигнал сторожу (`heartbeat.beat`) на необязательный `HEALTHCHECK_URL` из `.env`: «сбой», если у
+строки тика действие `error`, `died` или `stale_failed`, непустое `error` или `control_error`, сессия со статусом `failed`, отчёт
+после тика не собран или вышел его срок, код выхода не 0 или вылетело исключение (оно уходит дальше то же, после сигнала); иначе
+«в порядке». Текст: число прогонов (или «рынок закрыт, тик пуст») и строки тика, без значений из `.env` и домашнего каталога.
+Сбой сигнала это одна строка «сторож недоступен» в stderr; строки тика, файлы и код выхода он не меняет. Другие команды
+сигнала не шлют.
 `pause [эксперимент]`, `resume [эксперимент]`, `stop <эксперимент> --yes` работают без сети и `.env`, через модуль
 control (пишут только `control.json`); день это сегодняшняя дата в Нью-Йорке по часам системы (`market.today`). Без имени `pause`
 и `resume` берут единственный незавершённый эксперимент (`summary` не `finished`); нет такого или их несколько:
@@ -58,6 +64,7 @@ from traider.brokers import SimBroker
 from traider.config import TERMINAL_STATUSES, load_run, start_experiment
 from traider.control import pause, request_stop, resume, summary
 from traider.env import load_env
+from traider.heartbeat import beat
 from traider.market import NY, AlpacaMarket, ny_day, today
 from traider.serve import main_serve
 from traider.store import RunStore
@@ -92,10 +99,39 @@ def _start(args) -> int:
     return 0
 
 
+def _failed(r: dict) -> bool:
+    """Строка тика, о которой сторож должен сказать «сбой»: ошибка прогона или файла управления, гибель, сбойная
+    сессия (своя или зависшая сегодняшняя). `safety`, `unpriced`, `paused`, `cap`, `missed` и окончание в порядке."""
+    return (r["action"] in ("error", "died", "stale_failed") or bool(r.get("error") or r.get("control_error"))
+            or (r["action"] == "session" and r.get("status") == "failed"))
+
+
+def _heartbeat(env: dict, ok: bool, lines: list[str]) -> None:
+    """Сигнал сторожу; без `HEALTHCHECK_URL` ничего. Значения из `.env` и домашний каталог из текста вырезаются."""
+    text = "\n".join(lines).replace(str(Path.home()), "~")
+    for value in env.values():
+        if len(value) >= 8:   # короткие значения это не ключи, а их замена испортила бы текст
+            text = text.replace(value, "***")
+    if err := beat(env.get("HEALTHCHECK_URL"), ok, text):
+        print(f"сторож недоступен: {err}", file=sys.stderr)
+
+
 def _tick(args) -> int:
-    env = load_env()
+    """Тик и после него, один раз, сигнал сторожу; исключение уходит дальше тем же, что было, после сигнала."""
+    env, seen = load_env(), {"lines": [], "failed": False}
+    try:
+        code = _tick_run(args, env, seen)
+    except BaseException:
+        _heartbeat(env, False, seen["lines"])
+        raise
+    _heartbeat(env, code == 0 and not seen["failed"], seen["lines"])
+    return code
+
+
+def _tick_run(args, env: dict, seen: dict) -> int:
     if missing := [k for k in KEYS if not env.get(k)]:
-        print(f"в .env нет: {', '.join(missing)}", file=sys.stderr)
+        print(line := f"в .env нет: {', '.join(missing)}", file=sys.stderr)
+        seen["lines"].append(line)
         return 1
     market = AlpacaMarket(env["ALPACA_API_KEY"], env["ALPACA_SECRET_KEY"])
 
@@ -107,14 +143,19 @@ def _tick(args) -> int:
         results = tick(RUNS, market, make_broker, lambda: Anthropic(
             api_key=env["ANTHROPIC_API_KEY"], max_retries=API_RETRIES, timeout=API_TIMEOUT))
     except Exception as e:   # рынок или замок недоступны до обхода
-        print(f"тик не состоялся: {type(e).__name__}: {e}", file=sys.stderr)
+        print(line := f"тик не состоялся: {type(e).__name__}: {e}", file=sys.stderr)
+        seen["lines"].append(line)
         return 1
+    seen["lines"].append(f"прогонов в тике: {len(results)}" if results else "рынок закрыт, тик пуст")
     for r in results:
         extra = f" {r['status']} ${r['cost']:.2f}" if r["action"] == "session" else f" {r['error']}" if "error" in r else ""
         extra += f" (файл управления: {r['control_error']})" if "control_error" in r else ""
         when = datetime.fromisoformat(r["ts"]).astimezone(NY).strftime("%Y-%m-%d %H:%M")
-        print(f"{when} {r['experiment']}/{r['participant']}: {r['action']}{extra}")
-    _auto_report(market, env, args.wiki)   # замок тика уже снят
+        print(line := f"{when} {r['experiment']}/{r['participant']}: {r['action']}{extra}")
+        seen["lines"].append(line)
+        seen["failed"] = seen["failed"] or _failed(r)
+    if _auto_report(market, env, args.wiki):   # замок тика уже снят
+        seen["failed"] = True
     return 0
 
 
@@ -179,12 +220,13 @@ def _on_alarm(signum, frame):
     raise AutoReportTimeout(f"не уложился в {AUTO_REPORT_SECONDS} с")
 
 
-def _auto_report(market, env, wiki: Path | None) -> None:
-    """Ничего не печатает в stdout и не бросает: отчёт не должен менять ни строки тика, ни код выхода. Он читает файлы
+def _auto_report(market, env, wiki: Path | None) -> bool:
+    """True, если какой-то отчёт не собран или вышел срок (это видит только сторож).
+    Ничего не печатает в stdout и не бросает: отчёт не должен менять ни строки тика, ни код выхода. Он читает файлы
     прогонов и рынок и может идти, пока другой тик держит замок. Весь раздел, с запросами к рынку и брокеру, ограничен
     будильником и монотонным сроком, который проверяется перед каждым экспериментом и каждым шагом (id брокера, сборка):
     зависший запрос не должен держать задание launchd, а с ним проверку HP и стопы следующих тиков."""
-    prev, pending, start = None, 0, time.monotonic()
+    prev, pending, start, failed = None, 0, time.monotonic(), False
 
     def check():
         if time.monotonic() - start > AUTO_REPORT_SECONDS:
@@ -193,7 +235,7 @@ def _auto_report(market, env, wiki: Path | None) -> None:
         prev = signal.signal(signal.SIGALRM, _on_alarm)
         pending = signal.alarm(AUTO_REPORT_SECONDS)
         if not market.is_open():   # тик пуст и при закрытом рынке, и когда все прогоны окончены: открытость спрашиваем у рынка
-            return
+            return False
         day = ny_day(market.now())
         for exp in _experiments():
             check()
@@ -203,11 +245,14 @@ def _auto_report(market, env, wiki: Path | None) -> None:
             except Exception as e:
                 check()   # сбой после срока это срок
                 print(f"отчёт {exp.name} не собран: {type(e).__name__}: {e}", file=sys.stderr)
+                failed = True
     except AutoReportTimeout as e:
         signal.signal(signal.SIGALRM, signal.SIG_IGN)   # повторный сигнал не должен вырваться из обработчика
         signal.alarm(0)
         print(f"отчёты не собраны: {type(e).__name__}: {e}", file=sys.stderr)
+        failed = True
     except Exception as e:
+        failed = True
         try:
             check()
             print(f"отчёты не собраны: {type(e).__name__}: {e}", file=sys.stderr)
@@ -220,6 +265,7 @@ def _auto_report(market, env, wiki: Path | None) -> None:
             signal.signal(signal.SIGALRM, prev)
             if pending:
                 signal.alarm(max(1, pending - int(time.monotonic() - start)))
+    return failed
 
 
 def _report(args) -> int:
