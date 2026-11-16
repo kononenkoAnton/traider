@@ -565,3 +565,80 @@ def test_a_sale_at_the_entry_price_is_a_serious_incident(world):
     inc = [i for i in build_report(runs / "pilot-1", market)["incidents"] if i["participant"] == "haiku"
            and i["title"] == "продано по цене входа: котировки не было"]
     assert [(i["kind"], i["day"]) for i in inc] == [("serious", "2026-12-01")] and "AAPL" in inc[0]["text"]
+
+
+# --- пилот, день 1: после сделок тика сохранённый счёт Alpaca совпадает с брокером ---
+
+def _alpaca_day(world, monkeypatch=None):
+    """opus-a на счёте Alpaca (фейк): покупает LLY, смотрит счёт, покупает COST и заканчивает."""
+    from tests.conftest import PANEL
+    from tests.fakes import FakeAlpacaApi
+    from traider.alpaca import AlpacaBroker
+    runs, market, sim, _, _ = world
+    api = FakeAlpacaApi(cash=1000.0, market=market)
+    def make_broker(cfg, store):
+        if cfg.participant != "opus-a":
+            return sim(cfg, store)
+        return AlpacaBroker(cfg, store, market, api, poll_seconds=0.05, poll_interval=0.01)
+    def make_client():
+        return FakeAnthropic([
+            use("record_forecasts", forecasts=[{"symbol": s, "p": 0.6} for s in PANEL]),
+            use("buy", symbol="LLY", notional=150.0, stop_price=round(market.prices["LLY"] * 0.9, 2), thesis="т"),
+            use("get_account"),
+            use("buy", symbol="COST", notional=150.0, stop_price=round(market.prices["COST"] * 0.9, 2), thesis="т"),
+            use("finish_session", journal="ок")] + [use("finish_session", journal="ок")] * 5)
+    return runs, market, api, make_broker, make_client
+
+def test_alpaca_account_after_a_session_that_traded_matches_the_broker(world):
+    from traider.report import build_report
+    runs, market, api, make_broker, make_client = _alpaca_day(world)
+    got = {r["participant"]: r for r in tick(runs, market, make_broker, make_client)}
+    assert got["opus-a"]["action"] == "session" and got["opus-a"].get("error") is None
+    store = RunStore(runs / "pilot-1" / "opus-a")
+    assert [e["symbol"] for e in store.orders() if e["kind"] == "buy"] == ["LLY", "COST"]
+    acct = store.account()
+    assert {p.symbol for p in acct.positions} == {"LLY", "COST"} == set(api.positions)
+    assert acct.cash == pytest.approx(api.cash) and api.cash == pytest.approx(700.0)
+    report = build_report(runs / "pilot-1", market)
+    assert report["cash"]["opus-a"] == pytest.approx(700.0)
+    assert {s for s, by in report["positions"].items() if "opus-a" in by} == {"LLY", "COST"}
+
+def test_failed_account_refresh_keeps_the_old_account_and_is_recorded(world):
+    from traider.report import build_report
+    runs, market, api, make_broker, make_client = _alpaca_day(world)
+    real = api.cash_and_positions
+    calls = {"n": 0}
+    def flaky():
+        calls["n"] += 1
+        before = [e for e in RunStore(runs / "pilot-1" / "opus-a").orders() if e["kind"] == "buy"]
+        if len(before) == 2 and RunStore(runs / "pilot-1" / "opus-a").session("2026-12-01")["status"] != "started":
+            raise ConnectionError("сеть пропала")          # только обновление после сессии
+        return real()
+    api.cash_and_positions = flaky
+    got = {r["participant"]: r for r in tick(runs, market, make_broker, make_client)}
+    r = got["opus-a"]
+    assert r["action"] == "session" and r["status"] == "ok"
+    assert "ConnectionError" in r["error"] and "сеть пропала" in r["error"]
+    store = RunStore(runs / "pilot-1" / "opus-a")
+    acct = store.account()                                                   # прежний счёт, не нули
+    assert [p.symbol for p in acct.positions] == ["LLY"] and acct.cash == pytest.approx(850.0)
+    line = json.loads((runs / "pilot-1" / "opus-a" / "ticks.jsonl").read_text().splitlines()[-1])
+    assert line["action"] == "session" and "сеть пропала" in line["error"]
+    inc = [i for i in build_report(runs / "pilot-1", market)["incidents"]
+           if i["participant"] == "opus-a" and i["title"] == "ошибка тика"]
+    assert len(inc) == 1 and "сеть пропала" in inc[0]["text"]
+
+def test_ticks_without_trades_read_the_account_no_more_than_before(world, monkeypatch):
+    from traider.alpaca import AlpacaBroker
+    runs, market, api, make_broker, _ = _alpaca_day(world)
+    reads = []
+    real = AlpacaBroker.account
+    monkeypatch.setattr(AlpacaBroker, "account", lambda self: reads.append(1) or real(self))
+    market.clock = ny(2026, 12, 1, 9, 45)                                    # до окна: только проверка HP
+    tick(runs, market, make_broker, lambda: FakeAnthropic([]))
+    assert len(reads) == 1                                                   # один раз, в run_safety
+    RunStore(runs / "pilot-1" / "opus-a").update_state(status="finished")
+    reads.clear()
+    market.clock = ny(2026, 12, 1, 10, 5)
+    tick(runs, market, make_broker, lambda: FakeAnthropic([]))
+    assert reads == []                                                       # завершённый прогон брокера не трогает

@@ -158,10 +158,34 @@ def test_iterations_are_summed_and_fallback_used_is_set():
     assert result.fallback_used is True and result.model_used == "claude-opus-5"
 
 
-def test_two_iterations_alone_mark_fallback_and_plain_run_does_not():
-    step = use("finish", usage=dict(iterations=[dict(input_tokens=10), dict(input_tokens=10)]))
-    assert run([step])[0].fallback_used is True
+def test_server_tool_loop_iterations_of_the_requested_model_are_not_a_fallback():
+    # Поиск внутри запроса: несколько записей `message` той же модели (у записи `message` поле model необязательно).
+    step = use("finish", usage=dict(input_tokens=3000, output_tokens=300, web_search_requests=1, iterations=[
+        dict(model="claude-opus-5-5", input_tokens=1000, output_tokens=100),
+        dict(input_tokens=2000, output_tokens=200, cache_read_input_tokens=500)]))
+    result, _ = run([step])
+    assert result.fallback_used is False and result.model_used == "claude-opus-5-5"
+    # итерации суммируются вместо верхнего usage, поиск оплачивается один раз
+    assert result.cost == pytest.approx(cost_usd(Usage(1000, 100), PRICES) + cost_usd(Usage(2000, 200, 500), PRICES) + 0.01)
+    assert result.usage.searches == 1
     assert run([use("finish")])[0].fallback_used is False
+
+
+def test_documented_fallback_response_is_a_fallback_and_costs_the_sum_of_its_attempts():
+    # Пример из документации «Refusals and fallback»: верхний usage это только ответившая попытка.
+    step = use("finish", usage=dict(input_tokens=412, output_tokens=264, iterations=[
+        dict(type="message", model="claude-fable-5", input_tokens=535, output_tokens=0),
+        dict(type="fallback_message", model="claude-opus-4-8", input_tokens=412, output_tokens=264)]))
+    step["model"] = "claude-opus-4-8"
+    result, _ = run([step], model="claude-fable-5")
+    assert result.fallback_used is True and result.model_used == "claude-opus-4-8"
+    assert result.cost == pytest.approx(cost_usd(Usage(535, 0), PRICES) + cost_usd(Usage(412, 264), PRICES))
+
+
+def test_an_iteration_naming_another_model_is_a_fallback_even_if_the_top_model_matches():
+    step = use("finish", usage=dict(iterations=[
+        dict(type="fallback_message", model="claude-opus-5", input_tokens=10, output_tokens=1)]))
+    assert run([step])[0].fallback_used is True
 
 
 # --- цикл не поднимает исключений ---

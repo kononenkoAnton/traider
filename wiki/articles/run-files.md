@@ -5,7 +5,7 @@ type: leaf
 tags: ['storage', 'ledger', 'files']
 categories: ['system-architecture']
 created: 2026-11-14T15:55:56+00:00
-modified: 2026-11-16T08:00:00+00:00
+modified: 2026-11-16T20:00:00+00:00
 ---
 
 # Файлы прогона
@@ -58,11 +58,11 @@ modified: 2026-11-16T08:00:00+00:00
 
 ## Поля записи сессии
 
-`day`, `status`, `started_at`, `finished_at`, `stop` (исход цикла), `turns`, `cost` (с аналитиком), `usage` (`input`, `output`, `cache_read`, `cache_write`, `searches`), `model_used`, `fallback_used`, `snapshot_symbols` (сколько цен в снимке, 0 при сбое снимка), `buys`, `sells`, `rejects`, `journal`, `errors`, `analyst` (пусто у участников без аналитика; иначе `cost`, `searches`, `briefing`, `usage`, `model`, `calls` с записью на каждый вызов: `kind`, `question`, `stop`, `cost`, `transcript`) и `transcript`. Пропущенный день и день паузы пишутся без итогов; зависшая сессия получает `stop: "stale"` и ошибку.
+`day`, `status`, `started_at`, `finished_at`, `stop` (исход цикла), `turns`, `cost` (с аналитиком), `usage` (`input`, `output`, `cache_read`, `cache_write`, `searches`), `model_used`, `fallback_used` (истинно, только если ответила другая модель, [[model-and-budget]]; у записей 16.11.2026 участников `opus-a` и `opus-b` оно ложно истинно, записи не исправлялись, см. [[decision-log]]), `snapshot_symbols` (сколько цен в снимке, 0 при сбое снимка), `buys`, `sells`, `rejects`, `journal`, `errors`, `analyst` (пусто у участников без аналитика; иначе `cost`, `searches`, `briefing`, `usage`, `model`, `calls` с записью на каждый вызов: `kind`, `question`, `stop`, `cost`, `transcript`) и `transcript`. Пропущенный день и день паузы пишутся без итогов; зависшая сессия получает `stop: "stale"` и ошибку.
 
 ## Поля строки `ticks.jsonl`
 
-`ts` (время рынка), `day`, `action`, `equity`, `floor`, `hp`, `stops_placed`, `stop_fills`, `unpriced`, `error`, а у сессии ещё `status` и `cost`. Поле `control_error` есть только в тики, когда `control.json` эксперимента не прочёлся: в нём текст этой ошибки, а `error` остаётся своей ошибке прогона. Поля, до которых тик не дошёл (например, ошибка до проверки HP), пустые. Ненормальное число пишется как null, а не роняет запись. Если каталог прогона не пишется, строка пропадает, а результат тика всё равно печатается.
+`ts` (время рынка), `day`, `action`, `equity`, `floor`, `hp`, `stops_placed`, `stop_fills`, `unpriced`, `error`, а у сессии ещё `status` и `cost`. Поле `error` бывает и при действии, которое не `error`: например, сессия прошла, а счёт после сделок тика обновить не вышло ([[tick-and-session]]). Поле `control_error` есть только в тики, когда `control.json` эксперимента не прочёлся: в нём текст этой ошибки, а `error` остаётся своей ошибке прогона. Поля, до которых тик не дошёл (например, ошибка до проверки HP), пустые. Ненормальное число пишется как null, а не роняет запись. Если каталог прогона не пишется, строка пропадает, а результат тика всё равно печатается.
 
 ## Значения
 

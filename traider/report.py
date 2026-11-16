@@ -26,6 +26,7 @@
 Расход участника в `summary.cost`: сумма записанных стоимостей (пропуск и пауза стоят 0 и записаны); `None`, если
 ни у одной его сессии стоимость не записана; `sessions_without_cost` это число его сессий без записанной стоимости.
 Ликвидация без котировки (`no_quote_entry_price`) даёт происшествие `serious` на участника и день.
+Строка тика с полем `error` даёт происшествие «ошибка тика» при любом действии (например, сессия прошла, а счёт после неё не обновился). Позиции и деньги участника (`positions`, `cash`) берутся из сохранённого счёта прогона.
 Прогнозы: `brier`, `reference`, `ci` по панели, `brier_picks` по прогнозам купленных в тот же день бумаг;
 нет созревших, значит None. `brier_series` по дням отчёта: те же Брайер и эталон по созревшим прогнозам
 панели, данным до дня включительно (последняя точка равна сводке); вне дней участника и без таких прогнозов None.
@@ -366,7 +367,7 @@ def _incidents(ps: list[dict], checked: dict[str, list[str]], with_broker: set[s
         for t in p["ticks"]:
             if t.get("action") == "stale_failed" and t.get("day") in stale:
                 continue   # запись дня уже дала «сбой сессии»
-            keys = [t.get("action")] + (["unpriced"] if t.get("unpriced") else [])
+            keys = [t.get("action")] + (["unpriced"] if t.get("unpriced") else []) + (["error"] if t.get("error") else [])
             for key in dict.fromkeys(k for k in keys if k in TICK_INCIDENTS):
                 kind, title = TICK_INCIDENTS[key]
                 x = seen.setdefault((t.get("day"), key), {"kind": kind, "day": t.get("day"), "participant": pid,

@@ -26,7 +26,7 @@
 записи за сегодня: `missed`; 8. не раньше `window_start`, рынок открыт, записи нет: при
 непустом `unpriced` это `unpriced`, иначе запись `started`, аналитик (второй клиент) для
 `research = "analyst"` и `run_session` (`session` со статусом и стоимостью); 9. иначе `safety`. Статус не `active` после шагов 4 и 5 (неизвестный) даёт `safety` без учёта дней.
-Любое исключение по одному прогону даёт `error` с текстом и не мешает остальным. Каждый элемент
+Если за тик в журнал заявок прогона добавились события, после всех шагов вызывается `broker.account()`, чтобы сохранённый счёт совпал с брокером (у Alpaca он кэш, сделки его не обновляют); сбой этого вызова тик не роняет, счёт остаётся прежним, текст идёт в поле `error` элемента (при исключении шага: заметкой к нему). Любое исключение по одному прогону даёт `error` с текстом и не мешает остальным. Каждый элемент
 результата несёт `experiment`, `participant`, `action`, `ts` (время рынка) и, если проверка HP прошла,
 `equity`, `floor`, `hp`, `stops_placed`, `stop_fills`, `unpriced`; тот же набор (с `day`, `error`, а у сессии
 `status` и `cost`) пишется строкой в `ticks.jsonl` прогона через `RunStore.append_tick`, для ошибок тоже. Сбой записи этой строки (любое исключение) тик не останавливает и результата не меняет. Клиенты
@@ -163,6 +163,30 @@ def _one(run: Path, market: Market, make_broker, make_client, control: dict | No
     if store.state().get("first_day") is None:
         store.update_state(first_day=day)
     broker = make_broker(cfg, store)
+    traded = len(store.orders())
+    try:
+        out = _steps(cfg, store, broker, market, make_client, control, day, now, out)
+    except Exception as e:
+        if len(store.orders()) != traded and (err := _refresh_account(broker)):
+            e.add_note(err)
+        raise
+    if len(store.orders()) != traded and (err := _refresh_account(broker)):
+        out["error"] = err
+    return out
+
+
+def _refresh_account(broker: Broker) -> str | None:
+    """Счёт брокера заново в хранилище после тика со сделками: у Alpaca сохранённый счёт это кэш, сделки его
+    не обновляют, а страница строится по нему сразу после тика. Сбой не роняет тик; счёт остаётся прежним."""
+    try:
+        broker.account()
+        return None
+    except Exception as e:
+        return f"счёт после сделок тика не обновлён, на странице прежний: {type(e).__name__}: {e}"
+
+
+def _steps(cfg: RunConfig, store: RunStore, broker: Broker, market: Market, make_client, control: dict, day: str,
+           now: datetime, out: dict[str, Any]) -> dict:
     report = run_safety(cfg, store, broker, day)
     out |= {"equity": report.equity, "floor": report.floor, "hp": report.hp, "stops_placed": list(report.stops_placed),
             "stop_fills": list(report.stop_fills), "unpriced": list(report.unpriced)}
