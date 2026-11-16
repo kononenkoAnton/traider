@@ -150,3 +150,60 @@ def test_a_server_that_never_answers_ends_the_call_with_a_timeout(silent_server)
         client.get_clock()
     assert time.monotonic() - t0 < 3
     client._session.close()
+
+
+# --- пилот 16.11.2026: первая сверка с настоящим Alpaca ---
+
+def _alpaca_that_refuses_malformed(asked):
+    """Клиенты как у Alpaca на paper: одна недопустимо записанная бумага, и весь запрос данных отклонён."""
+    from types import SimpleNamespace as NS
+    from alpaca.common.exceptions import APIError
+    from traider.market import AlpacaMarket
+
+    def answer(make):
+        def call(req):
+            symbols = list(req.symbol_or_symbols)
+            asked.append(symbols)
+            bad = [s for s in symbols if "_" in s]
+            if bad:
+                raise APIError('{"message":"code=400, message=invalid symbol: %s"}' % bad[0])
+            return make(symbols)
+        return call
+
+    m = object.__new__(AlpacaMarket)
+    m.now = lambda: ny(2026, 12, 1, 10, 15)
+    trade, bar = NS(price=10.0, timestamp=ny(2026, 12, 1, 10, 14)), sdk_bar(ny(2026, 12, 1, 10, 0))
+    m._data = NS(get_stock_latest_trade=answer(lambda ss: {s: trade for s in ss}),
+                 get_stock_bars=answer(lambda ss: NS(data={s: [bar] for s in ss})))
+    m._trading = NS(get_clock=lambda: NS(is_open=True), get_calendar=lambda req: [
+        NS(open=datetime(2026, 12, 1, 9, 30), close=datetime(2026, 12, 1, 16, 0))])
+    return m
+
+
+def test_a_symbol_alpaca_calls_invalid_is_left_out_and_the_rest_still_answer():
+    asked = []
+    m = _alpaca_that_refuses_malformed(asked)
+    assert m.last_prices(["AAPL", "NOPE_XX", "SPY", "BAD_2"]) == {"AAPL": 10.0, "SPY": 10.0}
+    assert set(m.daily_bars(["AAPL", "NOPE_XX"], 5)) == {"AAPL"}
+    assert set(m.lows_since(["NOPE_XX", "AAPL"], ny(2026, 12, 1, 10, 0))) == {"AAPL"}
+    asked.clear()
+    assert m.last_prices(["NOPE_XX"]) == {} and asked == [["NOPE_XX"]]          # пустой запрос в API не уходит
+
+
+def test_any_other_alpaca_refusal_still_raises():
+    import pytest
+    from types import SimpleNamespace as NS
+    from alpaca.common.exceptions import APIError
+    m = _alpaca_that_refuses_malformed([])
+
+    def refuse(text):
+        def call(req):
+            raise APIError(text)
+        return NS(get_stock_latest_trade=call, get_stock_bars=call)
+
+    m._data = refuse('{"message":"forbidden."}')
+    with pytest.raises(APIError):
+        m.last_prices(["AAPL"])
+    m._data = refuse('{"message":"invalid symbol: OTHER"}')                     # названа бумага, которой не спрашивали
+    with pytest.raises(APIError):
+        m.daily_bars(["AAPL"], 5)

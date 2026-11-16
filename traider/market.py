@@ -16,7 +16,9 @@
 
 `AlpacaMarket` это настоящий рынок: тонкая обёртка над alpaca-py, все вызовы SDK только в
 нём. Данные берутся с бесплатной ленты IEX, она указывается явно. Любая ошибка связи или API
-поднимает исключение, пустой ответ никогда не прячет сбой. Цены и свечи отдаются обычными
+поднимает исключение, пустой ответ никогда не прячет сбой. Одно исключение (`without_invalid`): если в запросе цен
+или свечей одна бумага записана недопустимо, Alpaca отклоняет весь запрос (`invalid symbol: X`, увидено на paper
+16.11.2026); названную бумагу убираем и спрашиваем остальных, как того требует контракт. Цены и свечи отдаются обычными
 `float`. Цена годна, только если сделка была сегодня по Нью-Йорку, иначе бумага без цены.
 Свечи для стопов берутся только из обычной сессии по календарю Alpaca (с учётом коротких
 дней), дневные свечи только завершённые: пока рынок открыт, сегодняшняя отбрасывается. Дневные свечи
@@ -27,12 +29,14 @@
 задаёт, и зависшее чтение держало бы тик вечно) и не повторяет запросов: истёкший срок это обычное исключение, которое
 тик пишет как `error`. Через `bounded` создаются все клиенты здесь и в `traider.alpaca`.
 """
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
+from alpaca.common.exceptions import APIError
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical.news import NewsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -126,6 +130,24 @@ def bounded(client, timeout=TIMEOUT):
     return client
 
 
+_INVALID = re.compile(r'invalid symbol: ([^"\\]+)')
+
+
+def without_invalid(call, symbols: Iterable[str]) -> dict:
+    """Ответ `call(symbols)` без бумаг, которые API назвал недопустимыми (`invalid symbol: X`): названную убираем и
+    спрашиваем остальных. Любой другой отказ поднимается как есть; пустой список в API не уходит."""
+    symbols = list(symbols)
+    while symbols:
+        try:
+            return call(symbols)
+        except APIError as e:
+            bad = _INVALID.search(str(e))
+            if not bad or bad[1].strip() not in symbols:
+                raise
+            symbols = [s for s in symbols if s != bad[1].strip()]
+    return {}
+
+
 class AlpacaMarket:
     def __init__(self, api_key: str, secret_key: str):
         self._data = bounded(StockHistoricalDataClient(api_key, secret_key))
@@ -139,11 +161,8 @@ class AlpacaMarket:
         return datetime.now(NY)
 
     def last_prices(self, symbols: Iterable[str]) -> dict[str, float]:
-        symbols = list(symbols)
-        if not symbols:
-            return {}
-        trades = self._data.get_stock_latest_trade(
-            StockLatestTradeRequest(symbol_or_symbols=symbols, feed=DataFeed.IEX))
+        trades = without_invalid(lambda ss: self._data.get_stock_latest_trade(
+            StockLatestTradeRequest(symbol_or_symbols=ss, feed=DataFeed.IEX)), symbols)
         now = self.now()
         return {s: float(t.price) for s, t in trades.items()
                 if usable(t.price) and traded_today(t.timestamp, now)}
@@ -157,23 +176,24 @@ class AlpacaMarket:
         symbols = list(symbols)
         if not symbols:
             return {}
-        req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=TimeFrame(1, TimeFrameUnit.Day),
-                               start=self.now() - timedelta(days=days * 2 + 10), feed=DataFeed.IEX,
-                               adjustment=Adjustment.SPLIT)
+        start = self.now() - timedelta(days=days * 2 + 10)
+        data = without_invalid(lambda ss: self._data.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=ss, timeframe=TimeFrame(1, TimeFrameUnit.Day), start=start, feed=DataFeed.IEX,
+            adjustment=Adjustment.SPLIT)).data, symbols)
         today, market_open = ny_day(self.now()), self.is_open()
         return {s: completed_days([bar_from_sdk(b) for b in bars], today, market_open)[-days:]
-                for s, bars in self._data.get_stock_bars(req).data.items()}
+                for s, bars in data.items()}
 
     def lows_since(self, symbols: Iterable[str], since: datetime) -> dict[str, list[tuple[float, float]]]:
         symbols = list(symbols)
         if not symbols:
             return {}
-        req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=TimeFrame(1, TimeFrameUnit.Minute),
-                               start=floor_minute(since), feed=DataFeed.IEX)
+        data = without_invalid(lambda ss: self._data.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=ss, timeframe=TimeFrame(1, TimeFrameUnit.Minute), start=floor_minute(since),
+            feed=DataFeed.IEX)).data, symbols)
         cal = self._trading.get_calendar(GetCalendarRequest(start=since.astimezone(NY).date(), end=self.now().date()))
         sessions = [(c.open.replace(tzinfo=NY), c.close.replace(tzinfo=NY)) for c in cal]  # время календаря наивное, нью-йоркское
-        out = {s: low_open_pairs(regular_session_bars(bars, sessions))
-               for s, bars in self._data.get_stock_bars(req).data.items()}
+        out = {s: low_open_pairs(regular_session_bars(bars, sessions)) for s, bars in data.items()}
         return {s: p for s, p in out.items() if p}
 
     def news(self, symbols: Sequence[str] | None, limit: int) -> list[dict]:
