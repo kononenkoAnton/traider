@@ -641,3 +641,16 @@ def test_a_real_tick_through_main_builds_the_report_once_and_again_after_a_stop(
     after = json.loads(report.read_text())
     assert after["meta"]["generated_at"] == ny(2026, 12, 1, 13, 0).isoformat()
     assert {p["id"]: p["status"] for p in after["participants"]}["haiku"] == "finishing"
+
+
+def test_tick_line_shows_the_error_of_a_session_row(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(ENV)
+    monkeypatch.setattr(cli, "AlpacaMarket", lambda key, secret: object())
+    monkeypatch.setattr(cli, "_auto_report", lambda *a: False)
+    monkeypatch.setattr(cli, "tick", lambda *a: [{"experiment": "pilot-1", "participant": "opus-a", "action": "session",
+                                                  "status": "ok", "cost": 0.5, "ts": TS,
+                                                  "error": "счёт после сделок тика не обновлён"}])
+    assert main(["tick"]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "2026-12-01 10:05 pilot-1/opus-a: session ok $0.50 (ошибка: счёт после сделок тика не обновлён)"]

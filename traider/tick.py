@@ -26,7 +26,7 @@
 записи за сегодня: `missed`; 8. не раньше `window_start`, рынок открыт, записи нет: при
 непустом `unpriced` это `unpriced`, иначе запись `started`, аналитик (второй клиент) для
 `research = "analyst"` и `run_session` (`session` со статусом и стоимостью); 9. иначе `safety`. Статус не `active` после шагов 4 и 5 (неизвестный) даёт `safety` без учёта дней.
-Если за тик в журнал заявок прогона добавились события, после всех шагов вызывается `broker.account()`, чтобы сохранённый счёт совпал с брокером (у Alpaca он кэш, сделки его не обновляют); сбой этого вызова тик не роняет, счёт остаётся прежним, текст идёт в поле `error` элемента (при исключении шага: заметкой к нему). Любое исключение по одному прогону даёт `error` с текстом и не мешает остальным. Каждый элемент
+Если за тик в журнал заявок прогона добавились события, после всех шагов вызывается `broker.account()`, чтобы сохранённый счёт совпал с брокером (у Alpaca он кэш, сделки его не обновляют); сбой этого вызова тик не роняет, счёт остаётся прежним, текст идёт в поле `error` элемента (при исключении шага: заметкой к нему). Любое исключение по одному прогону даёт `error` с текстом (и заметками исключения через `; `) и не мешает остальным. Каждый элемент
 результата несёт `experiment`, `participant`, `action`, `ts` (время рынка) и, если проверка HP прошла,
 `equity`, `floor`, `hp`, `stops_placed`, `stop_fills`, `unpriced`; тот же набор (с `day`, `error`, а у сессии
 `status` и `cost`) пишется строкой в `ticks.jsonl` прогона через `RunStore.append_tick`, для ошибок тоже. Сбой записи этой строки (любое исключение) тик не останавливает и результата не меняет. Клиенты
@@ -246,7 +246,8 @@ def tick(runs_dir: Path, market: Market, make_broker: Callable[[RunConfig, RunSt
                 r = ({"participant": run.name, "action": "error", "error": shared[run]} if run in shared
                      else _one(run, market, make_broker, make_client, control))
             except Exception as e:
-                r = {"participant": run.name, "action": "error", "error": f"{type(e).__name__}: {e}"}
+                r = {"participant": run.name, "action": "error",
+                     "error": "; ".join([f"{type(e).__name__}: {e}", *getattr(e, "__notes__", [])])}
             if broken:
                 r["control_error"] = broken   # отдельно от своей ошибки прогона
             out.append({"experiment": run.parent.name, **r, "ts": market.now().isoformat()})

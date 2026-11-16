@@ -642,3 +642,39 @@ def test_ticks_without_trades_read_the_account_no_more_than_before(world, monkey
     market.clock = ny(2026, 12, 1, 10, 5)
     tick(runs, market, make_broker, lambda: FakeAnthropic([]))
     assert reads == []                                                       # завершённый прогон брокера не трогает
+
+
+def test_the_error_text_of_a_run_keeps_the_notes_of_its_exception(world, monkeypatch):
+    import traider.tick as tick_module
+    runs, market, mb, mc, _ = world
+
+    def boom(*a, **kw):
+        e = RuntimeError("шаг упал")
+        e.add_note("счёт после сделок тика не обновлён")
+        raise e
+    monkeypatch.setattr(tick_module, "_one", boom)
+    err = tick(runs, market, mb, mc)[0]["error"]
+    assert "шаг упал" in err and "счёт после сделок тика не обновлён" in err
+
+
+def test_a_row_with_unpriced_and_a_refresh_error_keeps_each_incident_its_own_text(world):
+    """Alpaca: стоп LLY исполнился, у COST нет котировки, обновление счёта после тика упало."""
+    from traider.report import build_report
+    runs, market, api, make_broker, make_client = _alpaca_day(world)
+    tick(runs, market, make_broker, make_client)                             # сессия: LLY и COST со стопами
+    store = RunStore(runs / "pilot-1" / "opus-a")
+    import inspect
+    real = api.cash_and_positions
+    def flaky():
+        if any(f.function == "_refresh_account" for f in inspect.stack()):
+            raise ConnectionError("сеть пропала")                         # только обновление счёта после тика
+        return real()
+    api.cash_and_positions = flaky
+    market.clock = ny(2026, 12, 1, 10, 20)
+    api.trigger_stop("LLY", market.prices["LLY"] * 0.9)
+    del market.prices["COST"]
+    r = {x["participant"]: x for x in tick(runs, market, make_broker, make_client)}["opus-a"]
+    assert r["unpriced"] == ["COST"] and r["stop_fills"] and "сеть пропала" in r["error"]
+    inc = {i["title"]: i["text"] for i in build_report(runs / "pilot-1", market)["incidents"] if i["participant"] == "opus-a"}
+    assert "COST" in inc["нет котировки у удерживаемой бумаги"] and "сеть пропала" not in inc["нет котировки у удерживаемой бумаги"]
+    assert "сеть пропала" in inc["ошибка тика"] and "COST" not in inc["ошибка тика"]

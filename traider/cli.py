@@ -12,7 +12,7 @@
 режим включается только здесь, существующий прогон командой живым не станет. `tick` читает `.env`,
 собирает `AlpacaMarket`, выбирает брокера по `cfg.broker` (`sim` встроенный, `alpaca` через
 `make_alpaca_api`), клиента Anthropic и печатает по строке на прогон: время рынка, `эксперимент/участник`,
-действие; ошибка до обхода это одна строка и код 1. Клиент Anthropic создаётся с `timeout=API_TIMEOUT`
+действие (у сессии статус, стоимость и, если есть, «(ошибка: …)», у прочих текст `error`); ошибка до обхода это одна строка и код 1. Клиент Anthropic создаётся с `timeout=API_TIMEOUT`
 (300 с): это предел каждого ожидания сети в одном запросе (соединение, каждое чтение потока), а не всего
 запроса; и `max_retries=API_RETRIES` (2): столько раз SDK повторит запрос после сбоя связи, 408, 409, 429 и
 5xx, так что тишина в одном запросе стоит не больше трёх таймаутов. Срок всей сессии держит
@@ -149,6 +149,7 @@ def _tick_run(args, env: dict, seen: dict) -> int:
     seen["lines"].append(f"прогонов в тике: {len(results)}" if results else "рынок закрыт, тик пуст")
     for r in results:
         extra = f" {r['status']} ${r['cost']:.2f}" if r["action"] == "session" else f" {r['error']}" if "error" in r else ""
+        extra += f" (ошибка: {r['error']})" if r["action"] == "session" and r.get("error") else ""
         extra += f" (файл управления: {r['control_error']})" if "control_error" in r else ""
         when = datetime.fromisoformat(r["ts"]).astimezone(NY).strftime("%Y-%m-%d %H:%M")
         print(line := f"{when} {r['experiment']}/{r['participant']}: {r['action']}{extra}")

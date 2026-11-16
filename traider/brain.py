@@ -12,8 +12,8 @@
 `max_seconds` по `clock` (по умолчанию `time.monotonic`), цикл останавливается с `stop="deadline"`. Вход инструмента проверяется по его JSON-схеме до вызова.
 Цикл ничего не решает о торговле и никогда не поднимает исключений: сбой клиента это `stop="error"`.
 Стоимость ответа: сумма записей `usage.iterations` (это учёт оплаты по попыткам), без них верхний `usage`; поиски из
-`server_tool_use` один раз на ответ. `fallback_used` истинно, только если в ответе названа другая модель (верхний
-`model` или `model` записи `usage.iterations`): несколько итераций одной модели это серверный цикл поиска.
+`server_tool_use` один раз на ответ. `fallback_used` истинно, только если верхний `model` не запрошенный или в
+`usage.iterations` есть запись типа `fallback_message`; модель в записях других типов (`message`, советник) не в счёт.
 После каждого хода с вызовами инструментов (кроме завершающего) к тексту последнего `tool_result` добавляется
 строка состояния: ход из `max_turns`, доллары из `max_usd` и, если поиск включён, поиски из `max_searches`.
 Отдельным блоком её не шлют: сообщение должно состоять только из `tool_result`.
@@ -256,10 +256,10 @@ def _loop(client, res, model, system, user, tools, prices, max_turns, max_usd, m
             res.cost += cost_usd(step, prices)
             res.usage = Usage(*(a + b for a, b in zip(vars(res.usage).values(), vars(step).values())))
         res.model_used = getattr(response, "model", None) or model
-        # Подмена только если где-то названа другая модель. Несколько итераций одной модели это
-        # серверный цикл инструмента (поиск), а не подмена.
-        named = {res.model_used} | {m for i in iterations or [] if (m := _g(i, "model", None))}
-        res.fallback_used = res.fallback_used or named != {model}
+        # Подмена по признакам из SDK: ответила другая модель или в iterations есть запись `fallback_message`.
+        # Записи других типов (`message` серверного цикла, советник) могут называть свою модель, это не подмена.
+        res.fallback_used = (res.fallback_used or res.model_used != model
+                             or any(_g(i, "type", None) == "fallback_message" for i in iterations or []))
         content = _echo(response.content)
         messages.append({"role": "assistant", "content": content})
         res.transcript.append({"role": "assistant", "content": [_plain(b) for b in content]})

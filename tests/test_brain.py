@@ -188,6 +188,14 @@ def test_an_iteration_naming_another_model_is_a_fallback_even_if_the_top_model_m
     assert run([step])[0].fallback_used is True
 
 
+def test_an_iteration_of_another_type_naming_another_model_is_not_a_fallback():
+    # запись советника всегда называет свою модель, запись `message` может назвать; подмена это только `fallback_message`
+    step = use("finish", usage=dict(iterations=[
+        dict(type="advisor_message", model="claude-opus-5", input_tokens=10, output_tokens=1),
+        dict(type="message", model="claude-haiku-5", input_tokens=10, output_tokens=1)]))
+    assert run([step])[0].fallback_used is False
+
+
 # --- цикл не поднимает исключений ---
 def test_unsupported_schema_type_is_an_error_result():
     weird = Tool("echo", "", {"type": "object", "properties": {"x": {"type": "weird"}}}, lambda a: "ok")
