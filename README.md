@@ -95,4 +95,4 @@ uv run traider status
 
 ## Лицензия
 
-Лицензия пока не выбрана.
+MIT, текст в файле [LICENSE](LICENSE).
