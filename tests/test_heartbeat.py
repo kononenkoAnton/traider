@@ -173,6 +173,20 @@ def test_a_death_in_the_tick_sends_one_fail_beat(tmp_path, watchdog, capsys, mon
     assert RunStore(run).state()["status"] == "dead"
 
 
+def test_an_invalid_run_sends_one_fail_beat_naming_it_and_without_it_the_beat_is_ok(tmp_path, watchdog, capsys, monkeypatch):
+    exp, _ = _world(tmp_path / "invalid", monkeypatch, watchdog.url)
+    cfg = exp / "haiku" / "config.json"
+    cfg.write_text(cfg.read_text().replace('"seed": 20261114', '"seed": 1'))   # контрольная сумма не сходится
+    assert main(["tick"]) == 0
+    [(_, path, body)] = watchdog.got
+    assert path == SECRET + "/fail" and "pilot-1/haiku: invalid" in body
+    assert sum(": session ok" in l for l in body.splitlines()) == 4
+    watchdog.got.clear()
+    _world(tmp_path / "healthy", monkeypatch, watchdog.url)
+    assert main(["tick"]) == 0
+    assert [p for _, p, _ in watchdog.got] == [SECRET]
+
+
 def test_a_failed_session_sends_one_fail_beat(tmp_path, watchdog, capsys, monkeypatch):
     _world(tmp_path, monkeypatch, watchdog.url, client=[RuntimeError("обрыв")])
     assert main(["tick"]) == 0
@@ -239,7 +253,7 @@ def test_other_commands_send_nothing(tmp_path, watchdog, capsys, monkeypatch):
     ({"action": "safety"}, False), ({"action": "unpriced", "unpriced": ["AAPL"]}, False), ({"action": "paused"}, False),
     ({"action": "missed"}, False), ({"action": "finishing"}, False), ({"action": "finished"}, False),
     ({"action": "session", "status": "cap"}, False), ({"action": "session", "status": "ok"}, False),
-    ({"action": "error", "error": "x"}, True), ({"action": "died"}, True), ({"action": "stale_failed"}, True),
+    ({"action": "error", "error": "x"}, True), ({"action": "died"}, True), ({"action": "invalid"}, True), ({"action": "stale_failed"}, True),
     ({"action": "session", "status": "failed"}, True), ({"action": "safety", "error": "счёт не обновлён"}, True),
     ({"action": "safety", "control_error": "control.json"}, True)])
 def test_which_rows_make_the_tick_failed(row, failed):

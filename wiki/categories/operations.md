@@ -5,7 +5,7 @@ type: category
 tags: ['operations']
 categories: ['traider']
 created: 2026-11-14T15:43:20+00:00
-modified: 2026-11-16T22:00:00+00:00
+modified: 2026-11-16T23:30:00+00:00
 ---
 
 # Эксплуатация
