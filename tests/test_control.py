@@ -53,7 +53,11 @@ BAD_DATES = ['{"pauses": [{"from": "2026-12-01", "to": "2026.12.30"}], "stop": n
              '{"pauses": [], "stop": {"day": "not a date", "ts": "2026-12-01T10:00:00-05:00"}}',
              '{"pauses": [{"from": "2026/12/01", "to": null}], "stop": null}',
              '{"pauses": [{"from": "2026-12-05", "to": "2026-12-01"}], "stop": null}',
-             '{"pauses": [], "stop": {"day": "2026-12-01", "ts": "вчера"}}']
+             '{"pauses": [], "stop": {"day": "2026-12-01", "ts": "вчера"}}',
+             '{"pauses": [{"from": "2026-12-01"}], "stop": null}',
+             '{"pauses": [{"to": "2026-12-01"}], "stop": null}',
+             '{"pauses": [], "stop": {"day": "2026-12-01"}}',
+             '{"pauses": [], "stop": {"ts": "2026-12-01T10:00:00-05:00"}}']
 
 
 @pytest.mark.parametrize("text", BAD_DATES + ["не json", "[]", '{"pauses": {}, "stop": null}', '{"pauses": [{"from": 1}], "stop": null}',
