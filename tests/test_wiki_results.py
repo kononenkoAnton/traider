@@ -23,7 +23,15 @@ MARK = "МАРКЕР-ЧУЖОГО-ТЕКСТА"
 @pytest.fixture
 def wiki(tmp_path):
     shutil.copytree("wiki", tmp_path / "wiki")
-    return tmp_path / "wiki"
+    root = tmp_path / "wiki"
+    # В настоящей вики уже есть статья результатов пилота с тем же ID, что создают тесты: в копии она
+    # переименована вместе со всеми ссылками на неё, копия остаётся цельной, а тест пишет свою с нуля.
+    real = root / "articles" / "results-pilot-1.md"
+    if real.exists():
+        real.rename(real.with_name("results-real-pilot-1.md"))
+        for f in root.rglob("*.md"):
+            f.write_text(f.read_text().replace("results-pilot-1", "results-real-pilot-1"))
+    return root
 
 
 def tree(root):
